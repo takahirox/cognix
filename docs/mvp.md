@@ -9,7 +9,8 @@ This specification resolves the documentation scope of
 [Issue #4](https://github.com/takahirox/cognix/issues/4). The functional requirements
 and scenarios below define engineering acceptance, not validation delivered by
 the specification itself. See the [implementation](implementation.md) and
-[current validation record](validation.md) for Issue #6 evidence and limitations.
+[current validation record](validation.md) for current Rust evidence and the
+historical Python baseline.
 
 The [long-term product vision (Issue #3)](https://github.com/takahirox/cognix/issues/3)
 includes a shared engine for terminal and desktop experiences, richer context,
@@ -31,7 +32,8 @@ vision; those broader capabilities are not release requirements here.
    any point.
 
 The startup command illustrates the interface; see the [README](../README.md)
-for setup. The example model tag has not been verified as compatible.
+for setup. The Rust validation record reports observed compatibility for the
+example tag.
 
 ## Functional scope
 
@@ -114,8 +116,8 @@ they were not run.
 
 ## Acceptance scenarios
 
-S1–S6 are engineering acceptance scenarios tracked by Issue #6. They are not
-pre-merge gates for the historical documentation-only Issue #4. Actual results
+S1–S6 were established for Issue #6 and remain acceptance scenarios for the
+Rust migration in Issue #8. They are not pre-merge gates for the historical documentation-only Issue #4. Actual results
 and unverified targets are in the [validation record](validation.md).
 
 - **S1 — Tool choice:** Given a small fixture project and a request to inspect a
@@ -167,9 +169,9 @@ infrastructure now. [OpenAI Codex](https://github.com/openai/codex) is a referen
 for agent-loop, tool-routing and provider boundaries, without requiring feature
 parity.
 
-Rust is a candidate implementation language, not a settled requirement. Ollama is
-the initial provider and Qwen3.8 27B the initial evaluation target; neither fixes
-the implementation language or guarantees model compatibility.
+Rust is the supported implementation language following Issue #8. Ollama is
+the initial provider and Qwen3.8 27B the initial evaluation target; neither
+guarantees model compatibility.
 
 The [implementation guide](implementation.md) records the selected language and
 libraries, schemas, numeric limits and command policy. The original design called

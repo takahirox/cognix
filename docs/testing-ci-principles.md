@@ -6,9 +6,11 @@ simplifying checks.
 
 ## Current tooling and change-based validation
 
-Cognix uses Python unittest, deterministic provider/HTTP fixtures, real OS sandbox
-boundary tests, and separately invoked Ollama trials. Ruff checks Python style;
-the standard-library documentation checker validates Markdown links/structure.
+Cognix uses Cargo tests, deterministic provider/HTTP fixtures, real macOS sandbox
+boundary tests, and separately invoked Rust/Ollama trials. rustfmt and Clippy
+check Rust style; the Rust documentation checker validates Markdown links,
+anchors, structure and template metadata. The synthetic Python fixture and
+security probes need Homebrew Python on the evaluated Mac; the app does not.
 See [check commands](../README.md#check-and-build) and the
 [validation record](validation.md) for actual results and measured feedback time.
 No CI/deployment workflow or performance budget is established yet. Do not invent
