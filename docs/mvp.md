@@ -6,9 +6,10 @@ local project, lets the model choose tools, enforces user approval and runtime
 limits, and reports actual results.
 
 This specification resolves the documentation scope of
-[Issue #4](https://github.com/takahirox/cognix/issues/4). The MVP is not implemented
-yet. The functional requirements and scenarios below describe future engineering
-work, not capabilities or validation already delivered by this document.
+[Issue #4](https://github.com/takahirox/cognix/issues/4). The functional requirements
+and scenarios below define engineering acceptance, not validation delivered by
+the specification itself. See the [implementation](implementation.md) and
+[current validation record](validation.md) for Issue #6 evidence and limitations.
 
 The [long-term product vision (Issue #3)](https://github.com/takahirox/cognix/issues/3)
 includes a shared engine for terminal and desktop experiences, richer context,
@@ -29,10 +30,10 @@ vision; those broader capabilities are not release requirements here.
    changed files and the actual verification status. The user can interrupt at
    any point.
 
-The startup command illustrates the intended interface. It is not an available
-setup command or a claim that the example model tag has been verified.
+The startup command illustrates the interface; see the [README](../README.md)
+for setup. The example model tag has not been verified as compatible.
 
-## Functional scope for future implementation
+## Functional scope
 
 ### F1 — CLI
 
@@ -111,11 +112,11 @@ unresolved failures. Distinguish passed, failed and unrun verification, includin
 work stopped by denial, cancellation or limits. Never claim tests passed when
 they were not run.
 
-## Future implementation acceptance scenarios
+## Acceptance scenarios
 
-S1–S6 are acceptance scenarios for separately scoped engineering Issues. They
-are not pre-merge gates for the documentation-only Issue #4 and have not been run
-in this repository.
+S1–S6 are engineering acceptance scenarios tracked by Issue #6. They are not
+pre-merge gates for the historical documentation-only Issue #4. Actual results
+and unverified targets are in the [validation record](validation.md).
 
 - **S1 — Tool choice:** Given a small fixture project and a request to inspect a
   source file, a tool-capable local model invokes `list_files`/`read_file` and uses
@@ -170,7 +171,9 @@ Rust is a candidate implementation language, not a settled requirement. Ollama i
 the initial provider and Qwen3.8 27B the initial evaluation target; neither fixes
 the implementation language or guarantees model compatibility.
 
-Follow-up engineering Issues should settle the implementation language and
+The [implementation guide](implementation.md) records the selected language and
+libraries, schemas, numeric limits and command policy. The original design called
+for follow-up engineering to settle the implementation language and
 libraries, provider/tool schemas and compatibility checks, default-model
 configuration, context accounting, numeric limits, command policy or isolation,
 and approval/cancellation behavior. Keep these decisions small and tied to
@@ -196,9 +199,9 @@ run:
 
 Follow the [development flow](development-flow.md#implementation-and-validation),
 [review guidelines](review-guidelines.md) and
-[testing/CI principles](testing-ci-principles.md). The repository has no application
-setup, build or test commands yet; runtime scenario results must be recorded when
-implementation exists.
+[testing/CI principles](testing-ci-principles.md). Application setup, build and test
+commands are in the [README](../README.md); runtime results are recorded separately
+from this historical documentation acceptance.
 
 Optional validation: review this specification against the first engineering
 Issues when they are planned. This is not a pre-merge gate.

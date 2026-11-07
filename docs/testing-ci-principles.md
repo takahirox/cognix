@@ -6,11 +6,13 @@ simplifying checks.
 
 ## Current tooling and change-based validation
 
-cognix currently contains documentation and templates. There are no application
-tests, package/build commands, or executable CI/deployment workflows. No runtime
-baseline or budget has been measured or established. Do not invent commands,
-results, timings or executable CI. Product implementation, tooling and workflows
-belong in separately scoped work.
+Cognix uses Python unittest, deterministic provider/HTTP fixtures, real OS sandbox
+boundary tests, and separately invoked Ollama trials. Ruff checks Python style;
+the standard-library documentation checker validates Markdown links/structure.
+See [check commands](../README.md#check-and-build) and the
+[validation record](validation.md) for actual results and measured feedback time.
+No CI/deployment workflow or performance budget is established yet. Do not invent
+commands, results, timings or executable CI.
 
 Match checks to the actual change and repository tooling:
 
