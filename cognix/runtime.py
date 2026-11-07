@@ -37,7 +37,8 @@ class Runtime:
         if not path or "\0" in path or Path(path).is_absolute():
             raise ValueError("Use a relative project path")
         parts = path.split("/")
-        if any(p in {"..", ".git"} for p in parts):
+        # Deny case aliases even on case-sensitive hosts so the policy is portable.
+        if any(p == ".." or p.casefold() == ".git" for p in parts):
             raise ValueError("Parent traversal and .git access are denied")
         parts = [p for p in parts if p not in {"", "."}]
         if not directory and not parts:
@@ -82,7 +83,7 @@ class Runtime:
                 for entry in iterator:
                     if self.cancel.is_set():
                         raise Cancelled()
-                    if entry.name == ".git" or entry.is_symlink():
+                    if entry.name.casefold() == ".git" or entry.is_symlink():
                         continue
                     entries.append(
                         entry.name
