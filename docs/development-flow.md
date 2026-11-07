@@ -42,8 +42,9 @@ categories does not waive implementation requirements or applicable checks.
 Inspect the current tree before editing. Apply the canonical
 [UI/UX and layout principles](ui-ux-principles.md) when interfaces are introduced.
 Choose checks using the [test and CI performance principles](testing-ci-principles.md)
-and the tooling actually present. Cognix uses Python's standard library at runtime,
-unittest for regression/integration tests, and Ruff for formatting/linting.
+and the tooling actually present. Cognix uses Rust/Cargo, deterministic Rust
+regression/integration tests, real macOS sandbox tests, rustfmt and Clippy. Python is used only by the
+small verification fixture and macOS security probes.
 See the [README](../README.md#check-and-build) for actual commands and the
 [validation record](validation.md) for measured results and remaining gaps.
 There is no deployment workflow. Do not invent commands, runtimes or results.

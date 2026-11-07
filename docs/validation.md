@@ -1,118 +1,148 @@
-# Issue #6 validation record
+# Rust migration validation (Issue #8)
 
-This record applies to the implementation files committed alongside it. The
-SIGINT fixes and target-model evidence still require review at the published
-revision. The draft PR uses a non-closing `Refs #6` reference. No push, merge,
-Issue closure, or post-merge verification was performed in this fix stage.
+This record applies to the Rust source and Cargo lockfile committed with it.
+The raw model trials contain SHA-256 hashes of the implementation, evaluator,
+documentation checker, manifests and fixture used. Their source hashes were
+checked against the final files. No PR, push, merge, comment or Issue closure was
+performed by this implementation node. Review and integration remain downstream.
 
-## Environment and reproducibility
+The [Python validation record](validation-python.md) and its two raw JSON records
+are historical evidence only. They are not Rust test results.
 
-Evaluated on 2026-11-07, Apple M4 Max, 68,719,476,736 bytes (64 GiB) unified
-memory, Darwin 27.2.0 arm64. Application/test interpreter: Python 3.13.13.
-Verification interpreter: `/opt/homebrew/bin/python3` (Homebrew Python 3.15.2).
-Ollama server/client: **0.34.4**. Real model: **`qwen3-coder:30b`**, local
-Q4_K_M, 30.5B parameters, digest
-`06c1097efce0431c2045fe7b2e5108366e43bee1b4603a7aded8f21689e90bca`.
-The evaluation target **`qwen3.8:27b`** was explicitly installed using
-`ollama pull qwen3.8:27b` (exit 0): local Q4_K_M, 27.3B parameters, digest
-`aaee06c39dcf2437cde036998d960e1fc1494b8191be7cc9657d01e509097813`.
-An existing Ollama install was started locally for this evaluation. Normal
-application startup does not download models automatically.
+## Environment and reproduction
 
-The repository-owned synthetic fixture is `tests/fixtures/division`: a small
-Python division function and two unittest cases. Zero denominators must return
-`None`; the checked-in fixture intentionally fails that case. Tests copy it to
-a disposable project. No external dataset is required.
+Evaluated on 2026-11-07: Apple M4 Max, 68,719,476,736 bytes (64 GiB) unified
+memory, Darwin 27.2.0 arm64. Homebrew rustc 1.94.0
+(`4a4ef493e`, host `aarch64-apple-darwin`), Cargo 1.94.0. The manifest requires
+Rust 1.87 or newer; only 1.94.0 was exercised here. Application runtime: native
+Rust, no Python. The external sandbox verification program is Homebrew
+`/opt/homebrew/bin/python3` (3.15.2). Ollama server: **0.34.4**, bound to loopback.
+The existing installation was started for this evaluation. No model download
+was performed for the Rust migration.
 
-## Acceptance mapping
+The repository-owned fixture `tests/fixtures/division` is unchanged: a small
+Python division function and two unittest cases. The zero-denominator case
+intentionally fails until `main.py` returns `None`. Each trial copies it into a
+fresh disposable project. Python is the fixture's verification program, not an
+application dependency. No external dataset is used.
 
-| Criterion | Implementation and actual evidence | Status / limitations |
-| --- | --- | --- |
-| AC1 — CLI | `cli.py`, package entry point; `test_cli.py` exercises interactive task input, real approval prompt, visible tool activity/results, EOF, invalid options/root/task, and SIGINT at input/model wait. Installed executable smoke and wheel build below. | Pass on this Mac. |
-| AC2 — Ollama/model selection | `provider.py`; local HTTP fixtures validate selected/default tag, payloads, server/model errors, unsupported tools/cloud tags, malformed/oversized responses, timeout/cancel and real tool behavior probe. Actual `qwen3-coder:30b` and `qwen3.8:27b` passed the startup behavior probe with Ollama 0.34.4. | Pass on both recorded local tags, including the target-model setup. |
-| AC3 — Loop/context | `agent.py`, `test_agent.py`: call IDs and ordering, full result round trip, multi-turn history, normal stop, malformed batch, schema errors, duplicate IDs, tool failure, step/context/provider stops and cancellation. | Pass. |
-| AC4 — Tools | `runtime.py`, `commands.py`; `test_runtime.py` and fixture integration exercise all four tools, preview-before-write, argument failures, missing/binary/large files, stale hashes and ambiguous patches. | Pass; targeted existing-file edits only, as documented. |
-| AC5 — Safety | Directory-FD path operations; exact argv policy plus OS sandbox. SIGINT regressions cover launch before ownership, repeated interruption during cleanup, and patch interruption before/after commit with truthful execution and modified-file evidence. Real subprocess tests deny outside reads, symlink escapes, root/outside writes, network, Git metadata, inherited secrets, forks/spawns; enforce time/output limits and cancellation. Fixtures exercise denial, queued unrun calls, parent swaps and preservation of existing edits. | Pass on macOS Seatbelt. Linux backend **Not run** on a real Linux host; no Linux guarantee claimed. |
-| AC6 — Edit/verify/recovery | Deterministic provider runs actual sandboxed failing tests, reads/patches with approvals and reruns to pass; assertions check failure returned to model and unrelated changes preserved. Three actual-model trials per tag are recorded below; every Qwen3.8 trial observed a failed check, patched main.py and reran to pass. | Pass on both recorded models; observed counts do not establish general success rates. |
-| AC7 — Evidence reporting | `Agent.report`, `cli.render`, `test_cli.py`: passed/failed/not_run/denied/canceled/limit_reached; invalid args; SIGINT launch/commit regressions preserve executed and modified-file evidence; model's false “tests passed” prose is not rendered as evidence. | Pass. |
-| AC8 — Reproducible checks/docs | README, implementation guide, this record, executable doc checker, package build, Ruff and unittest checks below. Raw provider/approval/tool results in `ollama-trials.json` and `ollama-qwen3.8-trials.json`; target record includes installed metadata and implementation/fixture source hashes. | Pass for recorded environment; Linux limitation remains explicit. |
-
-## Actual-model trials
-
-Run from repository root:
+From the repository root:
 
 ```sh
-.venv/bin/python scripts/evaluate_ollama.py --model qwen3-coder:30b \
-  --python /opt/homebrew/bin/python3 --runs 3 --output docs/ollama-trials.json
-ollama pull qwen3.8:27b
-.venv/bin/python scripts/evaluate_ollama.py --model qwen3.8:27b \
-  --python /opt/homebrew/bin/python3 --runs 3 --output docs/ollama-qwen3.8-trials.json
+cargo build --locked --release
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+cargo run --locked --example check_docs
+git diff --check
+cargo run --locked --example evaluate_ollama -- --model qwen3-coder:30b \
+  --python /opt/homebrew/bin/python3 --runs 3 --output /tmp/cognix-coder.json
+cargo run --locked --example evaluate_ollama -- --model qwen3.8:27b \
+  --python /opt/homebrew/bin/python3 --runs 3 --output /tmp/cognix-target.json
 ```
 
-The [raw trial record](ollama-trials.json) includes the exact task, provider
-messages, tool results, commands, approval previews/decisions, hardware, provider
-version, elapsed time and success/failure counts. The harness automatically
-approves only `main.py` diffs and its exact sandboxed fixture check, within
-disposable directories. Normal CLI sessions still prompt for each action.
+The evaluator approves only `main.py` diffs and the exact sandboxed unittest
+argv in these disposable projects. It records each preview/decision, the full
+conversation, tool calls/results, exit codes, elapsed time, model metadata and
+source hashes. Product CLI sessions always ask for each write/command approval.
 
-**Pass:** 3 attempts, 3 observed successes, 0 failures on `qwen3-coder:30b`.
-Each attempt inspected fixture files, applied an approved `main.py` correction,
-executed an approved sandboxed unittest command and received exit code 0 with
-two tests passing. These three observations do not establish a general 100%
-success rate. Failed-check recovery is deterministic regression evidence,
-separate from these probabilistic trials.
+## Mandatory acceptance mapping
 
-The earlier missing-model result reflected local setup. The target is in the
-[official Ollama catalog](https://ollama.com/library/qwen3.8:27b); after the explicit
-pull, `/api/show` and `/api/tags` returned the installed tag, with `completion`,
-`tools`, `vision` and `thinking` capabilities. The actual Cognix startup probe
-passed before each of the three target trials; capabilities alone were not
-used as compatibility evidence.
+| Criterion | Actual method and evidence | Result |
+| --- | --- | --- |
+| AC1 — Native application | `cargo build --locked --release`; isolated `cargo install --locked --path . --root <temporary-directory>`; installed `cognix --help` from outside the checkout with PATH restricted to `/usr/bin:/bin`; `file` identifies Mach-O 64-bit arm64. | Pass on this Apple Silicon Mac. |
+| AC2 — CLI | `tests/cli.rs`: project/model options, environment defaults, interactive/single task, activity, real approvals and EOF denial, invalid input, visible final prose, sanitized terminal output, SIGINT at input/model wait and during approved command execution, committed patch preservation. | Pass. |
+| AC3 — Provider | `src/provider.rs`; `tests/provider.rs` exercises native Ollama payloads/probe, alternate model selection, missing server/model, cloud/unsupported tags, failed capability/probe, malformed/oversized/incomplete responses, timeout/cancellation and context errors. Both actual local models passed readiness/probe and fixture trials below. | Pass on recorded local tags. No hosted inference or automatic download. |
+| AC4 — Agent/context | `tests/agent.rs`: ordered results and native/generated IDs, retained thinking/history across turns, duplicate/malformed batch rejection before effects, closed schemas and recoverable errors, final answers, step/context/provider stops, cancellation and queued unrun calls. | Pass. |
+| AC5 — Tools/edits | `tests/runtime.rs`: all four tools, schema/type/path failures, missing/large/binary/nonregular files, bounded listings, unique-span/stale-hash checks, previews, approval/denial, atomic writes, concurrent edits/parent swaps and preservation of unrelated changes. | Pass. Existing-file targeted patches retain the baseline scope. |
+| AC6 — Safety | Real macOS subprocesses in `tests/commands.rs` deny outside/symlink reads, root/outside writes, network, Git metadata/case aliases, forks and child spawning. Scratch writes work; environment is restricted to the documented set. Limits/cancel kill and reap the process. Directory-FD tools deny symlinks/hardlinks/traversal/Git aliases; `tests/root_changes.rs` rejects a replaced root. CLI tests send real SIGINT. | Pass on macOS Seatbelt. Linux is unsupported and fails closed before command approval/launch; real Linux validation is Not run and no Linux isolation is claimed. |
+| AC7 — S1–S6 | Deterministic fixture test actually inspects, runs failing tests, approves/applies a correction and reruns to pass, asserting failure feedback and unchanged tests/user files. Actual local-model trials exercise the same flow with recorded approvals; alternate selection and unsupported models have deterministic tests. Setup, hardware, versions, exact tags/digests and outcomes are recorded here and in JSON. | Pass on both recorded models; observations are not a general success-rate guarantee. |
+| AC8 — Truthful evidence | Runtime-owned ledger and separate model prose; `tests/agent.rs` and `tests/cli.rs` test unsupported success claims, all six outcome statuses and queued unrun work. `src/runtime_tests.rs` injects cancellation immediately before/after atomic commit, at spawn ownership, cleanup and completed-command return. Executed flags, exit codes/output, hashes, modified files and ledger survive. Real CLI SIGINT tests cover committed edits and running commands. | Pass. Completed work remains recorded; no automatic rollback or further unapproved action. |
+| AC9 — Complete migration/docs | Cargo is the source of truth. Python package/entry points, old application regression tests and Python evaluation/docs scripts are retired after porting coverage. Rust check/evaluation examples replace the scripts. README, MVP, implementation and contributor/testing guidance describe Rust. Native build/install, formatting, lint, tests, docs and whitespace checks below ran successfully. | Pass. Historical Python evidence is explicitly separate. |
 
-**Pass:** 3 attempts, 3 observed successes, 0 failures on `qwen3.8:27b`, recorded
-in the [target trial record](ollama-qwen3.8-trials.json). Each attempt read the
-fixture source and tests, ran an approved check that failed with the intentional
-zero-denominator error, applied an approved `main.py` patch, and reran the approved
-sandboxed check to pass (exit 0, two tests). Tests were preserved byte for byte,
-and `main.py` was the sole modified file. The initial failed checks remain
-recorded as failed; the final model answer is separate from that evidence.
-These three observed successes do not establish a general 100% success rate.
+## Regression coverage migration
 
-The target record also contains the exact installed model metadata, download
-command/result, and SHA-256 hashes of the implementation, evaluator and fixture
-files used. Both trial records include actual approval previews, decisions,
-provider messages and results. Optional DeepSeek and Codex comparisons were
-**Skipped**; Linux isolation remains **Not run** on a real Linux host.
+The Rust tests combine related cases instead of reproducing Python test-function
+counts. The historical Python suite's assertions are represented as follows:
 
-## Repository checks
-
-| Check | Result |
+| Baseline coverage | Rust coverage |
 | --- | --- |
-| `python3 -m venv .venv` and `.venv/bin/python -m pip install '.[dev]'` | Pass: package built/installed with Ruff 0.17.4; no runtime dependencies. |
-| `.venv/bin/python -m unittest discover -s tests -v` | Pass: 46 tests, no failures/errors/skips, 13.376 seconds on this host. Covers real sandbox execution and HTTP/CLI boundaries without inference. |
-| `.venv/bin/ruff check .` | Pass. |
-| `.venv/bin/ruff format --check .` | Pass. |
-| `.venv/bin/python scripts/check_docs.py` | Pass: 11 Markdown documents, 0 local-link/anchor/structure/template-metadata errors. |
-| `.venv/bin/python -m pip wheel --no-deps --wheel-dir dist .` | Pass: built `cognix-0.1.0-py3-none-any.whl`. |
-| Fresh temporary venv, install wheel with `pip install --no-deps`, run installed `cognix --help` from outside checkout | Pass: imports resolved inside the clean environment, entry point exited 0. |
+| IDs/order, round trips, multi-turn context, generated/duplicate IDs, malformed envelopes and excessive batches | `tests/agent.rs`, `tests/provider.rs` |
+| Tool schema errors and ordinary failure recovery, final answers, provider/step/context limits, pre/during-model cancellation | `tests/agent.rs` |
+| Listing/read bounds, malformed arguments, missing/binary/large/FIFO files, stale/ambiguous patches, previews, denial and concurrent edits | `tests/runtime.rs` |
+| Canonical root confinement, symlink and hardlink aliases, Git metadata/case aliases, parent/root swaps, user edits | `tests/runtime.rs`, `tests/root_changes.rs` |
+| Exact command policy, actual exit/output/failure, scratch/environment isolation, outside reads/writes/network/Git denial, fork/spawn denial | `tests/commands.rs`, `tests/runtime.rs` |
+| Time/output/closed-pipe limits, cancellation before launch and while running, process reaping | `tests/commands.rs` |
+| Python signal-deferral ownership/restoration regressions around spawn, cleanup and rename | `src/runtime_tests.rs` injects the cancellation flag at these boundaries; Rust has no signal-driven stack unwinding or handler restoration. `tests/cli.rs` additionally sends actual SIGINT after patch commit and during command execution. |
+| CLI task/root/model configuration, interactive approvals/EOF/invalid options, input/model interruption, sanitized visible prose and separate evidence | `tests/cli.rs` |
+| HTTP native protocol, model readiness/capability/probe/cloud rejection, malformed/oversized/server/model/context errors, timeout/cancel | `tests/provider.rs` |
+| S1–S6 fixture inspect/fail/approved patch/approved check/recovery and honest results | `tests/agent.rs` plus the two actual Rust trial records |
+
+## Actual model trials
+
+- **`qwen3-coder:30b`**: local Q4_K_M, 30.5B parameters, digest
+  `06c1097efce0431c2045fe7b2e5108366e43bee1b4603a7aded8f21689e90bca`.
+  [Rust raw record](rust-qwen3-coder-trials.json): **3 attempts, 3 successes,
+  0 failures** on the final source. Every attempt inspected the fixture, observed
+  an approved failing test, committed an approved `main.py` patch, and reran the
+  approved check to pass. Elapsed seconds: 11.742, 4.751, 4.746, including startup
+  probe (and model loading where needed).
+- **`qwen3.8:27b`**: local Q4_K_M, 27.3B parameters, digest
+  `aaee06c39dcf2437cde036998d960e1fc1494b8191be7cc9657d01e509097813`.
+  [Rust target raw record](rust-qwen3.8-trials.json): **3 attempts, 3 successes,
+  0 failures** on the final source. Every attempt inspected the fixture, observed
+  an approved failing test, committed an approved `main.py` patch and reran the
+  approved check to pass. Elapsed seconds: 41.988, 42.193, 42.463, including the
+  startup probe.
+
+Each successful trial requires final-answer termination, only `main.py` in the
+modified-file ledger, a recorded failed check followed by a final passed check,
+and byte-for-byte unchanged tests. Initial failures remain failed in the ledger;
+model text does not change them. Two earlier development batches per tag also
+observed 3/3 successes each (6/6 per tag). Final-source batches replace those
+records rather than mixing revisions or counting earlier results in the
+final-source totals. These six final observations do not establish a universal
+success rate.
+
+The installed native CLI also completed an actual local-model inspection task
+from outside the checkout with its environment restricted to `PATH=/usr/bin:/bin`.
+It read `main.py`, explained the zero-denominator behavior, left the fixture
+unchanged and reported verification as not run (exit 0). The executable hash,
+exact invocation and terminal output are in the [native CLI smoke record](rust-cli-smoke.json).
+
+## Repository checks and remaining limitations
+
+| Check | Actual result |
+| --- | --- |
+| `cargo build --locked --release` | Pass; native arm64 executable, initial optimized build 7.98 seconds on this host. |
+| Isolated `cargo install --locked --path . --root <temporary-directory>`, installed `cognix --help`, `file` | Pass; executable runs outside checkout without a Python environment; Mach-O 64-bit arm64. Cached final install build 0.28 seconds. |
+| Installed native CLI with actual Qwen3-Coder inspection task | Pass; exit 0, actual `read_file`, unchanged fixture, verification explicitly not run; raw smoke record linked above. |
+| `cargo fmt --all -- --check` | Pass. |
+| `cargo clippy --locked --all-targets -- -D warnings` | Pass. |
+| `cargo test --locked --all-targets` | Pass: 35 tests, no failures or skips on this Mac. Measured suite groups total about 2.3 seconds, excluding compilation. |
+| `cargo run --locked --example check_docs` | Pass: 12 Markdown documents, 0 local-link/anchor/structure/template metadata errors. |
 | `git diff --check` and staged equivalent | Pass. |
+| Actual Rust/Ollama fixture trials | Final source: 3/3 per tag (Qwen3-Coder and Qwen3.8); both recorded failing-check recovery. |
 
-The refreshed `qwen3-coder:30b` trials took 4.027, 4.035 and 4.156 seconds;
-`qwen3.8:27b` trials took 43.070, 35.863 and 35.265 seconds (including each
-startup probe). These observations and the test-suite time are local feedback
-measurements, not performance budgets or cross-machine guarantees. The SIGINT
-regressions were checked on the final implementation; both models' fixture
-results remain separate from deterministic security and cancellation tests.
+An initial deterministic fixture-port failure used the wrong variable names and
+was corrected. An initial HTTP fixture failure exposed macOS accepted sockets
+inheriting nonblocking mode; the fixture now explicitly uses blocking accepted
+sockets. The final suites above pass after those corrections. Rust time/output
+bounds and cancellation preserve execution evidence without Python's exception
+and handler-restoration race.
 
-The handler-restoration fix extends SIGINT deferral through tool return, cleanup
-and ledger insertion. Two added regressions inject SIGINT immediately after the
-normal handler is restored: committed patches retain their digest and modified
-file evidence; completed commands retain `executed=true`, exit code 0 and output.
-Both regressions fail against the preceding implementation and pass with this
-fix. Ruff lint/format, documentation and whitespace checks also passed.
-Actual-model trials were **Not run** again for this cancellation fix; their
-stored source hashes identify the earlier trial revision. Real Linux/bubblewrap
-validation remains **Not run**, pending the review question's external evidence.
+Seatbelt is a deprecated macOS facility; failure to launch it never retries
+without isolation. Verification that needs child processes, dependency downloads
+or project writes remains outside the documented policy. ACLs/xattrs are not
+copied by atomic patch replacement, as in the baseline; ordinary source-file
+mode bits and unrelated contents are preserved. A concurrent hostile process
+running as the same OS user remains outside the file-tool isolation boundary.
 
-Required post-merge verification: none required. No CI run exists for this
-checkpoint; local results do not imply CI or deployment success.
+Optional Linux sandbox validation and DeepSeek/comparative performance studies:
+**Not run**; Linux commands fail closed. No CI run or deployment workflow exists;
+local results do not imply CI/deployment success. These timings are feedback
+measurements, not performance budgets. No implementation work remains in the
+supported macOS scope; downstream must review the checkpoint and evidence
+before integration.
+
+Required post-merge verification: none required.

@@ -3,25 +3,30 @@
 Cognix is a local Ollama coding agent with a terminal interface, bounded tool
 loops, approved edits, and sandboxed verification. The
 [MVP specification](docs/mvp.md) defines the scope; [validation evidence](docs/validation.md)
-records what has actually been tested for [Issue #6](https://github.com/takahirox/cognix/issues/6).
+records the Rust migration checks for [Issue #8](https://github.com/takahirox/cognix/issues/8).
 
 ## Setup
 
-Requires Python 3.11 or newer and a local [Ollama](https://ollama.com/) installation.
-Runtime uses Python's standard library; setuptools builds the package. macOS
-requires `/usr/bin/sandbox-exec` for commands. Linux requires bubblewrap (`bwrap`)
-and permitted user namespaces. Other systems can inspect/edit files but cannot
-run verification commands. Linux isolation has not yet been exercised on a real
-Linux host; see the validation record.
+The supported application is a native Rust executable on Apple Silicon macOS.
+Use Rust/Cargo 1.87 or newer (validated with Homebrew Rust 1.94.0) and a local
+[Ollama](https://ollama.com/) installation. Verification commands require
+`/usr/bin/sandbox-exec`. Linux and other platforms are unsupported for command
+execution and fail closed; no Linux isolation is claimed.
 
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -e '.[dev]'
+cargo build --locked --release
+./target/release/cognix --help
+# Optional installation into ~/.cargo/bin:
+cargo install --locked --path .
 ollama serve
-# In another terminal, install a tool-capable local model if needed:
+# In another terminal, explicitly install a model only if needed:
 ollama pull qwen3-coder:30b
-.venv/bin/cognix --help
 ```
+
+Cargo downloads build dependencies on the first build; the committed lockfile
+pins their versions. The application needs no Python runtime. The repository's
+small Python fixture and macOS security tests use Homebrew Python separately as
+the approved verification program, not as the Cognix application runtime.
 
 The default model is `qwen3-coder:30b`. Set `COGNIX_MODEL` or pass `--model` to use
 any compatible local tag, including suitable DeepSeek tags. Startup checks
@@ -41,14 +46,14 @@ exact model digests, observed results and platform limitations.
 Start from a selected project directory using the installed executable:
 
 ```sh
-/path/to/cognix/.venv/bin/cognix --model qwen3-coder:30b
+/path/to/cognix/target/release/cognix --model qwen3-coder:30b
 ```
 
 Or select a project explicitly. This example is for Homebrew Python on Apple
 Silicon; replace the executable with your absolute system-installed Python path:
 
 ```sh
-.venv/bin/cognix --root /path/to/project --model qwen3-coder:30b \
+./target/release/cognix --root /path/to/project --model qwen3-coder:30b \
   --allow-command '["/opt/homebrew/bin/python3","-I","-B","-m","unittest","discover","-s",".","-p","test_*.py"]'
 # > Fix the division-by-zero bug in main.py; return None for zero and verify.
 ```
@@ -80,23 +85,29 @@ for the exact tool contract, numeric limits, execution policy and limitations.
 ## Check and build
 
 ```sh
-.venv/bin/python -m unittest discover -s tests -v
-.venv/bin/ruff check .
-.venv/bin/ruff format --check .
-.venv/bin/python scripts/check_docs.py
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+cargo run --locked --example check_docs
 git diff --check
-.venv/bin/python -m pip wheel --no-deps --wheel-dir dist .
+cargo build --locked --release
 ```
 
-The suite uses deterministic mock providers and a local HTTP fixture server; it
-needs no model or hosted service. Sandbox integration tests run real subprocesses
-and explicitly skip when the host lacks isolation or a compatible interpreter.
-A skipped mandatory boundary check remains unverified on that host. Optional
-real-model trials run separately:
+Deterministic tests use scripted providers and loopback HTTP fixtures; no model
+is needed. macOS integration tests execute real sandboxed subprocesses using
+`/opt/homebrew/bin/python3` and fail if that boundary is unavailable. They cover
+SIGINT in the CLI, model waits, committed patches, and running commands. Tests
+for macOS execution are compiled only on macOS; their absence on another host is
+not evidence of isolation. See the validation record for coverage and timings.
+No CI or deployment workflow is established.
+
+Real-model trials run separately:
 
 ```sh
-.venv/bin/python scripts/evaluate_ollama.py --model qwen3-coder:30b \
+cargo run --locked --example evaluate_ollama -- --model qwen3-coder:30b \
   --python /opt/homebrew/bin/python3 --runs 3 --output /tmp/cognix-trials.json
+cargo run --locked --example evaluate_ollama -- --model qwen3.8:27b \
+  --python /opt/homebrew/bin/python3 --runs 3 --output /tmp/cognix-target-trials.json
 ```
 
 This fixture-only evaluator approves `main.py` patches and its one exact test
