@@ -5,6 +5,7 @@ import hashlib
 import os
 import secrets
 import stat
+from contextlib import ExitStack
 from pathlib import Path
 
 from . import commands
@@ -115,7 +116,7 @@ class Runtime:
         finally:
             os.close(parent)
 
-    def apply_patch(self, path, sha256, old_text, new_text):
+    def apply_patch(self, path, sha256, old_text, new_text, *, interrupts=None):
         parts = self._parts(path)
         normalized = "/".join(parts)
         if self.seen.get(normalized) != sha256:
@@ -183,7 +184,7 @@ class Runtime:
                 raise Cancelled()
             # SIGINT requests cancellation here, but cannot split the committed
             # rename from its evidence. Approved bytes may already be visible.
-            with defer_sigint(self.cancel) as canceled:
+            with defer_sigint(self.cancel, until=interrupts) as canceled:
                 if canceled():
                     raise Cancelled()
                 os.rename(temporary, parts[-1], src_dir_fd=parent, dst_dir_fd=parent)
@@ -203,7 +204,7 @@ class Runtime:
                     pass
             os.close(parent)
 
-    def run_command(self, argv):
+    def run_command(self, argv, *, interrupts=None):
         if tuple(argv) not in self.allowed_commands:
             return {
                 "status": "not_run",
@@ -227,26 +228,47 @@ class Runtime:
         if (info.st_ino, info.st_dev) != (anchored.st_ino, anchored.st_dev):
             raise ValueError("Project root changed during session")
         return commands.run(
-            self.root, argv, self.cancel, self.timeout, self.output_limit
+            self.root,
+            argv,
+            self.cancel,
+            self.timeout,
+            self.output_limit,
+            interrupts=interrupts,
         )
 
     def execute(self, name, arguments):
         result = {"status": "failed", "executed": False}
         try:
-            if self.cancel.is_set():
-                raise Cancelled()
-            validate(name, arguments)
-            result = {"status": "ok", **getattr(self, name)(**arguments)}
-        except (Cancelled, KeyboardInterrupt):
+            with ExitStack() as interrupts:
+                try:
+                    if self.cancel.is_set():
+                        raise Cancelled()
+                    validate(name, arguments)
+                    options = (
+                        {"interrupts": interrupts}
+                        if name in {"apply_patch", "run_command"}
+                        else {}
+                    )
+                    result = {
+                        "status": "ok",
+                        **getattr(self, name)(**arguments, **options),
+                    }
+                except (Cancelled, KeyboardInterrupt):
+                    self.cancel.set()
+                    result = {"status": "canceled", "executed": False}
+                except (ValueError, OSError, UnicodeError) as exc:
+                    result = {
+                        "status": "not_run" if name == "run_command" else "failed",
+                        "executed": False,
+                        "error": str(exc)[:1000],
+                    }
+                self.events.append(
+                    {"tool": name, "arguments": arguments, "result": result}
+                )
+        except KeyboardInterrupt:
+            # The normal handler can fire as ExitStack restores it. The result
+            # and ledger already own the evidence; cancellation must retain it.
             self.cancel.set()
-            result = {"status": "canceled", "executed": False}
-        except (ValueError, OSError, UnicodeError) as exc:
-            result = {
-                "status": "not_run" if name == "run_command" else "failed",
-                "executed": False,
-                "error": str(exc)[:1000],
-            }
         if self.cancel.is_set() and result["status"] in {"ok", "passed"}:
             result["status"] = "canceled"
-        self.events.append({"tool": name, "arguments": arguments, "result": result})
         return result

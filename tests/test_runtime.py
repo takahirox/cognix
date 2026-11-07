@@ -113,6 +113,36 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.modified, set())
         self.assertEqual(list(self.root.glob(".cognix-*")), [])
 
+    def test_sigint_at_handler_restoration_keeps_committed_patch_evidence(self):
+        install = signal.signal
+        handler = signal.getsignal(signal.SIGINT)
+        restored = []
+
+        def restore(signum, replacement):
+            previous = install(signum, replacement)
+            if replacement == handler:
+                restored.append(True)
+                os.kill(os.getpid(), signal.SIGINT)
+            return previous
+
+        with patch("cognix.cancellation.signal.signal", side_effect=restore):
+            result = self.edit()
+        self.assertEqual(restored, [True])
+        self.assertEqual(signal.getsignal(signal.SIGINT), handler)
+        content = (self.root / "main.py").read_bytes()
+        self.assertIn(b"return a / b if b else None", content)
+        self.assertEqual(result["status"], "canceled")
+        self.assertTrue(result["executed"])
+        self.assertEqual(result["sha256"], hashlib.sha256(content).hexdigest())
+        self.assertEqual(self.runtime.seen["main.py"], result["sha256"])
+        self.assertEqual(list(self.root.glob(".cognix-*")), [])
+        self.assertEqual(self.runtime.events[-1]["result"], result)
+        self.assertTrue(self.cancel.is_set())
+        report = Agent(None, self.runtime, self.cancel).run("Do not continue")
+        self.assertEqual(report["status"], "canceled")
+        self.assertEqual(report["modified_files"], ["main.py"])
+        self.assertEqual(report["events"][-1]["result"], result)
+
     def test_edit_during_approval_is_preserved(self):
         def concurrent(*_):
             (self.root / "main.py").write_text("new user content")

@@ -6,7 +6,12 @@ from contextlib import contextmanager
 
 
 @contextmanager
-def defer_sigint(cancel):
+def defer_sigint(cancel, until=None):
+    # A caller can keep the guard alive until its execution ledger is updated,
+    # beyond the tool's return and resource cleanup.
+    if until is not None:
+        yield until.enter_context(defer_sigint(cancel))
+        return
     # Python delivers signals only on the main thread. Worker callers already
     # use the shared event and must not change the process-wide signal handler.
     if threading.current_thread() is not threading.main_thread():
