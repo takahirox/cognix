@@ -65,8 +65,9 @@ Results list modified files and exact checks, exit codes and captured output.
 They distinguish `passed`, `failed`, `not_run`, `denied`, `canceled` and
 `limit_reached`. No command means verification was not run. A zero exit code is
 recorded as passed; it does not prove test coverage or task correctness. Final
-terminal results use recorded tool evidence, so free-form model prose cannot
-invent a successful check. A no-tool response ends a turn, not proof of success.
+model responses are sanitized and displayed separately from recorded execution
+evidence, which determines check statuses. A no-tool response ends a turn, not
+proof of success.
 In single-task mode, any failed/denied action makes the exit code 1 even if a
 later correction succeeds; inspect the check ledger for recovery evidence.
 

@@ -122,10 +122,11 @@ macOS denies child creation. Captured output is returned to the model as data.
 Terminal control characters are escaped in tool output, paths and diffs.
 
 The runtime's ledger determines modified files, exact checks, execution flags,
-exit codes, failures, denials and unrun/canceled/limited work. The CLI deliberately
-does not render arbitrary final model prose as a result: a model claiming tests
-passed cannot manufacture recorded evidence. The core retains that prose as
-`model_reply` and in its conversation for future frontend use. A normal no-tool
-answer ends the turn, even if no files changed or no check ran. Evidence remains
-explicit. All session history and evidence are in memory, not written to disk
-by the product.
+exit codes, failures, denials and unrun/canceled/limited work. The CLI displays
+sanitized final model prose in a labeled response section so inspection answers
+and blocker explanations are visible. A separate recorded execution evidence
+section reports verification status from the ledger; model claims are not
+verification evidence. The core retains the prose as `model_reply` and in its
+conversation. A normal no-tool answer ends the turn, even if no files changed or
+no check ran. Evidence remains explicit. All session history and evidence are in
+memory, not written to disk by the product.

@@ -181,7 +181,41 @@ class CLITests(unittest.TestCase):
                     process.kill()
                     process.communicate()
 
-    def test_reporting_is_evidence_only_and_terminal_safe(self):
+    def test_final_answers_and_blocker_explanations_are_visible(self):
+        for reply in [
+            "The divide function returns None when the denominator is zero.",
+            "Cannot verify: pytest is missing. Install pytest before retrying.\x1b[2J",
+        ]:
+            with self.subTest(reply=reply), tempfile.TemporaryDirectory() as directory:
+                server = self.server(
+                    [(200, completion({"role": "assistant", "content": reply}))]
+                )
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    result = main(
+                        [
+                            "--root",
+                            directory,
+                            "--ollama-url",
+                            server.url,
+                            "--task",
+                            "Inspect the function and explain any verification blocker",
+                        ]
+                    )
+                self.assertEqual(result, 0)
+                model_response, evidence = output.getvalue().split(
+                    "\nRecorded execution evidence:\n"
+                )
+                self.assertIn(
+                    "Model response (not verification evidence):", model_response
+                )
+                self.assertIn(terminal_text(reply), model_response)
+                self.assertNotIn("\x1b", output.getvalue())
+                self.assertNotIn(terminal_text(reply), evidence)
+                self.assertIn("Verification: not run (no command executed)", evidence)
+                self.assertNotIn("Check argv:", evidence)
+
+    def test_reporting_separates_model_claims_from_evidence_and_is_terminal_safe(self):
         checks = []
         for status in [
             "passed",
@@ -216,7 +250,12 @@ class CLITests(unittest.TestCase):
                     "events": checks,
                 }
             )
-        self.assertNotIn("trust me", output.getvalue())
+        model_response, evidence = output.getvalue().split(
+            "\nRecorded execution evidence:\n"
+        )
+        self.assertIn("All tests passed, trust me", model_response)
+        self.assertIn("Model response (not verification evidence):", model_response)
+        self.assertNotIn("trust me", evidence)
         for status in [
             "passed",
             "failed",
@@ -225,7 +264,7 @@ class CLITests(unittest.TestCase):
             "not_run",
             "limit_reached",
         ]:
-            self.assertIn(status + ";", output.getvalue())
+            self.assertIn(status + ";", evidence)
         self.assertEqual(terminal_text("x\x1b[2J\ry"), "x\\x1b[2J\\x0dy")
 
     def test_sigint_stops_approved_running_command_and_records_evidence(self):
