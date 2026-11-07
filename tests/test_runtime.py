@@ -1,11 +1,13 @@
 import hashlib
 import os
+import signal
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from cognix.agent import Agent
 from cognix.runtime import Runtime
 
 
@@ -68,6 +70,47 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.approve = cancel
         self.assertEqual(self.edit()["status"], "canceled")
         self.assertEqual((self.root / "main.py").read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".cognix-*")), [])
+
+    def test_sigint_after_rename_reports_committed_patch(self):
+        rename = os.rename
+        handler = signal.getsignal(signal.SIGINT)
+
+        def commit(*args, **kwargs):
+            rename(*args, **kwargs)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        with patch("cognix.runtime.os.rename", side_effect=commit):
+            result = self.edit()
+        content = (self.root / "main.py").read_bytes()
+        self.assertIn(b"return a / b if b else None", content)
+        self.assertTrue(content.startswith(b"# user note"))
+        self.assertEqual(result["status"], "canceled")
+        self.assertTrue(result["executed"])
+        self.assertNotIn("error", result)
+        self.assertEqual(result["sha256"], hashlib.sha256(content).hexdigest())
+        self.assertEqual(self.runtime.seen["main.py"], result["sha256"])
+        self.assertEqual(list(self.root.glob(".cognix-*")), [])
+        self.assertTrue(self.cancel.is_set())
+        self.assertEqual(signal.getsignal(signal.SIGINT), handler)
+        report = Agent(None, self.runtime, self.cancel).run("Do not continue")
+        self.assertEqual(report["status"], "canceled")
+        self.assertEqual(report["modified_files"], ["main.py"])
+        self.assertEqual(report["events"][-1]["result"], result)
+
+    def test_sigint_before_rename_leaves_file_unchanged(self):
+        original = (self.root / "main.py").read_bytes()
+        fsync = os.fsync
+
+        def interrupt(fd):
+            fsync(fd)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        with patch("cognix.runtime.os.fsync", side_effect=interrupt):
+            result = self.edit()
+        self.assertEqual(result, {"status": "canceled", "executed": False})
+        self.assertEqual((self.root / "main.py").read_bytes(), original)
+        self.assertEqual(self.runtime.modified, set())
         self.assertEqual(list(self.root.glob(".cognix-*")), [])
 
     def test_edit_during_approval_is_preserved(self):

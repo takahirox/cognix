@@ -30,10 +30,11 @@ unsupported tools, failed probe, unavailable server, or cloud-backed tag stops
 startup with an error. No hosted API is required. Only loopback HTTP Ollama
 origins are accepted (`--ollama-url` or `COGNIX_OLLAMA_URL`).
 
-**Qwen3.8 27B remains an evaluation target, not a dependency.** The local server
-reported `qwen3.8:27b` missing during validation; its compatibility is unverified.
-Do not infer compatibility from a model name. The available `qwen3-coder:30b`
-passed the tool-call probe and three recorded fixture trials.
+**Qwen3.8 27B is an evaluated target, not a dependency.** Both `qwen3.8:27b`
+and `qwen3-coder:30b` passed the tool-call probe and three fixture trials each on
+Ollama 0.34.4. The target tag was explicitly downloaded for evaluation; normal
+startup never downloads a model automatically. See the validation record for
+exact model digests, observed results and platform limitations.
 
 ## Run
 

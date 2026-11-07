@@ -1,11 +1,16 @@
+import os
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from cognix.commands import SandboxUnavailable, parse_command, run, sandbox_argv
+from cognix.runtime import Runtime
 
 
 def verification_python():
@@ -99,6 +104,47 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(result["status"], "canceled")
         self.assertIsNotNone(result["exit_code"])
         self.assertTrue(result["executed"])
+
+    def test_sigint_after_launch_records_execution_and_reaps_process(self):
+        popen = subprocess.Popen
+        killpg = os.killpg
+        launched = []
+        handler = signal.getsignal(signal.SIGINT)
+
+        def launch(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            launched.append(process)
+            self.addCleanup(lambda: process.poll() is None and process.kill())
+            # Reproduce SIGINT before Popen's caller can take ownership.
+            os.kill(os.getpid(), signal.SIGINT)
+            return process
+
+        def kill_group(pid, sig):
+            # A second interruption must not abandon cleanup either.
+            os.kill(os.getpid(), signal.SIGINT)
+            killpg(pid, sig)
+
+        argv = [self.python, "-c", "import time; time.sleep(20)"]
+        runtime = Runtime(self.root, lambda *_: True, self.cancel, [tuple(argv)])
+        self.addCleanup(runtime.close)
+        started = time.monotonic()
+        with (
+            patch("cognix.commands.subprocess.Popen", side_effect=launch),
+            patch("cognix.commands.os.killpg", side_effect=kill_group),
+        ):
+            result = runtime.execute("run_command", {"argv": argv})
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(result["status"], "canceled")
+        self.assertTrue(result["executed"])
+        self.assertEqual(result["exit_code"], -signal.SIGKILL)
+        self.assertIsNotNone(launched[0].poll())
+        self.assertTrue(launched[0].stdout.closed)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(launched[0].pid, 0)
+        self.assertEqual(runtime.events[-1]["result"], result)
+        self.assertTrue(self.cancel.is_set())
+        self.assertEqual(signal.getsignal(signal.SIGINT), handler)
 
     @unittest.skipUnless(
         sys.platform == "darwin", "macOS single-process sandbox policy"
