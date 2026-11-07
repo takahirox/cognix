@@ -7,7 +7,7 @@ use std::{
     os::{
         fd::AsRawFd,
         unix::{
-            fs::PermissionsExt,
+            fs::{MetadataExt, PermissionsExt},
             process::{CommandExt, ExitStatusExt},
         },
     },
@@ -98,6 +98,55 @@ pub fn sandbox_argv(root: &Path, scratch: &Path, argv: &[String]) -> Result<Vec<
     Ok(out)
 }
 
+fn validate_project_reads(
+    root: &Path,
+    cancel: &Cancellation,
+    deadline: Instant,
+) -> Result<(), String> {
+    // Seatbelt's subpath rules cannot distinguish an ordinary project file from
+    // a hard link to outside data or .git. Reject the entire command rather than
+    // trying to infer which paths an interpreter or test runner might open.
+    // Run this after approval, immediately before launch. As with the file tools,
+    // concurrent hostile changes by another same-user process are out of scope.
+    let mut directories = vec![root.to_owned()];
+    let mut entries = 0;
+    while let Some(directory) = directories.pop() {
+        let listing = fs::read_dir(directory).map_err(|e| {
+            format!("Cannot inspect project command boundary; command not run: {e}")
+        })?;
+        for entry in listing {
+            if cancel.is_canceled() || Instant::now() >= deadline {
+                return Err("Project command boundary check interrupted".into());
+            }
+            entries += 1;
+            if entries > 100_000 {
+                return Err(
+                    "Project command boundary exceeds 100000 entries; command not run".into(),
+                );
+            }
+            let entry = entry.map_err(|e| format!("Cannot inspect project entry: {e}"))?;
+            // Seatbelt already denies .git, including case aliases. Never follow
+            // symlinks; Seatbelt checks their resolved targets at access time.
+            if entry
+                .file_name()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(b".git")
+            {
+                continue;
+            }
+            let info = fs::symlink_metadata(entry.path())
+                .map_err(|e| format!("Cannot inspect project entry: {e}"))?;
+            if info.is_file() && info.nlink() != 1 {
+                return Err("Project contains a file with multiple hard links; command not run. Use an ordinary copy of the file instead".into());
+            }
+            if info.is_dir() {
+                directories.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn descriptor_buffer() -> std::io::Result<Vec<libc::proc_fdinfo>> {
     // Allocate before fork. The kernel includes spare entries in its size estimate;
@@ -180,6 +229,14 @@ pub fn run(
     if cancel.is_canceled() {
         return Ok(json!({"status":"canceled","executed":false}));
     }
+    let validation = validate_project_reads(root, cancel, deadline);
+    if cancel.is_canceled() {
+        return Ok(json!({"status":"canceled","executed":false}));
+    }
+    if Instant::now() >= deadline {
+        return Ok(json!({"status":"limit_reached","executed":false}));
+    }
+    validation?;
     let temporary = tempfile::Builder::new()
         .prefix("cognix-check-")
         .tempdir()

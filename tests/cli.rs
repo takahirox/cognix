@@ -91,6 +91,78 @@ fn interactive_task_approval_and_exit() {
     assert!(s.contains("\\x1b"));
 }
 #[cfg(target_os = "macos")]
+fn check_approved_hard_link_command(git_alias: bool) {
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let source = if git_alias {
+        fs::create_dir(project.path().join(".git")).unwrap();
+        project.path().join(".git/config")
+    } else {
+        outside.path().join("secret")
+    };
+    let marker = "private hard-link contents";
+    fs::write(&source, marker).unwrap();
+    fs::create_dir(project.path().join("nested")).unwrap();
+    fs::hard_link(&source, project.path().join("nested/alias")).unwrap();
+    let argv = json!(["/bin/cat", "nested/alias"]);
+    let request = argv.clone();
+    let server = Server::new(move |p, b| {
+        if p != "/api/chat" || b["messages"].as_array().unwrap().len() == 1 {
+            ready(p, b)
+        } else {
+            match b["messages"].as_array().unwrap().len() {
+                2 => tool("read_file", json!({"path":"nested/alias"})),
+                4 => tool("run_command", json!({"argv":request})),
+                _ => final_answer(),
+            }
+        }
+    });
+    let out = run(
+        command(project.path(), &server.url).args([
+            "--task",
+            "verify",
+            "--allow-command",
+            &argv.to_string(),
+        ]),
+        "y\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stdout.contains("Approve this action?"), "{stdout}");
+    assert!(!stdout.contains(marker), "{stdout}");
+    assert!(!stderr.contains(marker), "{stderr}");
+    let requests = server.requests.lock().unwrap();
+    let results: Vec<Value> = requests.last().unwrap()["body"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| serde_json::from_str(m["content"].as_str().unwrap()).unwrap())
+        .collect();
+    assert_eq!(results[0]["status"], "failed");
+    let result = &results[1];
+    assert_eq!(result["status"], "not_run", "{result}");
+    assert_eq!(result["executed"], false, "{result}");
+    assert!(
+        result["error"].as_str().unwrap().contains("hard link"),
+        "{result}"
+    );
+    assert!(result["exit_code"].is_null(), "{result}");
+    assert!(result["output"].is_null(), "{result}");
+    assert_eq!(fs::read_to_string(&source).unwrap(), marker);
+}
+#[cfg(target_os = "macos")]
+#[test]
+fn approved_command_rejects_outside_hard_link() {
+    check_approved_hard_link_command(false);
+}
+#[cfg(target_os = "macos")]
+#[test]
+fn approved_command_rejects_git_hard_link() {
+    check_approved_hard_link_command(true);
+}
+#[cfg(target_os = "macos")]
 #[test]
 fn approved_command_cannot_use_inherited_outside_descriptors() {
     use std::os::{

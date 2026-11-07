@@ -72,6 +72,17 @@ An explicitly chosen shell or interpreter is still constrained by the sandbox.
 Approval is required even for an allowlisted invocation. An unsupported sandbox
 or sandbox launch failure never triggers an unsandboxed retry.
 
+After approval, every command checks the readable project tree before launch.
+Any regular file with multiple hard links refuses the entire command with
+`not_run` and `executed: false`, even when that file is absent from argv: a test
+runner can open arbitrary project files. Use an ordinary copy instead of a hard
+link. Seatbelt's path rules alone cannot distinguish a project file from an alias
+to outside data or Git metadata. This check skips `.git` (already denied by
+Seatbelt), never follows symlinks, and fails closed on inspection errors or more
+than 100,000 entries. Inspection shares the command deadline and cancellation
+flag. As with the file tools, concurrent hostile changes by another process
+running as the same user are outside this boundary.
+
 Commands receive a fresh environment with a fixed PATH, scratch HOME/TMP,
 disabled Python bytecode/user site, and disabled global/system Git configuration.
 API keys, SSH agents, proxy settings, Python paths and other parent variables are
