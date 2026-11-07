@@ -89,7 +89,7 @@ provider messages and results. Optional DeepSeek and Codex comparisons were
 | Check | Result |
 | --- | --- |
 | `python3 -m venv .venv` and `.venv/bin/python -m pip install '.[dev]'` | Pass: package built/installed with Ruff 0.17.4; no runtime dependencies. |
-| `.venv/bin/python -m unittest discover -s tests -v` | Pass: 44 tests, no failures/errors/skips, 12.832 seconds on this host. Covers real sandbox execution and HTTP/CLI boundaries without inference. |
+| `.venv/bin/python -m unittest discover -s tests -v` | Pass: 46 tests, no failures/errors/skips, 13.376 seconds on this host. Covers real sandbox execution and HTTP/CLI boundaries without inference. |
 | `.venv/bin/ruff check .` | Pass. |
 | `.venv/bin/ruff format --check .` | Pass. |
 | `.venv/bin/python scripts/check_docs.py` | Pass: 11 Markdown documents, 0 local-link/anchor/structure/template-metadata errors. |
@@ -103,6 +103,16 @@ startup probe). These observations and the test-suite time are local feedback
 measurements, not performance budgets or cross-machine guarantees. The SIGINT
 regressions were checked on the final implementation; both models' fixture
 results remain separate from deterministic security and cancellation tests.
+
+The handler-restoration fix extends SIGINT deferral through tool return, cleanup
+and ledger insertion. Two added regressions inject SIGINT immediately after the
+normal handler is restored: committed patches retain their digest and modified
+file evidence; completed commands retain `executed=true`, exit code 0 and output.
+Both regressions fail against the preceding implementation and pass with this
+fix. Ruff lint/format, documentation and whitespace checks also passed.
+Actual-model trials were **Not run** again for this cancellation fix; their
+stored source hashes identify the earlier trial revision. Real Linux/bubblewrap
+validation remains **Not run**, pending the review question's external evidence.
 
 Required post-merge verification: none required. No CI run exists for this
 checkpoint; local results do not imply CI or deployment success.

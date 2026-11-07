@@ -130,9 +130,9 @@ def _kill(process):
     process.wait()
 
 
-def run(root, argv, cancel, timeout=30, output_limit=16384):
+def run(root, argv, cancel, timeout=30, output_limit=16384, *, interrupts=None):
     with (
-        defer_sigint(cancel) as canceled,
+        defer_sigint(cancel, until=interrupts) as canceled,
         tempfile.TemporaryDirectory(prefix="cognix-check-") as temporary,
     ):
         scratch = Path(temporary).resolve()

@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from cognix.agent import Agent
 from cognix.commands import SandboxUnavailable, parse_command, run, sandbox_argv
 from cognix.runtime import Runtime
 
@@ -145,6 +146,35 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(runtime.events[-1]["result"], result)
         self.assertTrue(self.cancel.is_set())
         self.assertEqual(signal.getsignal(signal.SIGINT), handler)
+
+    def test_sigint_at_handler_restoration_keeps_completed_command_evidence(self):
+        install = signal.signal
+        handler = signal.getsignal(signal.SIGINT)
+        restored = []
+
+        def restore(signum, replacement):
+            previous = install(signum, replacement)
+            if replacement == handler:
+                restored.append(True)
+                os.kill(os.getpid(), signal.SIGINT)
+            return previous
+
+        argv = [self.python, "-c", "print('completed')"]
+        runtime = Runtime(self.root, lambda *_: True, self.cancel, [tuple(argv)])
+        self.addCleanup(runtime.close)
+        with patch("cognix.cancellation.signal.signal", side_effect=restore):
+            result = runtime.execute("run_command", {"argv": argv})
+        self.assertEqual(restored, [True])
+        self.assertEqual(signal.getsignal(signal.SIGINT), handler)
+        self.assertEqual(result["status"], "canceled")
+        self.assertTrue(result["executed"])
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["output"], "completed\n")
+        self.assertEqual(runtime.events[-1]["result"], result)
+        self.assertTrue(self.cancel.is_set())
+        report = Agent(None, runtime, self.cancel).run("Do not continue")
+        self.assertEqual(report["status"], "canceled")
+        self.assertEqual(report["checks"][-1]["result"], result)
 
     @unittest.skipUnless(
         sys.platform == "darwin", "macOS single-process sandbox policy"
