@@ -1,3 +1,4 @@
+import hashlib
 import os
 import tempfile
 import threading
@@ -127,6 +128,51 @@ class RuntimeTests(unittest.TestCase):
             )
             self.assertNotIn("escape", self.call("list_files", path=".")["entries"])
             self.assertEqual(target.read_text(), "outside")
+
+    def test_git_metadata_case_aliases_are_denied(self):
+        (self.root / ".git").mkdir()
+        config = self.root / ".git/config"
+        config.write_text("git config")
+        (self.root / "nested").mkdir()
+        gitfile = self.root / "nested/.GiT"
+        gitfile.write_text("gitdir: elsewhere")
+
+        for parent, metadata, target in [
+            (".", ".git", config),
+            ("nested", ".GiT", gitfile),
+        ]:
+            with self.subTest(parent=parent):
+                self.assertNotIn(
+                    metadata + ("/" if target == config else ""),
+                    self.call("list_files", path=parent)["entries"],
+                )
+                original = target.read_bytes()
+                digest = hashlib.sha256(original).hexdigest()
+                for alias in [".git", ".GIT", ".GiT"]:
+                    directory = f"{parent}/{alias}"
+                    path = f"{directory}/config" if target == config else directory
+                    # A known digest must not let patches bypass path protection.
+                    self.runtime.seen[path.removeprefix("./")] = digest
+                    for tool, args in [
+                        ("list_files", {"path": directory}),
+                        ("read_file", {"path": path}),
+                        (
+                            "apply_patch",
+                            {
+                                "path": path,
+                                "sha256": digest,
+                                "old_text": original.decode(),
+                                "new_text": "overwritten",
+                            },
+                        ),
+                    ]:
+                        with self.subTest(alias=alias, tool=tool):
+                            result = self.call(tool, **args)
+                            self.assertEqual(result["status"], "failed")
+                            self.assertIn(".git access", result["error"])
+                self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(self.previews, [])
+        self.assertEqual(self.runtime.modified, set())
 
     def test_bad_arguments_and_precise_failures(self):
         for name, args in [
