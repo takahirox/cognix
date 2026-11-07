@@ -36,6 +36,10 @@ def render(report):
     show(f"\nSession: {report['status']}")
     if report["error"]:
         show(report["error"])
+    if report["model_reply"]:
+        show("\nModel response (not verification evidence):")
+        show(report["model_reply"])
+    show("\nRecorded execution evidence:")
     show("Modified files: " + (", ".join(report["modified_files"]) or "none"))
     if not report["checks"]:
         show("Verification: not run (no command executed)")
@@ -64,9 +68,7 @@ def render(report):
             show(
                 f"{event['tool']}: {event['result']['status']}: {event['result'].get('error', '')}"
             )
-    # Free-form model prose is retained in memory, but cannot override or invent
-    # evidence in terminal results (including false 'tests passed' claims).
-    show("Results above are recorded execution evidence. 'passed' means exit code 0.")
+    show("Recorded 'passed' means exit code 0.")
 
 
 def positive(value):
