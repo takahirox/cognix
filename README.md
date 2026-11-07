@@ -41,6 +41,46 @@ Ollama 0.34.4. The target tag was explicitly downloaded for evaluation; normal
 startup never downloads a model automatically. See the validation record for
 exact model digests, observed results and platform limitations.
 
+## Development launcher
+
+On Apple Silicon macOS, install Rust/Cargo 1.87+ and Ollama, with `cargo` and
+`ollama` on `PATH`. The launcher uses the macOS-provided Bash, curl and plutil;
+it needs no Python runtime. Install a compatible model explicitly with
+`ollama pull` as shown above, then run:
+
+```sh
+./scripts/dev.sh --model qwen3.8:27b
+./scripts/dev.sh --root '/path/to/my project' --task 'Inspect main.py' \
+  --allow-command '["/usr/bin/true"]'
+# From another directory (the current directory remains the default project):
+/path/to/cognix/scripts/dev.sh --model qwen3-coder:30b
+```
+
+The script is committed executable; if a copy lost that permission, run
+`chmod +x scripts/dev.sh`. It builds the native debug CLI using the repository's
+Cargo manifest and `target` directory, forwarding all CLI arguments unchanged.
+`COGNIX_MODEL`, `COGNIX_OLLAMA_URL` and the `--ollama-url` override still apply.
+
+An existing server with a valid Ollama `/api/version` response is reused and
+left running. If the default `http://127.0.0.1:11434` endpoint refuses connections,
+the launcher starts `ollama serve` bound to that address, waits up to 30 seconds,
+and stops only its own server/process group on exit or interruption. Custom local
+HTTP endpoints must already be running; the launcher never starts a daemon for
+them. An incompatible or unresponsive listener produces an error. Override the
+readiness deadline with `COGNIX_DEV_STARTUP_TIMEOUT` (1–300 seconds) if necessary.
+Startup prints the path to a retained temporary `ollama.log`; inspect it with
+`cat /printed/path/ollama.log`, then delete that temporary directory when done.
+Normal Cognix exit codes pass through; Ctrl-C, termination and hangup exit with
+130, 143 and 129 respectively, with bounded cleanup of owned processes.
+
+The launcher never pulls models or selects a hosted fallback. Cognix still
+checks local model readiness and tool calling, and retains its existing approval,
+sandbox and command allowlist behavior. To run manually, start `ollama serve` in
+one terminal (or use the Ollama app), then run
+`cargo run --locked --manifest-path /path/to/cognix/Cargo.toml -- --model qwen3.8:27b`
+in another, or use the built executable described below. See the
+[launcher validation record](docs/dev-launcher-validation.md) for focused checks.
+
 ## Run
 
 Start from a selected project directory using the installed executable:
