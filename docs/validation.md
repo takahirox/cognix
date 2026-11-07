@@ -1,13 +1,43 @@
 # Rust migration validation (Issue #8)
 
-This record applies to the Rust source and Cargo lockfile committed with it.
+The initial migration results below apply to commit `9e90e6e` and its Cargo lockfile.
 The raw model trials contain SHA-256 hashes of the implementation, evaluator,
 documentation checker, manifests and fixture used. Their source hashes were
-checked against the final files. No PR, push, merge, comment or Issue closure was
+checked against that baseline. The descriptor-isolation revision has separate
+evidence below; those earlier model trials were not rerun for the revision.
+No PR, push, merge, comment or Issue closure was
 performed by this implementation node. Review and integration remain downstream.
 
 The [Python validation record](validation-python.md) and its two raw JSON records
 are historical evidence only. They are not Rust test results.
+
+## Review revision: inherited descriptor isolation (AC6)
+
+On 2026-11-07 on the same Apple Silicon macOS environment, fixed command spawning
+to mark all non-stdio descriptors close-on-exec in the forked child. The native
+descriptor-table query covers handles above lowered soft/hard descriptor limits;
+an enumeration failure, possibly truncated result or flag-setting failure aborts
+launch. All allocation happens before fork, and the spawn-error pipe stays open
+until exec so launch failures retain their normal reporting.
+
+`tests/cli.rs::approved_command_cannot_use_inherited_outside_descriptors` starts
+the actual CLI with low and high (at least 4096) inheritable handles to a synthetic
+outside file, then lowers both descriptor limits to 256. A deterministic Ollama
+fixture requests an allowlisted Python probe, approved through real CLI stdin.
+Reads, writes and metadata access through both handles fail with `EBADF`; stdin
+is empty, stdout/stderr are captured in order, the outside file is unchanged,
+and recorded evidence reports execution with exit 0 and `passed`. This regression
+was also run against the original launcher and failed because an outside handle
+was accessible. With the fix it passes. A real-subprocess unit test additionally
+checks that a truncated descriptor list aborts spawn and exec failure still
+returns `ENOENT` through Rust's error pipe.
+
+Revision checks: `cargo test --locked --all-targets` (37 passed, no failures or
+skips, including real macOS sandbox/cancellation tests), rustfmt, Clippy with
+warnings denied, the repository documentation checker and `git diff --check`
+all passed. Local-model trials remain evidence for the baseline above, rather
+than new observations of this revision. Non-macOS command support remains
+unsupported and fail closed.
 
 ## Environment and reproduction
 

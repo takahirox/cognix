@@ -90,6 +90,93 @@ fn interactive_task_approval_and_exit() {
     assert!(!s.contains('\u{1b}'));
     assert!(s.contains("\\x1b"));
 }
+#[cfg(target_os = "macos")]
+#[test]
+fn approved_command_cannot_use_inherited_outside_descriptors() {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::process::CommandExt,
+    };
+
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let secret_path = outside.path().join("secret");
+    fs::write(&secret_path, "outside descriptor marker").unwrap();
+    let secret = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&secret_path)
+        .unwrap();
+    // Keep these CLOEXEC in the test runner so parallel tests cannot inherit them.
+    // Only the Cognix subprocess clears the flags, simulating an embedding host.
+    let duplicate = |min: i32| {
+        let fd = unsafe { libc::fcntl(secret.as_raw_fd(), libc::F_DUPFD_CLOEXEC, min) };
+        assert!(fd >= min);
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    };
+    let low = duplicate(3);
+    let high = duplicate(4096);
+    let fds = [low.as_raw_fd(), high.as_raw_fd()];
+    let code = format!(
+        "import errno,os\nfor fd in {fds:?}:\n for action in [lambda:os.read(fd,100),lambda:os.write(fd,b'corrupt'),lambda:os.fstat(fd)]:\n  try: action()\n  except OSError as e: assert e.errno==errno.EBADF,e\n  else: raise AssertionError('inherited outside handle accessible')\nassert os.read(0,1)==b''\nos.write(1,b'stdout preserved\\n')\nos.write(2,b'stderr preserved\\n')"
+    );
+    let argv = json!(["/opt/homebrew/bin/python3", "-c", code]);
+    let request = argv.clone();
+    let server = Server::new(move |p, b| {
+        if p != "/api/chat" || b["messages"].as_array().unwrap().len() == 1 {
+            ready(p, b)
+        } else if b["messages"].as_array().unwrap().len() == 2 {
+            tool("run_command", json!({"argv":request}))
+        } else {
+            final_answer()
+        }
+    });
+    let mut c = command(project.path(), &server.url);
+    c.args(["--task", "verify", "--allow-command", &argv.to_string()]);
+    // Change only the subprocess's limits. The high descriptor remains open even
+    // above the hard limit, defeating sanitizers that sweep only to that limit.
+    unsafe {
+        c.pre_exec(move || {
+            for fd in fds {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            let limit = libc::rlimit {
+                rlim_cur: 256,
+                rlim_max: 256,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = run(&mut c, "y\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("Approve this action?"), "{stdout}");
+    // Inspect the actual tool result sent back to the model, not its final prose.
+    let requests = server.requests.lock().unwrap();
+    let result = requests
+        .iter()
+        .flat_map(|r| r["body"]["messages"].as_array().into_iter().flatten())
+        .find(|m| m["role"] == "tool" && m["tool_name"] == "run_command")
+        .unwrap();
+    let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+    assert_eq!(result["status"], "passed", "{result}");
+    assert_eq!(result["executed"], true, "{result}");
+    assert_eq!(result["exit_code"], 0, "{result}");
+    assert_eq!(result["output"], "stdout preserved\nstderr preserved\n");
+    assert_eq!(
+        fs::read_to_string(&secret_path).unwrap(),
+        "outside descriptor marker"
+    );
+}
 #[test]
 fn eof_denies_and_invalid_options_fail() {
     let server = Server::new(|p, b| {

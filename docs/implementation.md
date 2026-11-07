@@ -75,7 +75,12 @@ or sandbox launch failure never triggers an unsandboxed retry.
 Commands receive a fresh environment with a fixed PATH, scratch HOME/TMP,
 disabled Python bytecode/user site, and disabled global/system Git configuration.
 API keys, SSH agents, proxy settings, Python paths and other parent variables are
-not inherited. The sandbox allows project and runtime reads, scratch writes,
+not inherited. Before exec on macOS, the forked child enumerates its actual file
+descriptor table and marks every descriptor above stderr close-on-exec. Enumeration
+or flag-setting failures abort launch; an incomplete table never permits execution.
+Only redirected stdin/stdout/stderr survive exec, while Rust's spawn-error pipe
+remains usable until exec succeeds or reports failure. The parent is unaffected.
+The sandbox allows project and runtime reads, scratch writes,
 and no network or project writes. Verification that needs dependency downloads,
 project build output, child services, or user configuration can fail under this
 policy; install dependencies separately and choose checks compatible with it.

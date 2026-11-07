@@ -98,6 +98,75 @@ pub fn sandbox_argv(root: &Path, scratch: &Path, argv: &[String]) -> Result<Vec<
     Ok(out)
 }
 
+#[cfg(target_os = "macos")]
+fn descriptor_buffer() -> std::io::Result<Vec<libc::proc_fdinfo>> {
+    // Allocate before fork. The kernel includes spare entries in its size estimate;
+    // if other threads outgrow it before fork, the child fails closed below.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if bytes <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((0..bytes as usize / size_of::<libc::proc_fdinfo>())
+        .map(|_| libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0,
+        })
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn sanitize_descriptors(buffer: &mut [libc::proc_fdinfo]) -> std::io::Result<()> {
+    // Only called in the forked child. libproc's proc_pidinfo is a thin syscall
+    // wrapper, so this uses no allocator or userspace locks after fork.
+    // Enumerate the child's actual table, including Rust's newly created spawn
+    // error pipe and descriptors above any subsequently lowered RLIMIT_NOFILE.
+    let capacity = i32::try_from(std::mem::size_of_val(buffer))
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::E2BIG))?;
+    if capacity == 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::E2BIG));
+    }
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            buffer.as_mut_ptr().cast(),
+            capacity,
+        )
+    };
+    if bytes <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // A full buffer may be truncated. Never launch with an incomplete list.
+    if bytes >= capacity || !(bytes as usize).is_multiple_of(size_of::<libc::proc_fdinfo>()) {
+        return Err(std::io::Error::from_raw_os_error(libc::E2BIG));
+    }
+    for entry in &buffer[..bytes as usize / size_of::<libc::proc_fdinfo>()] {
+        if entry.proc_fd >= 3 {
+            let flags = unsafe { libc::fcntl(entry.proc_fd, libc::F_GETFD) };
+            if flags < 0
+                || (flags & libc::FD_CLOEXEC == 0
+                    && unsafe {
+                        libc::fcntl(entry.proc_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC)
+                    } < 0)
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    // CLOEXEC, rather than close(), keeps Rust's error pipe usable if exec fails.
+    // The caller's stdin/stdout/stderr have already been redirected by Command.
+    Ok(())
+}
+
 pub fn run(
     root: &Path,
     argv: &[String],
@@ -141,9 +210,14 @@ pub fn run(
     command
         .stdout(writer.try_clone().map_err(|e| e.to_string())?)
         .stderr(writer);
-    // SAFETY: setsid is async-signal-safe; no locks/allocations after fork.
+    #[cfg(target_os = "macos")]
+    let mut descriptors = descriptor_buffer()
+        .map_err(|e| format!("Cannot prepare descriptor isolation; command not run: {e}"))?;
+    // SAFETY: only syscall wrappers and preallocated memory are used after fork.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
+            #[cfg(target_os = "macos")]
+            sanitize_descriptors(&mut descriptors)?;
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -259,4 +333,36 @@ pub fn run(
         result["error"] = json!(error);
     }
     Ok(result)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_sanitization_fails_closed_and_preserves_spawn_errors() {
+        // An undersized list must abort spawn; it cannot silently omit handles.
+        let mut small = descriptor_buffer().unwrap();
+        small.truncate(1);
+        let mut command = Command::new("/usr/bin/true");
+        unsafe {
+            command.pre_exec(move || sanitize_descriptors(&mut small));
+        }
+        assert_eq!(
+            command.spawn().unwrap_err().raw_os_error(),
+            Some(libc::E2BIG)
+        );
+
+        // A failed exec after sanitization still reaches the parent's spawn pipe.
+        let root = tempfile::tempdir().unwrap();
+        let mut descriptors = descriptor_buffer().unwrap();
+        let mut command = Command::new(root.path().join("missing-executable"));
+        unsafe {
+            command.pre_exec(move || sanitize_descriptors(&mut descriptors));
+        }
+        assert_eq!(
+            command.spawn().unwrap_err().raw_os_error(),
+            Some(libc::ENOENT)
+        );
+    }
 }
