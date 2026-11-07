@@ -3,13 +3,64 @@
 The initial migration results below apply to commit `9e90e6e` and its Cargo lockfile.
 The raw model trials contain SHA-256 hashes of the implementation, evaluator,
 documentation checker, manifests and fixture used. Their source hashes were
-checked against that baseline. The descriptor-isolation revision has separate
-evidence below; those earlier model trials were not rerun for the revision.
+checked against that baseline. The descriptor-isolation and hard-link revisions
+have separate evidence below; earlier trials remain observations of their
+recorded implementation rather than new observations of later revisions.
 No PR, push, merge, comment or Issue closure was
 performed by this implementation node. Review and integration remain downstream.
 
 The [Python validation record](validation-python.md) and its two raw JSON records
 are historical evidence only. They are not Rust test results.
+
+## Review revision: hard-link command boundary (AC6, AC8)
+
+On 2026-11-07 on the Apple M4 Max/macOS environment below, added a project-tree
+inspection after command approval and before launch. Seatbelt's path rules
+allowed a project hard link to expose outside file data or `.git/config` even
+though `read_file` refused the same alias. Commands now refuse to launch if any
+regular file in the readable tree has multiple hard links. Inspection errors
+and more than 100,000 entries also fail closed; cancellation and the command
+deadline cover inspection. The existing documented exclusion of hostile
+same-user concurrent filesystem changes still applies.
+
+The real CLI subprocess regressions
+`approved_command_rejects_outside_hard_link` and
+`approved_command_rejects_git_hard_link` in `tests/cli.rs` both failed against the
+previous launcher: after real stdin approval, `/bin/cat nested/alias` exposed
+synthetic private contents and recorded `passed`, `executed: true`, exit 0.
+Both now pass: `read_file` rejects the alias, approval cannot override the command
+boundary, no contents are exposed, and the tool result records `not_run`,
+`executed: false`, with no exit code or command output. Unsupported final model
+success claims do not change that result. `tests/root_changes.rs` additionally
+checks a nested hard link introduced during approval, absent from command argv,
+and verifies the same refusal in the runtime ledger.
+
+Revision checks: `cargo test --locked --all-targets` passed all 40 tests with no
+failures or skips, including the existing real macOS subprocess isolation,
+inherited-descriptor, timeout, SIGINT and fixture failure/recovery checks.
+`cargo fmt --all -- --check`, Clippy with warnings denied,
+`cargo build --locked --release`, the native CLI `--help` smoke check, the
+repository documentation checker and `git diff --check` passed. `file` identified
+the release executable as Mach-O 64-bit arm64.
+
+Reran `evaluate_ollama` with `--runs 1` for each previously installed model on
+Ollama 0.34.4, using the same fixture, hardware, exact test argv and model
+digests documented below. No model download was needed. Each observed attempt
+inspected the fixture, ran an approved failing test (exit 1), applied an approved
+`main.py` correction, then ran an approved passing test (exit 0); tests stayed
+unchanged and the session ended with `final_answer`.
+
+| Model | Attempts | Successes | Failures | Elapsed seconds |
+| --- | --- | --- | --- | --- |
+| `qwen3-coder:30b` | 1 | 1 | 0 | 14.93 |
+| `qwen3.8:27b` | 1 | 1 | 0 | 52.69 |
+
+These are fresh observations of this revision, separate from the three-trial
+baseline records below. The evaluator's recorded source hashes matched the
+current Rust sources, examples, manifests and fixture files;
+`src/commands.rs` SHA-256 was
+`de3217fa0259a0d06b28b1f05885836322b50c231e5fe188b80d063f40819fd0`.
+Reproduce with the evaluator commands below using `--runs 1`.
 
 ## Review revision: inherited descriptor isolation (AC6)
 
@@ -85,7 +136,7 @@ source hashes. Product CLI sessions always ask for each write/command approval.
 | AC3 — Provider | `src/provider.rs`; `tests/provider.rs` exercises native Ollama payloads/probe, alternate model selection, missing server/model, cloud/unsupported tags, failed capability/probe, malformed/oversized/incomplete responses, timeout/cancellation and context errors. Both actual local models passed readiness/probe and fixture trials below. | Pass on recorded local tags. No hosted inference or automatic download. |
 | AC4 — Agent/context | `tests/agent.rs`: ordered results and native/generated IDs, retained thinking/history across turns, duplicate/malformed batch rejection before effects, closed schemas and recoverable errors, final answers, step/context/provider stops, cancellation and queued unrun calls. | Pass. |
 | AC5 — Tools/edits | `tests/runtime.rs`: all four tools, schema/type/path failures, missing/large/binary/nonregular files, bounded listings, unique-span/stale-hash checks, previews, approval/denial, atomic writes, concurrent edits/parent swaps and preservation of unrelated changes. | Pass. Existing-file targeted patches retain the baseline scope. |
-| AC6 — Safety | Real macOS subprocesses in `tests/commands.rs` deny outside/symlink reads, root/outside writes, network, Git metadata/case aliases, forks and child spawning. Scratch writes work; environment is restricted to the documented set. Limits/cancel kill and reap the process. Directory-FD tools deny symlinks/hardlinks/traversal/Git aliases; `tests/root_changes.rs` rejects a replaced root. CLI tests send real SIGINT. | Pass on macOS Seatbelt. Linux is unsupported and fails closed before command approval/launch; real Linux validation is Not run and no Linux isolation is claimed. |
+| AC6 — Safety | Real macOS subprocesses in `tests/commands.rs` deny outside/symlink reads, root/outside writes, network, Git metadata/case aliases, forks and child spawning. Scratch writes work; environment is restricted to the documented set. Limits/cancel kill and reap the process. Directory-FD tools deny symlinks/hardlinks/traversal/Git aliases; `tests/root_changes.rs` rejects a replaced root and hard links introduced during approval. CLI subprocesses refuse approved commands with outside/Git hard-link aliases and send real SIGINT. | Pass on macOS Seatbelt plus the prelaunch hard-link check described above. Linux is unsupported and fails closed before command approval/launch; real Linux validation is Not run and no Linux isolation is claimed. |
 | AC7 — S1–S6 | Deterministic fixture test actually inspects, runs failing tests, approves/applies a correction and reruns to pass, asserting failure feedback and unchanged tests/user files. Actual local-model trials exercise the same flow with recorded approvals; alternate selection and unsupported models have deterministic tests. Setup, hardware, versions, exact tags/digests and outcomes are recorded here and in JSON. | Pass on both recorded models; observations are not a general success-rate guarantee. |
 | AC8 — Truthful evidence | Runtime-owned ledger and separate model prose; `tests/agent.rs` and `tests/cli.rs` test unsupported success claims, all six outcome statuses and queued unrun work. `src/runtime_tests.rs` injects cancellation immediately before/after atomic commit, at spawn ownership, cleanup and completed-command return. Executed flags, exit codes/output, hashes, modified files and ledger survive. Real CLI SIGINT tests cover committed edits and running commands. | Pass. Completed work remains recorded; no automatic rollback or further unapproved action. |
 | AC9 — Complete migration/docs | Cargo is the source of truth. Python package/entry points, old application regression tests and Python evaluation/docs scripts are retired after porting coverage. Rust check/evaluation examples replace the scripts. README, MVP, implementation and contributor/testing guidance describe Rust. Native build/install, formatting, lint, tests, docs and whitespace checks below ran successfully. | Pass. Historical Python evidence is explicitly separate. |
