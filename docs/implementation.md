@@ -121,6 +121,13 @@ output pipes then keeps running. Linux's PID namespace bounds descendants;
 macOS denies child creation. Captured output is returned to the model as data.
 Terminal control characters are escaped in tool output, paths and diffs.
 
+During command launch/cleanup and the patch's atomic rename/bookkeeping, SIGINT
+requests cancellation without interrupting ownership or evidence updates. A
+launched command is killed and reaped and remains recorded as executed. An
+approved patch already committed at interruption remains in modified files with
+`executed: true` and a canceled result; cancellation does not undo approved edits.
+Approval prompts keep their normal immediate Ctrl-C behavior.
+
 The runtime's ledger determines modified files, exact checks, execution flags,
 exit codes, failures, denials and unrun/canceled/limited work. The CLI displays
 sanitized final model prose in a labeled response section so inspection answers

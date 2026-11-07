@@ -11,6 +11,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from .cancellation import defer_sigint
+
 
 class SandboxUnavailable(ValueError):
     pass
@@ -129,7 +131,10 @@ def _kill(process):
 
 
 def run(root, argv, cancel, timeout=30, output_limit=16384):
-    with tempfile.TemporaryDirectory(prefix="cognix-check-") as temporary:
+    with (
+        defer_sigint(cancel) as canceled,
+        tempfile.TemporaryDirectory(prefix="cognix-check-") as temporary,
+    ):
         scratch = Path(temporary).resolve()
         command = sandbox_argv(root, scratch, argv)
         env = {
@@ -145,27 +150,28 @@ def run(root, argv, cancel, timeout=30, output_limit=16384):
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0",
         }
-        if cancel.is_set():
+        if canceled():
             return {"status": "canceled", "executed": False}
-        process = subprocess.Popen(
-            command,
-            cwd=root,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-        )
+        process = None
         output = bytearray()
-        deadline = time.monotonic() + timeout
         status = None
         try:
+            process = subprocess.Popen(
+                command,
+                cwd=root,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+            deadline = time.monotonic() + timeout
             with selectors.DefaultSelector() as selector:
                 os.set_blocking(process.stdout.fileno(), False)
                 selector.register(process.stdout, selectors.EVENT_READ)
                 while selector.get_map():
-                    if cancel.is_set():
+                    if canceled():
                         status = "canceled"
                         break
                     if time.monotonic() >= deadline:
@@ -186,19 +192,26 @@ def run(root, argv, cancel, timeout=30, output_limit=16384):
                         break
                 # A process may close stdout and keep running; the same deadline still applies.
                 while status is None and process.poll() is None:
-                    if cancel.wait(0.02):
+                    if canceled():
                         status = "canceled"
                     elif time.monotonic() >= deadline:
                         status = "limit_reached"
-            if cancel.is_set():
+                    else:
+                        cancel.wait(0.02)
+            if canceled():
                 status = "canceled"
         except KeyboardInterrupt:
             cancel.set()
             status = "canceled"
         finally:
             # Also kills descendants retaining pipes or surviving after their parent exited.
-            _kill(process)
-            process.stdout.close()
+            if process is not None:
+                _kill(process)
+                process.stdout.close()
+        if process is None:
+            return {"status": "canceled", "executed": False}
+        if canceled():
+            status = "canceled"
         return {
             "status": status or ("passed" if process.returncode == 0 else "failed"),
             "executed": True,

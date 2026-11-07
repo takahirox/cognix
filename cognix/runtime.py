@@ -8,6 +8,7 @@ import stat
 from pathlib import Path
 
 from . import commands
+from .cancellation import defer_sigint
 from .provider import Cancelled
 from .schema import validate
 
@@ -180,14 +181,26 @@ class Runtime:
                 os.fsync(target.fileno())
             if self.cancel.is_set():
                 raise Cancelled()
-            os.rename(temporary, parts[-1], src_dir_fd=parent, dst_dir_fd=parent)
-            temporary = None
-            self.modified.add(normalized)
-            self.seen[normalized] = hashlib.sha256(encoded).hexdigest()
-            return {"path": normalized, "sha256": self.seen[normalized]}
+            # SIGINT requests cancellation here, but cannot split the committed
+            # rename from its evidence. Approved bytes may already be visible.
+            with defer_sigint(self.cancel) as canceled:
+                if canceled():
+                    raise Cancelled()
+                os.rename(temporary, parts[-1], src_dir_fd=parent, dst_dir_fd=parent)
+                temporary = None
+                self.modified.add(normalized)
+                self.seen[normalized] = hashlib.sha256(encoded).hexdigest()
+                return {
+                    "path": normalized,
+                    "sha256": self.seen[normalized],
+                    "executed": True,
+                }
         finally:
             if temporary:
-                os.unlink(temporary, dir_fd=parent)
+                try:
+                    os.unlink(temporary, dir_fd=parent)
+                except FileNotFoundError:
+                    pass
             os.close(parent)
 
     def run_command(self, argv):
@@ -233,5 +246,7 @@ class Runtime:
                 "executed": False,
                 "error": str(exc)[:1000],
             }
+        if self.cancel.is_set() and result["status"] in {"ok", "passed"}:
+            result["status"] = "canceled"
         self.events.append({"tool": name, "arguments": arguments, "result": result})
         return result
