@@ -1,4 +1,5 @@
 use clap::Parser;
+use cognix::cli::Args;
 use cognix::{
     Cancellation,
     agent::Agent,
@@ -7,54 +8,8 @@ use cognix::{
     runtime::Runtime,
     terminal::{input, render, show},
 };
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
-fn positive(s: &str) -> Result<usize, String> {
-    s.parse::<usize>()
-        .ok()
-        .filter(|n| *n > 0)
-        .ok_or("must be greater than zero".into())
-}
-fn seconds(s: &str) -> Result<usize, String> {
-    positive(s).and_then(|n| {
-        if n <= 86400 {
-            Ok(n)
-        } else {
-            Err("must be at most 86400 seconds".into())
-        }
-    })
-}
-#[derive(Parser)]
-#[command(
-    version,
-    about = "Cognix: bounded local edit-and-verify agent. Ctrl-C cancels; /exit quits."
-)]
-struct Args {
-    #[arg(long, default_value = ".")]
-    root: PathBuf,
-    #[arg(long, env = "COGNIX_MODEL", default_value = "qwen3-coder:30b")]
-    model: String,
-    #[arg(
-        long,
-        env = "COGNIX_OLLAMA_URL",
-        default_value = "http://127.0.0.1:11434"
-    )]
-    ollama_url: String,
-    #[arg(long)]
-    task: Option<String>,
-    #[arg(long, value_name = "JSON_ARGV")]
-    allow_command: Vec<String>,
-    #[arg(long,default_value="16",value_parser=positive)]
-    max_steps: usize,
-    #[arg(long,default_value="16384",value_parser=positive)]
-    num_ctx: usize,
-    #[arg(long,default_value="120",value_parser=seconds)]
-    model_timeout: usize,
-    #[arg(long,default_value="30",value_parser=seconds)]
-    command_timeout: usize,
-    #[arg(long,default_value="16384",value_parser=positive)]
-    output_limit: usize,
-}
 #[tokio::main]
 async fn main() {
     std::process::exit(run(Args::parse()).await);

@@ -23,6 +23,17 @@ pub fn show(value: &str) {
     println!("{}", text(value));
 }
 pub fn input(prompt: &str, cancel: &Cancellation) -> Result<Option<String>, String> {
+    read_input(prompt, cancel, true)
+}
+/// Read a newline-submitted line, discarding any buffered text at EOF.
+pub fn submitted_input(prompt: &str, cancel: &Cancellation) -> Result<Option<String>, String> {
+    read_input(prompt, cancel, false)
+}
+fn read_input(
+    prompt: &str,
+    cancel: &Cancellation,
+    accept_eof_text: bool,
+) -> Result<Option<String>, String> {
     print!("{prompt}");
     std::io::stdout().flush().map_err(|e| e.to_string())?;
     let mut line = Vec::new();
@@ -42,7 +53,7 @@ pub fn input(prompt: &str, cancel: &Cancellation) -> Result<Option<String>, Stri
         let mut byte = 0u8;
         let n = unsafe { libc::read(0, (&mut byte as *mut u8).cast(), 1) };
         if n == 0 {
-            return if line.is_empty() {
+            return if line.is_empty() || !accept_eof_text {
                 Ok(None)
             } else {
                 String::from_utf8(line).map(Some).map_err(|e| e.to_string())
