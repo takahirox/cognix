@@ -29,7 +29,7 @@ same validated loopback origin, without proxies or redirects.
 | Criterion | Evidence | Result |
 | --- | --- | --- |
 | AC1 — Selection/presence | Real HTTP fixtures verify space/equal CLI forms, CLI over environment, environment/default selection, namespace/registry and implicit-tag normalization, exact request model, quoted/newline/JSON argv and retained stdin. Installed models produce no prompt/pull; a cached rerun does not update. | Pass. |
-| AC2 — Consent | Disposable pseudoterminals exercise explicit approval, No, blank/default No and terminal EOF. Null/piped input, including piped `yes`, cannot approve. Missing-model messages show the tag, endpoint, network/disk warning and endpoint-specific manual command; declined runs do not start Cognix. | Pass. |
+| AC2 — Consent | Disposable pseudoterminals exercise explicit approval, No, blank/default No and terminal EOF, including buffered `y`/`yes` followed by two Ctrl-D characters without Enter. Null/piped input, including piped `yes`, cannot approve. Missing-model messages show the tag, endpoint, network/disk warning and endpoint-specific manual command; declined runs do not start Cognix. | Pass. |
 | AC3 — Download | Custom-port fixtures record streaming `/api/pull` for the selected tag, then `/api/show` before launching. A 2000-record stream yields bounded status/byte output. Native Cognix accepts a compatible downloaded model and rejects unsupported capabilities or a failed actual tool-call probe. | Pass with disposable fixtures. |
 | AC4 — Safety/failure | Tests cover invalid/empty/cloud tags, remote metadata, authentication/server errors, unrelated 404s, wrong-model 404s, redirects, malformed JSON/metadata, refused model connections, disk/network pull errors, incomplete/invalid streams, success without availability and a separate one-second download timeout. SIGINT/SIGTERM cancel a real pending pull; no failed case starts Cognix or selects a hosted fallback. | Pass. |
 | AC5 — Lifecycle | Existing Issue #10 regressions still pass. Added provisioning failure and interrupt paths preserve helper/build/Cognix exit status, owned Ollama/descendant cleanup and retained logs; existing servers remain unowned. Pseudoterminals verify consent does not consume later approval input. | Pass. |
@@ -48,6 +48,16 @@ same validated loopback origin, without proxies or redirects.
 | `cargo run --locked --example check_docs` | Pass: 13 Markdown documents, zero errors. |
 | `git diff --check` and staged equivalent | Pass. |
 | ShellCheck | Not run: unavailable; Bash syntax and behavioral coverage ran. |
+
+The Issue #12 review regression reproduced a pull after buffered affirmative
+text ended at EOF. The download prompt now requires a newline-submitted answer
+and discards partial input at EOF; other terminal input retains its existing
+behavior. The extended pseudoterminal regression failed before the fix and
+passed afterward, asserting no pull or Cognix startup for both `y` and `yes`
+followed by EOF. Revision validation passed all 58 Cargo tests (including all
+18 launcher tests), formatting, Clippy, Bash syntax, documentation and whitespace
+checks. The release build result above is from the earlier implementation check;
+it was not repeated for this revision.
 
 ### Provisioning limits and optional validation
 

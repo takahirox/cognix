@@ -203,7 +203,7 @@ async fn provision(args: &Args, cancel: &Cancellation) -> Result<(), String> {
     if !std::io::stdin().is_terminal() {
         return Err(format!("Non-interactive input; no download. {manual}"));
     }
-    let answer = terminal::input(&format!("Download {}? [y/N] ", args.model), cancel)?;
+    let answer = terminal::submitted_input(&format!("Download {}? [y/N] ", args.model), cancel)?;
     if !answer.is_some_and(|a| matches!(a.trim().to_ascii_lowercase().as_str(), "y" | "yes")) {
         return Err(format!("Download declined or EOF; no download. {manual}"));
     }
