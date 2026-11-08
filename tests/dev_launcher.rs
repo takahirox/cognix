@@ -635,7 +635,16 @@ fn effective_models_are_checked_exactly_without_prompt_or_changed_arguments() {
 
 #[test]
 fn decline_default_eof_and_noninteractive_never_download_or_start_cognix() {
-    for answer in [Some("n\n"), Some("\n"), Some("\x04"), None] {
+    for answer in [
+        Some("n\n"),
+        Some("\n"),
+        Some("\x04"),
+        // Canonical terminals flush buffered text on the first Ctrl-D and
+        // report EOF on the second. Neither is a newline-submitted approval.
+        Some("y\x04\x04"),
+        Some("yes\x04\x04"),
+        None,
+    ] {
         let server = Server::new(|path, body| {
             if path == "/api/show" {
                 missing(body["model"].as_str().unwrap())
