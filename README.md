@@ -14,10 +14,19 @@ Use Rust/Cargo 1.87 or newer (validated with Homebrew Rust 1.94.0) and a local
 execution and fail closed; no Linux isolation is claimed.
 
 ```sh
+./scripts/dev.sh --model qwen3-coder:30b
+```
+
+The development launcher starts local Ollama if needed and offers to download a
+missing model with explicit confirmation. See [development launcher](#development-launcher)
+for consent, timeout and manual-installation behavior. To build and run the direct
+binary instead:
+
+```sh
 cargo build --locked --release
 ./target/release/cognix --help
 # Optional installation into ~/.cargo/bin:
-cargo install --locked --path .
+cargo install --locked --path . --bin cognix
 ollama serve
 # In another terminal, explicitly install a model only if needed:
 ollama pull qwen3-coder:30b
@@ -37,16 +46,16 @@ origins are accepted (`--ollama-url` or `COGNIX_OLLAMA_URL`).
 
 **Qwen3.8 27B is an evaluated target, not a dependency.** Both `qwen3.8:27b`
 and `qwen3-coder:30b` passed the tool-call probe and three fixture trials each on
-Ollama 0.34.4. The target tag was explicitly downloaded for evaluation; normal
-startup never downloads a model automatically. See the validation record for
-exact model digests, observed results and platform limitations.
+Ollama 0.34.4. The target tag was explicitly downloaded for evaluation; the direct
+`cognix` binary never downloads models. The launcher asks before any download.
+See the validation record for exact model digests, observed results and platform
+limitations.
 
 ## Development launcher
 
 On Apple Silicon macOS, install Rust/Cargo 1.87+ and Ollama, with `cargo` and
 `ollama` on `PATH`. The launcher uses the macOS-provided Bash, curl and plutil;
-it needs no Python runtime. Install a compatible model explicitly with
-`ollama pull` as shown above, then run:
+it needs no Python runtime. Run:
 
 ```sh
 ./scripts/dev.sh --model qwen3.8:27b
@@ -57,8 +66,9 @@ it needs no Python runtime. Install a compatible model explicitly with
 ```
 
 The script is committed executable; if a copy lost that permission, run
-`chmod +x scripts/dev.sh`. It builds the native debug CLI using the repository's
-Cargo manifest and `target` directory, forwarding all CLI arguments unchanged.
+`chmod +x scripts/dev.sh`. It builds the native debug CLI and its internal model
+provisioning helper using the repository's Cargo manifest and `target` directory,
+forwarding all CLI arguments unchanged.
 `COGNIX_MODEL`, `COGNIX_OLLAMA_URL` and the `--ollama-url` override still apply.
 
 An existing server with a valid Ollama `/api/version` response is reused and
@@ -73,10 +83,40 @@ Startup prints the path to a retained temporary `ollama.log`; inspect it with
 Normal Cognix exit codes pass through; Ctrl-C, termination and hangup exit with
 130, 143 and 129 respectively, with bounded cleanup of owned processes.
 
-The launcher never pulls models or selects a hosted fallback. Cognix still
-checks local model readiness and tool calling, and retains its existing approval,
-sandbox and command allowlist behavior. To run manually, start `ollama serve` in
-one terminal (or use the Ollama app), then run
+After building, the helper uses Cognix's own CLI parser to resolve `--model tag`
+or `--model=tag`, then `COGNIX_MODEL`, then `qwen3-coder:30b`. It checks that exact
+selection through `/api/show` on the configured endpoint. Installed models start
+without prompts, updates or downloads. Help/version and invalid CLI options are
+handled by the same parser without provisioning.
+
+Only Ollama's explicit missing-model response offers a download. The launcher
+shows the tag, endpoint and warning about potentially many GB of network/disk
+usage, then asks `Download <tag>? [y/N]`. Type `y` or `yes` to approve. Blank input,
+No, EOF or non-terminal stdin exits 1 without fetching or starting Cognix. Piping
+`yes` does not approve a download. The error includes a manual alternative:
+
+```sh
+# Start the chosen local server first, then target that same instance:
+OLLAMA_HOST='http://127.0.0.1:11434' ollama pull qwen3.8:27b
+```
+
+Approved downloads use streaming `/api/pull` on that same loopback endpoint,
+with bounded status/byte progress and a local availability check afterward.
+`COGNIX_DEV_PULL_TIMEOUT` sets the separate total download deadline (1–86400
+seconds; default 3600). Ctrl-C cancels provisioning. Failure, timeout or
+cancellation stops startup; inspect the reported error and check network access
+and free disk space before retrying. Ollama may retain partial data for a retry;
+the launcher never deletes model caches or user data. Invalid names, cloud-backed
+tags/metadata, authentication failures, incompatible responses and other server
+errors do not trigger downloads. No hosted inference fallback is selected.
+Network access to model registries is needed only for an approved download;
+normal local inference requires no hosted AI API.
+
+Cognix still checks local model readiness, capabilities and actual tool calling,
+and retains its approval, sandbox and command allowlist behavior. A downloaded
+model can fail these checks. The direct `cognix` binary does not provision models.
+To run manually, start `ollama serve` in one terminal (or use the Ollama app),
+install a suitable model using the command above, then run
 `cargo run --locked --manifest-path /path/to/cognix/Cargo.toml -- --model qwen3.8:27b`
 in another, or use the built executable described below. See the
 [launcher validation record](docs/dev-launcher-validation.md) for focused checks.

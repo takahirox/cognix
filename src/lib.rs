@@ -1,5 +1,6 @@
 //! Reusable agent engine. Terminal presentation and approval live in the binary.
 pub mod agent;
+pub mod cli;
 pub mod commands;
 pub mod provider;
 pub mod runtime;

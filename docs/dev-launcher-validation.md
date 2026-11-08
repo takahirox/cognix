@@ -1,5 +1,70 @@
 # Development launcher validation
 
+## Model provisioning (Issue #12)
+
+Validated on 2026-11-08 on Apple Silicon macOS 27.2, system Bash 3.2.57,
+Homebrew Rust/Cargo 1.94.0. This section records the current provisioning change;
+the remaining sections preserve the earlier Issue #10 evidence.
+
+`scripts/dev.sh` builds and runs the internal `cognix-dev-model` helper before
+Cognix. The helper shares `src/cli.rs` with Cognix, avoiding a second model/default
+or option-value parser. Rust's existing HTTP/JSON dependencies handle bounded
+streaming, so no Python, jq or additional dependency is needed. Core agent and
+provider behavior is unchanged. `cargo run` still defaults to `cognix`, and the
+README's installation command installs only the application binary.
+
+Model lookup uses `/api/show` with the original model selection. Only an HTTP
+404 containing Ollama's specific missing-model error for that same model permits
+consent. The comparison accounts for Ollama's implicit registry, library and
+`:latest`, and case-insensitive canonical names; different tags remain distinct.
+The response contract and name syntax were checked against Ollama's
+[0.34.4 server handler](https://github.com/ollama/ollama/blob/v0.34.4/server/routes.go)
+and [name validation](https://github.com/ollama/ollama/blob/v0.34.4/types/model/name.go).
+Other errors and incompatible payloads fail closed. Successful metadata rejects
+remote model/host fields. Pulling and the final availability check target the
+same validated loopback origin, without proxies or redirects.
+
+### Provisioning acceptance
+
+| Criterion | Evidence | Result |
+| --- | --- | --- |
+| AC1 — Selection/presence | Real HTTP fixtures verify space/equal CLI forms, CLI over environment, environment/default selection, namespace/registry and implicit-tag normalization, exact request model, quoted/newline/JSON argv and retained stdin. Installed models produce no prompt/pull; a cached rerun does not update. | Pass. |
+| AC2 — Consent | Disposable pseudoterminals exercise explicit approval, No, blank/default No and terminal EOF. Null/piped input, including piped `yes`, cannot approve. Missing-model messages show the tag, endpoint, network/disk warning and endpoint-specific manual command; declined runs do not start Cognix. | Pass. |
+| AC3 — Download | Custom-port fixtures record streaming `/api/pull` for the selected tag, then `/api/show` before launching. A 2000-record stream yields bounded status/byte output. Native Cognix accepts a compatible downloaded model and rejects unsupported capabilities or a failed actual tool-call probe. | Pass with disposable fixtures. |
+| AC4 — Safety/failure | Tests cover invalid/empty/cloud tags, remote metadata, authentication/server errors, unrelated 404s, wrong-model 404s, redirects, malformed JSON/metadata, refused model connections, disk/network pull errors, incomplete/invalid streams, success without availability and a separate one-second download timeout. SIGINT/SIGTERM cancel a real pending pull; no failed case starts Cognix or selects a hosted fallback. | Pass. |
+| AC5 — Lifecycle | Existing Issue #10 regressions still pass. Added provisioning failure and interrupt paths preserve helper/build/Cognix exit status, owned Ollama/descendant cleanup and retained logs; existing servers remain unowned. Pseudoterminals verify consent does not consume later approval input. | Pass. |
+| AC6 — Tests/docs | Commands below, updated README setup/launcher/manual fallback and this record. Fixtures require no model download and never bind the developer's default Ollama port. | Pass. |
+
+### Provisioning check results
+
+| Command/check | Result |
+| --- | --- |
+| `/bin/bash -n scripts/dev.sh` | Pass with system Bash 3.2. |
+| `cargo test --locked --test dev_launcher` | Pass: 18 tests (17 behavior tests plus native-child fixture), no failures or ignored tests. |
+| `cargo test --locked --all-targets` | Pass: 58 tests, no failures or ignored tests, including real macOS sandbox and CLI signal coverage. Final helper hardening and provisioning-failure coverage were checked again with the launcher suite. |
+| `cargo fmt --all -- --check` | Pass. |
+| `cargo clippy --locked --all-targets -- -D warnings` | Pass. |
+| `cargo build --locked --release` | Pass for both binaries. |
+| `cargo run --locked --example check_docs` | Pass: 13 Markdown documents, zero errors. |
+| `git diff --check` and staged equivalent | Pass. |
+| ShellCheck | Not run: unavailable; Bash syntax and behavioral coverage ran. |
+
+### Provisioning limits and optional validation
+
+No live model was downloaded and no existing model cache was modified. The
+optional live first-install/cached smoke test was not run; HTTP fixtures simulate
+Ollama model state and progress, including errors. They prove endpoint targeting,
+consent, parsing and lifecycle behavior, but do not claim a real registry,
+storage-exhaustion, macOS Ollama app or model-compatibility trial. A canceled
+request may leave Ollama-managed partial data; the launcher never deletes it.
+Non-macOS launcher behavior remains unsupported and these launcher tests run only
+on macOS. Download timeout defaults to 3600 seconds and is configurable separately
+from server startup via `COGNIX_DEV_PULL_TIMEOUT` (1–86400 seconds).
+
+Required post-merge verification: none required.
+
+## Earlier server startup (Issue #10)
+
 Validation for [Issue #10](https://github.com/takahirox/cognix/issues/10), performed
 on 2026-11-08 on Apple Silicon macOS 27.2 (Darwin arm64), with macOS Bash
 3.2.57, Homebrew Rust/Cargo 1.94.0 and Ollama 0.34.4. This record covers the
