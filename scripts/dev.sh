@@ -40,6 +40,7 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/cognix-dev.XXXXXX") || exit 1
 ollama_pid=
 build_pid=
 cognix_pid=
+provision_pid=
 signal_status=0
 
 # Only build/Ollama jobs get their own process groups. Cognix stays in the
@@ -47,6 +48,7 @@ signal_status=0
 cancel() {
     signal_status=$1
     [[ -z $cognix_pid ]] || kill -INT "$cognix_pid" 2>/dev/null || :
+    [[ -z $provision_pid ]] || kill -INT "$provision_pid" 2>/dev/null || :
     [[ -z $build_pid ]] || kill -TERM -- "-$build_pid" 2>/dev/null || :
     [[ -z $ollama_pid ]] || kill -TERM -- "-$ollama_pid" 2>/dev/null || :
 }
@@ -54,12 +56,14 @@ cleanup() {
     local status=$? i alive
     trap '' INT TERM HUP
     [[ -z $cognix_pid ]] || kill -INT "$cognix_pid" 2>/dev/null || :
+    [[ -z $provision_pid ]] || kill -INT "$provision_pid" 2>/dev/null || :
     [[ -z $build_pid ]] || kill -TERM -- "-$build_pid" 2>/dev/null || :
     [[ -z $ollama_pid ]] || kill -TERM -- "-$ollama_pid" 2>/dev/null || :
     # Bound cleanup too: a stuck child cannot hold the launcher open forever.
     for ((i=0; i<50; i++)); do
         alive=0
         [[ -z $cognix_pid ]] || { kill -0 "$cognix_pid" 2>/dev/null && alive=1; }
+        [[ -z $provision_pid ]] || { kill -0 "$provision_pid" 2>/dev/null && alive=1; }
         [[ -z $build_pid ]] || { kill -0 -- "-$build_pid" 2>/dev/null && alive=1; }
         [[ -z $ollama_pid ]] || { kill -0 -- "-$ollama_pid" 2>/dev/null && alive=1; }
         ((alive)) || break
@@ -74,6 +78,10 @@ cleanup() {
         kill -KILL -- "-$pid" 2>/dev/null || :
         wait "$pid" 2>/dev/null || :
     done
+    if [[ -n $provision_pid ]]; then
+        kill -KILL "$provision_pid" 2>/dev/null || :
+        wait "$provision_pid" 2>/dev/null || :
+    fi
     rm -f "$scratch/version" "$scratch/curl-error"
     # Keep startup logs for inspection; remove the directory when none exists.
     rmdir "$scratch" 2>/dev/null || :
@@ -149,7 +157,7 @@ check_canceled
 # Build from any working directory, then run the native executable directly so
 # signals reach Cognix rather than only a cargo run parent. Keep the caller's cwd.
 set -m
-(cd -- "$repo" && exec cargo build --locked --manifest-path "$repo/Cargo.toml" --target-dir "$repo/target" --bin cognix) &
+(cd -- "$repo" && exec cargo build --locked --manifest-path "$repo/Cargo.toml" --target-dir "$repo/target" --bin cognix --bin cognix-dev-model) &
 build_pid=$!
 set +m
 check_canceled
@@ -158,6 +166,16 @@ status=$?
 check_canceled
 ((status == 0)) || exit "$status"
 build_pid=
+# The helper shares Cognix's CLI parser, original argv and unbuffered stdin.
+# Keep it in the foreground terminal group so interactive consent works.
+"$repo/target/debug/cognix-dev-model" "$@" <&0 &
+provision_pid=$!
+check_canceled
+wait "$provision_pid"
+status=$?
+check_canceled
+((status == 0)) || exit "$status"
+provision_pid=
 "$repo/target/debug/cognix" "$@" <&0 &
 cognix_pid=$!
 check_canceled
