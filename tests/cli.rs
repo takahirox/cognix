@@ -49,7 +49,7 @@ fn final_answer() -> Reply {
 
 #[test]
 fn create_file_preview_approval_defaults_and_eof() {
-    for input in ["y\n", "n\n", "\n", ""] {
+    for input in ["y\n", "n\n", "\n", "", "y"] {
         let server = Server::new(|p, b| {
             if p != "/api/chat" || b["messages"].as_array().unwrap().len() == 1 {
                 ready(p, b)
@@ -85,6 +85,7 @@ fn create_file_preview_approval_defaults_and_eof() {
             assert!(stdout.contains("Modified files: [\"new.txt\"]"));
         } else {
             assert!(stdout.contains("denied"));
+            assert!(stdout.contains("Modified files: []"));
             assert_eq!(fs::read_dir(t.path()).unwrap().count(), 0);
         }
     }
