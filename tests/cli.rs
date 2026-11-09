@@ -46,6 +46,49 @@ fn final_answer() -> Reply {
         json!({"done":true,"message":{"role":"assistant","content":"All tests passed!\u{1b}[31m"}}),
     )
 }
+
+#[test]
+fn create_file_preview_approval_defaults_and_eof() {
+    for input in ["y\n", "n\n", "\n", ""] {
+        let server = Server::new(|p, b| {
+            if p != "/api/chat" || b["messages"].as_array().unwrap().len() == 1 {
+                ready(p, b)
+            } else if b["messages"].as_array().unwrap().len() == 2 {
+                tool("create_file", json!({"path":"new.txt","content":"hello\n"}))
+            } else {
+                final_answer()
+            }
+        });
+        let t = tempfile::tempdir().unwrap();
+        let out = run(
+            command(t.path(), &server.url).args(["--task", "create a file"]),
+            input,
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let preview = stdout.find("Proposed create_file").unwrap();
+        let addition = stdout.find("+hello").unwrap();
+        let approval = stdout.find("Approve this action? [y/N]").unwrap();
+        assert!(preview < addition && addition < approval, "{stdout}");
+        assert!(stdout.contains("6 UTF-8 bytes"));
+        let approved = input == "y\n";
+        assert_eq!(
+            out.status.code(),
+            Some(if approved { 0 } else { 1 }),
+            "{stdout}"
+        );
+        assert_eq!(t.path().join("new.txt").exists(), approved);
+        if approved {
+            assert_eq!(
+                fs::read_to_string(t.path().join("new.txt")).unwrap(),
+                "hello\n"
+            );
+            assert!(stdout.contains("Modified files: [\"new.txt\"]"));
+        } else {
+            assert!(stdout.contains("denied"));
+            assert_eq!(fs::read_dir(t.path()).unwrap().count(), 0);
+        }
+    }
+}
 fn finished(child: &mut Child) -> std::process::ExitStatus {
     let end = Instant::now() + Duration::from_secs(5);
     loop {

@@ -1,4 +1,109 @@
 use super::*;
+
+#[test]
+fn creation_interruptions_and_publish_races_clean_up_owned_staging() {
+    for phase in [
+        "before_commit",
+        "after_commit",
+        "destination_race",
+        "parent_race",
+        "root_race",
+        "staging_race",
+    ] {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("dir")).unwrap();
+        let cancel = Cancellation::default();
+        let mut r = Runtime::new(&root, Box::new(|_, _| true), cancel.clone()).unwrap();
+        let path = root.clone();
+        r.hook = Some(Box::new(move |point| {
+            if point == phase {
+                cancel.cancel();
+            }
+            if point != "before_commit" {
+                return;
+            }
+            match phase {
+                "destination_race" => std::fs::write(path.join("dir/new"), "racing edit").unwrap(),
+                "parent_race" => {
+                    std::fs::rename(path.join("dir"), path.join("old")).unwrap();
+                    std::fs::create_dir(path.join("dir")).unwrap();
+                }
+                "root_race" => {
+                    std::fs::rename(&path, path.with_file_name("moved")).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                }
+                "staging_race" => {
+                    let staging = std::fs::read_dir(path.join("dir"))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    // Retain the owned inode so replacement cannot reuse its identity.
+                    std::fs::rename(&staging, path.join("owned-moved")).unwrap();
+                    std::fs::write(&staging, "unrelated replacement").unwrap();
+                }
+                _ => (),
+            }
+        }));
+        let result = r.execute("create_file", json!({"path":"dir/new","content":"agent"}));
+        let committed = phase == "after_commit";
+        assert_eq!(
+            result["status"],
+            if matches!(phase, "before_commit" | "after_commit") {
+                "canceled"
+            } else {
+                "failed"
+            },
+            "{phase}: {result}"
+        );
+        assert_eq!(result["executed"], committed);
+        assert_eq!(r.modified.contains("dir/new"), committed);
+        assert_eq!(r.events.last().unwrap()["result"], result);
+        if committed {
+            assert_eq!(result["sha256"], hash(b"agent"));
+            assert!(!r.seen.contains_key("dir/new"));
+            assert_eq!(
+                std::fs::read_to_string(root.join("dir/new")).unwrap(),
+                "agent"
+            );
+        } else if phase == "destination_race" {
+            assert_eq!(
+                std::fs::read_to_string(root.join("dir/new")).unwrap(),
+                "racing edit"
+            );
+        } else {
+            assert!(!root.join("dir/new").exists());
+        }
+        let parent = match phase {
+            "parent_race" => root.join("old"),
+            "root_race" => root.with_file_name("moved").join("dir"),
+            _ => root.join("dir"),
+        };
+        let staging: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".cognix-")
+            })
+            .collect();
+        if phase == "staging_race" {
+            // Cleanup must leave a substituted name alone.
+            assert_eq!(staging.len(), 1);
+            assert_eq!(
+                std::fs::read_to_string(&staging[0]).unwrap(),
+                "unrelated replacement"
+            );
+        } else {
+            assert!(staging.is_empty(), "{phase}: {staging:?}");
+        }
+    }
+}
 #[cfg(target_os = "macos")]
 #[test]
 fn interrupt_at_command_ownership_and_cleanup_boundaries() {

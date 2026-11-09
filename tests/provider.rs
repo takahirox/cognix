@@ -39,7 +39,14 @@ async fn readiness_and_native_roundtrip() {
     assert_eq!(body["model"], "deepseek-local:test");
     assert_eq!(body["options"]["num_ctx"], 16384);
     assert_eq!(body["stream"], false);
-    assert_eq!(body["tools"].as_array().unwrap().len(), 4);
+    assert_eq!(body["tools"].as_array().unwrap().len(), 5);
+    assert!(
+        body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "create_file")
+    );
 }
 #[tokio::test]
 async fn unsupported_cloud_missing_and_behavior_failures() {

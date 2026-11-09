@@ -2,8 +2,8 @@
 
 Cognix is a local Ollama coding agent with a terminal interface, bounded tool
 loops, approved edits, and sandboxed verification. The
-[MVP specification](docs/mvp.md) defines the scope; [validation evidence](docs/validation.md)
-records the Rust migration checks for [Issue #8](https://github.com/takahirox/cognix/issues/8).
+[MVP specification](docs/mvp.md) defines the original scope; [validation evidence](docs/validation.md)
+records the Rust migration and subsequent tool and security checks.
 
 ## Setup
 
@@ -138,7 +138,7 @@ Silicon; replace the executable with your absolute system-installed Python path:
 # > Fix the division-by-zero bug in main.py; return None for zero and verify.
 ```
 
-The model chooses `list_files`, `read_file`, `apply_patch`, and `run_command`.
+The model chooses `list_files`, `read_file`, `apply_patch`, `create_file`, and `run_command`.
 Each patch displays a diff and exact replacement before `Approve this action?
 [y/N]`; type `y` to approve. Commands show the exact argv and require separate
 approval. Any other response, including EOF, denies the action. There is no
@@ -146,6 +146,18 @@ automatic approval option. Ctrl-C cancels work and exits with code 130. `/exit`
 or EOF at the task prompt ends the session. `--task 'request'` runs one task while
 retaining interactive approvals. Progress shows model waits, tool names and
 structured result statuses.
+
+`create_file` takes a project-relative `path` and complete UTF-8 `content` (up to
+64 KiB, including empty text; no NULs). It displays the destination, byte count
+and a bounded add-only preview before the same per-action approval prompt.
+The parent directory must already exist. Absolute paths, `..`, `.git`, symlinked
+parents and existing destinations are rejected; publication never overwrites,
+even if a destination appears during approval. It creates one regular file with
+owner-only permissions (0600, subject to umask), and records it in modified files
+and session evidence. Denial, EOF or cancellation before publication leaves no
+new file. Cancellation after publication preserves the approved file and its
+execution evidence. Creating directories, deleting and renaming remain unsupported;
+`apply_patch` still requires reading an existing file first.
 
 Results list modified files and exact checks, exit codes and captured output.
 They distinguish `passed`, `failed`, `not_run`, `denied`, `canceled` and

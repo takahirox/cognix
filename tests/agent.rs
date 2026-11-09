@@ -25,6 +25,74 @@ fn setup(script: Vec<Value>) -> (tempfile::TempDir, Agent<Script>) {
         Agent::new(Script(script.into_iter().map(Ok).collect()), r),
     )
 }
+
+struct CreateFixture(usize);
+impl Provider for CreateFixture {
+    async fn chat(
+        &mut self,
+        messages: &[Value],
+        tools: &Value,
+        _: &Cancellation,
+    ) -> Result<Value, Error> {
+        assert!(
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["function"]["name"] == "create_file")
+        );
+        let reply = match self.0 {
+            0 => calls(vec![call("list_files", json!({"path":"."}))]),
+            1 => calls(vec![call(
+                "create_file",
+                json!({"path":"new.rs","content":"// new\n"}),
+            )]),
+            2 => {
+                let result: Value =
+                    serde_json::from_str(messages.last().unwrap()["content"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(result["status"], "ok");
+                assert_eq!(result["executed"], true);
+                assert_eq!(result["path"], "new.rs");
+                calls(vec![call("read_file", json!({"path":"new.rs"}))])
+            }
+            3 => {
+                let result: Value =
+                    serde_json::from_str(messages.last().unwrap()["content"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(result["content"], "// new\n");
+                calls(vec![call(
+                    "apply_patch",
+                    json!({"path":"new.rs","sha256":result["sha256"],"old_text":"new","new_text":"created"}),
+                )])
+            }
+            4 => answer("Created and inspected new.rs"),
+            _ => panic!("unexpected request"),
+        };
+        self.0 += 1;
+        Ok(reply)
+    }
+}
+#[tokio::test]
+async fn model_requested_creation_in_multistep_task_is_reported() {
+    let (t, a) = setup(vec![]);
+    let mut a = Agent::new(CreateFixture(0), a.runtime);
+    let result = a.run("Create a Rust module and inspect it").await;
+    assert_eq!(result["status"], "final_answer", "{result}");
+    assert_eq!(result["modified_files"], json!(["new.rs"]));
+    assert_eq!(result["events"][1]["tool"], "create_file");
+    assert_eq!(result["events"][1]["result"]["status"], "ok");
+    assert_eq!(result["events"][1]["arguments"]["content"], "// new\n");
+    assert_eq!(result["checks"], json!([]));
+    assert_eq!(
+        fs::read_to_string(t.path().join("new.rs")).unwrap(),
+        "// created\n"
+    );
+    assert_eq!(
+        fs::read_to_string(t.path().join("file")).unwrap(),
+        "content"
+    );
+}
 #[tokio::test]
 async fn ordering_ids_history_and_final_prose() {
     let mut explicit = call("list_files", json!({"path":"."}));
