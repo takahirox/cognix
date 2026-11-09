@@ -12,6 +12,34 @@ performed by this implementation node. Review and integration remain downstream.
 The [Python validation record](validation-python.md) and its two raw JSON records
 are historical evidence only. They are not Rust test results.
 
+## Safe file creation extension (Issue #14)
+
+Validated on 2026-11-09 in this Apple Silicon macOS worktree with Homebrew
+rustc 1.94.0. This section covers the new `create_file` tool; the original
+migration and real-model trials below remain evidence for their recorded revisions.
+
+| Criterion | Evidence | Result |
+| --- | --- | --- |
+| AC1 — Contract and integration | `src/schema.rs` advertises closed `path`/`content` arguments with runtime byte limits. `tests/create_file.rs` rejects missing/extra fields, wrong types and oversized payloads. `tests/provider.rs` checks HTTP advertisement. `tests/agent.rs::model_requested_creation_in_multistep_task_is_reported` exercises model-requested listing, creation, reading and patching, including structured results and the final report. | Pass. |
+| AC2 — Approval and preview | Runtime tests check path, addition preview, UTF-8 byte count, bounded escaped output, empty content, denial and cancellation. `tests/cli.rs::create_file_preview_approval_defaults_and_eof` checks preview-before-prompt order and real stdin approval, No, blank and EOF. | Pass. |
+| AC3 — Root/path boundary | `tests/create_file.rs` rejects absolute/traversal/Git/NUL paths, symlinked parents, absent parents and non-directory parents. Root/parent identity changes during approval are refused without writes. Traversal uses anchored descriptors and `O_NOFOLLOW`. | Pass. |
+| AC4 — Exclusive publication and cleanup | Existing regular files, directories, hard links, symlinks, dangling symlinks and FIFOs remain unchanged. `src/runtime_tests.rs::creation_interruptions_and_publish_races_clean_up_owned_staging` injects destination creation, parent/root replacement, staging substitution and cancellation immediately before/after publish. Owned staging is cleaned on failed/canceled calls; substituted names are preserved. Atomic `linkat` refuses a destination that appears after preflight. | Pass. |
+| AC5 — Limits/evidence/compatibility | Empty, Unicode and exactly 64 KiB content succeed; oversized UTF-8 and NUL content fail. Results record normalized path/hash/bytes, execution flags and status; the event ledger retains full content. Created paths enter modified files. Post-publication cancellation preserves evidence. Reading before patching remains required; existing runtime, command, agent and CLI regressions pass. | Pass. |
+| AC6 — Regression checks | `cargo test --locked --all-targets`: 68 passed, zero failures/ignored tests, including real macOS sandbox checks. `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, the documentation checker and whitespace checks pass. | Pass. |
+| AC7 — Documentation | README, implementation tool/approval/path/content/cleanup constraints and the historical MVP scope note are updated. `cargo run --locked --example check_docs` checks 13 Markdown documents with zero errors; full diff reviewed for consistency. | Pass. |
+
+The first full test run exposed the provider fixture's old four-tool count; it
+was updated to expect five and assert creation is advertised. The first Clippy
+run found an unnecessary inode cast; it was removed, retaining only the
+platform-dependent device conversion. The final test and lint runs above passed.
+`cargo build --locked --release` also passed.
+
+Optional real-model creation trial: **Not run**; deterministic providers and the
+actual CLI establish dispatch/approval behavior without model downloads or
+inference. The existing exclusion of hostile same-user concurrent filesystem
+changes still applies; this work does not add OS-level project isolation.
+Required post-merge verification: none required.
+
 ## Review revision: hard-link command boundary (AC6, AC8)
 
 On 2026-11-07 on the Apple M4 Max/macOS environment below, added a project-tree

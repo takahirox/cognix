@@ -6,7 +6,7 @@ use cognix::{
     commands,
     provider::Ollama,
     runtime::Runtime,
-    terminal::{input, render, show},
+    terminal::{input, render, show, submitted_input},
 };
 use std::time::Duration;
 
@@ -48,7 +48,7 @@ async fn session(args: Args, cancel: &Cancellation) -> Result<i32, String> {
         &args.root,
         Box::new(move |kind, preview| {
             show(&format!("\nProposed {kind}:\n{preview}"));
-            input("Approve this action? [y/N] ", &approval_cancel)
+            submitted_input("Approve this action? [y/N] ", &approval_cancel)
                 .ok()
                 .flatten()
                 .is_some_and(|s| s.trim().eq_ignore_ascii_case("y"))

@@ -38,6 +38,7 @@ a server lying about its configuration is outside the client trust boundary.
 | `list_files` | `path` | One directory; `.` means root. Symlinks and `.git` omitted. |
 | `read_file` | `path` | UTF-8 regular file, content and SHA-256; no binary/NUL data. |
 | `apply_patch` | `path`, `sha256`, `old_text`, `new_text` | Previously read existing file; replace one unique nonempty span after preview/approval. |
+| `create_file` | `path`, `content` | One new UTF-8 regular file in an existing directory, after creation preview/approval; exclusive publication, never overwrite. |
 | `run_command` | `argv` | Exact allowlisted argument array, approval, sandbox, bounded result. |
 
 Patching intentionally supports existing files only, not creation, deletion,
@@ -49,6 +50,48 @@ Extended attributes and ACLs are not copied by atomic replacement; use this MVP
 on ordinary source files. Approved edits remain after cancellation or a failed
 check, and are reported; there is no automatic rollback.
 
+New-file creation is an extension to the original MVP tools. For example:
+
+```json
+{"path":"src/new_module.rs","content":"pub fn answer() -> u32 { 42 }\n"}
+```
+
+`content` is the complete UTF-8 text, at most 65,536 bytes, without NULs; an empty
+string intentionally creates an empty file. `path` is at most 4,096 UTF-8 bytes
+and must name a file relative to the project root. Missing/non-directory parents,
+symlinked parents, trailing slashes, absolute paths, traversal and `.git` components
+are rejected. No parent directory is created. All existing destinations, including
+directories, FIFOs, symlinks (even dangling ones) and hard links, are rejected.
+Creation does not delete, rename or replace existing files or change the patch
+contract: read a created file before patching it.
+
+Before each creation, the normal explicit `Approve this action? [y/N]` prompt
+shows the destination, total UTF-8 byte count and an add-only preview. Content
+display is capped at 8,192 escaped characters (plus addition markers and bounded
+path/header text), with a truncation notice; empty content is labeled explicitly.
+Denial, EOF and cancellation before publication leave no new file. There is no
+automatic approval. The full requested content is retained in the in-memory
+tool/event ledger, independent of preview truncation.
+
+After approval, root/parent identity and destination absence are rechecked.
+An exclusive `openat(O_CREAT | O_EXCL | O_NOFOLLOW)` creates a same-directory
+staging file with mode 0600 (subject to umask). Content is written and synced,
+then root/parent and staging identities are checked immediately before publish.
+Descriptor-relative `linkat` atomically publishes the complete file only if the
+destination is absent, including when it appeared after the checks. There is no
+ordinary string-path creation or overwriting rename. The owned staging name is
+removed on success, error or cancellation; cleanup checks its identity to avoid
+unlinking a substituted file. A replaced staging name causes failure. As with
+patching, this boundary does not isolate against a hostile same-user process
+moving directories or replacing staging names between the final checks and syscalls.
+
+Success returns `status: "ok"`, `executed: true`, normalized `path`, `sha256` and
+`bytes`, and adds the path to modified files and the event ledger. Failed, denied
+and canceled calls record distinct statuses with `executed: false`. If interrupted
+after publication, the file and hash remain recorded with `executed: true` and
+`status: "canceled"`; no rollback occurs. No fallible/canceling operation separates
+publication from evidence ownership.
+
 ## File boundary
 
 The selected root is canonicalized and opened once. Each component is traversed
@@ -59,7 +102,7 @@ outside aliases. FIFOs/devices cannot block a read. Parent/file identities and
 contents are rechecked after approval before an atomic write. Keep external
 editors and processes from concurrently moving project directories during a
 session: this is not isolation from another hostile process running as your user.
-A root change also prevents command execution.
+A root change also prevents creation and command execution.
 
 ## Verification policy and isolation
 
@@ -128,7 +171,8 @@ until their deadline. Keep the allowlist small and review each action.
 | Context accounting | Serialized UTF-8 history + schemas + 64/message + 4,096 reserved tokens; conservative byte-tokenizer budget. No truncation. |
 | Generated response | 2,048 tokens; provider length exhaustion is a visible context-limit error. |
 | Provider JSON response | 1 MiB; larger response rejected. |
-| File size / patch result | 64 KiB; oversized files rejected, not silently shortened. |
+| File size / patch result / new-file content | 64 KiB of UTF-8 bytes; oversized files rejected, not silently shortened. |
+| Tool arguments | 1 MiB serialized JSON; closed fields and exact types; creation paths at most 4,096 bytes. |
 | Directory listing | 500 entries and the output byte budget; choose a narrower directory on failure. |
 | Command time | 30 seconds; `--command-timeout` (maximum 86,400 seconds). |
 | Combined stdout/stderr | 16,384 bytes; `--output-limit`; excess kills execution and records `limit_reached`. |
@@ -144,10 +188,12 @@ tool output, paths and diffs.
 
 A process-wide Ctrl-C handler only sets an atomic cancellation flag. Rust
 control flow is never unwound by SIGINT, including command spawn/cleanup and
-the patch's atomic rename/bookkeeping. Cancellation checks stop new actions
+the patch's atomic rename/bookkeeping and creation's atomic publish/bookkeeping.
+Cancellation checks stop new actions
 while ownership and evidence updates complete. A launched command is killed
 and reaped and remains recorded as executed. An
-approved patch already committed at interruption remains in modified files with
+approved patch or creation already committed at interruption remains in modified
+files with
 `executed: true` and a canceled result; cancellation does not undo approved edits.
 Approval prompts keep their normal immediate Ctrl-C behavior.
 

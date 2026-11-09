@@ -75,6 +75,48 @@ impl Drop for Temporary<'_> {
     }
 }
 
+// Creation owns a descriptor as well as a name. Cleanup must not unlink a file
+// another process substituted for our staging file.
+struct CreationTemporary<'a> {
+    parent: &'a File,
+    name: CString,
+    file: File,
+}
+impl CreationTemporary<'_> {
+    fn owns_name(&self) -> bool {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let Ok(info) = self.file.metadata() else {
+            return false;
+        };
+        // SAFETY: live descriptors/name and valid stat output storage.
+        if unsafe {
+            libc::fstatat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            return false;
+        }
+        let st = unsafe { st.assume_init() };
+        // dev_t is signed on macOS and u64 on Linux.
+        #[allow(clippy::unnecessary_cast)]
+        let device = st.st_dev as u64;
+        device == info.dev() && st.st_ino == info.ino()
+    }
+}
+impl Drop for CreationTemporary<'_> {
+    fn drop(&mut self) {
+        if self.owns_name() {
+            unsafe {
+                libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0);
+            }
+        }
+    }
+}
+
 impl Runtime {
     pub fn new(root: &Path, approve: Approval, cancel: Cancellation) -> Result<Self, String> {
         let root = root.canonicalize().map_err(err)?;
@@ -324,6 +366,145 @@ impl Runtime {
         }
         Ok(json!({"path":normalized,"sha256":digest,"executed":true}))
     }
+    fn creation_parent_unchanged(&self, parts: &[&str], parent: &File) -> Result<(), String> {
+        let root = self.root.symlink_metadata().map_err(err)?;
+        if !root.is_dir() || !identity(&root, &self.root_fd.metadata().map_err(err)?) {
+            return Err("Project root changed during session".into());
+        }
+        let fresh = self.directory(parts)?;
+        if !identity(
+            &fresh.metadata().map_err(err)?,
+            &parent.metadata().map_err(err)?,
+        ) {
+            return Err("Parent directory changed during creation".into());
+        }
+        Ok(())
+    }
+    fn destination_absent(parent: &File, name: &CString) -> Result<(), String> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+        {
+            return Err("Destination already exists; creation never overwrites".into());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(err(error));
+        }
+        Ok(())
+    }
+    fn create_file(&mut self, args: &Value) -> Result<Value, String> {
+        let path = args["path"].as_str().unwrap();
+        let parts = Self::parts(path, false)?;
+        if matches!(path.rsplit('/').next(), Some("" | ".")) {
+            return Err("Expected a destination file name".into());
+        }
+        let normalized = parts.join("/");
+        let content = args["content"].as_str().unwrap();
+        if content.contains('\0') {
+            return Err("New file content must be UTF-8 text without NULs".into());
+        }
+        let parent_parts = &parts[..parts.len() - 1];
+        let parent = self.directory(parent_parts)?;
+        let target = cstring(parts[parts.len() - 1])?;
+        self.creation_parent_unchanged(parent_parts, &parent)?;
+        Self::destination_absent(&parent, &target)?;
+
+        // Bound the escaped display, not the raw text: terminal controls can
+        // expand when sanitized. The complete content stays in the event ledger.
+        const PREVIEW_CHARS: usize = 8192;
+        let display = crate::terminal::text(content);
+        let excerpt: String = display.chars().take(PREVIEW_CHARS).collect();
+        let mut preview = format!(
+            "Create {normalized:?} ({} UTF-8 bytes)\n--- /dev/null\n+++ {normalized:?}\n",
+            content.len()
+        );
+        for line in excerpt.split_inclusive('\n') {
+            preview.push('+');
+            preview.push_str(line);
+        }
+        if !excerpt.ends_with('\n') && !excerpt.is_empty() {
+            preview.push_str("\n\\ No newline at end of displayed content\n");
+        }
+        if display.chars().count() > PREVIEW_CHARS {
+            preview.push_str("[Creation preview truncated; full content is larger]\n");
+        } else if content.is_empty() {
+            preview.push_str("[Empty file: 0 additions]\n");
+        }
+        let approved = (self.approve)("create_file", &preview);
+        if self.cancel.is_canceled() {
+            return Ok(json!({"status":"canceled","path":normalized,"executed":false}));
+        }
+        if !approved {
+            return Ok(json!({"status":"denied","path":normalized,"executed":false}));
+        }
+        self.creation_parent_unchanged(parent_parts, &parent)?;
+        Self::destination_absent(&parent, &target)?;
+
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            ".cognix-create-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let file = openat(
+            &parent,
+            &name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )?;
+        let mut temporary = CreationTemporary {
+            parent: &parent,
+            name: cstring(&name)?,
+            file,
+        };
+        temporary.file.write_all(content.as_bytes()).map_err(err)?;
+        temporary.file.sync_all().map_err(err)?;
+        #[cfg(test)]
+        if let Some(h) = &mut self.hook {
+            h("before_commit");
+        }
+        if self.cancel.is_canceled() {
+            return Ok(json!({"status":"canceled","path":normalized,"executed":false}));
+        }
+        self.creation_parent_unchanged(parent_parts, &parent)?;
+        if !temporary.owns_name() || temporary.file.metadata().map_err(err)?.nlink() != 1 {
+            return Err("Creation staging file changed before commit".into());
+        }
+        // linkat publishes the fully written inode atomically and fails with
+        // EEXIST for *every* existing destination, including dangling symlinks.
+        // The earlier absence checks are only for feedback, never exclusivity.
+        if unsafe {
+            libc::linkat(
+                parent.as_raw_fd(),
+                temporary.name.as_ptr(),
+                parent.as_raw_fd(),
+                target.as_ptr(),
+                0,
+            )
+        } < 0
+        {
+            return Err(err(std::io::Error::last_os_error()));
+        }
+        // No fallible/canceling operation between publish and evidence ownership.
+        let digest = hash(content.as_bytes());
+        self.modified.insert(normalized.clone());
+        // Keep apply_patch's read-first contract, including stale observations
+        // of a previous file that an external editor removed at this path.
+        self.seen.remove(&normalized);
+        drop(temporary);
+        #[cfg(test)]
+        if let Some(h) = &mut self.hook {
+            h("after_commit");
+        }
+        Ok(json!({"path":normalized,"sha256":digest,"bytes":content.len(),"executed":true}))
+    }
     fn run_command(&mut self, args: &Value) -> Result<Value, String> {
         let argv = schema::argv(&args["argv"])?;
         if !self.allowed_commands.contains(&argv) {
@@ -367,6 +548,7 @@ impl Runtime {
                 "list_files" => self.list(args["path"].as_str().unwrap()),
                 "read_file" => self.read_file(args["path"].as_str().unwrap()),
                 "apply_patch" => self.patch(&args),
+                "create_file" => self.create_file(&args),
                 "run_command" => self.run_command(&args),
                 _ => Err("Unknown tool".into()),
             })

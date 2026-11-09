@@ -81,6 +81,11 @@ stopped. A verification failure can inform another attempt within the same limit
 | `apply_patch` | Apply a targeted, approved patch; avoid uncontrolled whole-file replacement. |
 | `run_command` | Execute an approved verification command within the command policy. |
 
+The current implementation also supports the approved `create_file` extension
+from [Issue #14](https://github.com/takahirox/cognix/issues/14); see its
+[tool contract and constraints](implementation.md#tools-and-context). The table
+above records the original MVP tool scope.
+
 Validate arguments and return structured success/failure data for every tool,
 including useful errors for invalid calls. Semantic indexing and Git write tools
 are not required.

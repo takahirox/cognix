@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
 
+pub const MAX_CREATE_BYTES: usize = 65536;
+
 pub fn tools() -> Value {
     let string = json!({"type":"string"});
     let defs = [
@@ -17,6 +19,11 @@ pub fn tools() -> Value {
             "apply_patch",
             "Replace exactly one unique nonempty span in a previously read existing file, using its sha256. User approves a diff; no new files or deletions.",
             json!({"path":string,"sha256":string,"old_text":string,"new_text":string}),
+        ),
+        (
+            "create_file",
+            "Create one new UTF-8 file (at most 64 KiB, no NULs) in an existing project directory after preview and approval. Never overwrite or create directories; empty content is allowed.",
+            json!({"path":{"type":"string","maxLength":4096},"content":{"type":"string","maxLength":MAX_CREATE_BYTES}}),
         ),
         (
             "run_command",
@@ -69,6 +76,14 @@ pub fn validate(name: &str, args: &Value) -> Result<(), String> {
             argv(value)?;
         } else if !value.is_string() {
             return Err(format!("{key} must be a string"));
+        }
+    }
+    if name == "create_file" {
+        if args["content"].as_str().unwrap().len() > MAX_CREATE_BYTES {
+            return Err("New file exceeds 64 KiB of UTF-8 content".into());
+        }
+        if args["path"].as_str().unwrap().len() > 4096 {
+            return Err("Destination path exceeds 4096 bytes".into());
         }
     }
     Ok(())
