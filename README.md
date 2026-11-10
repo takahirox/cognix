@@ -4,6 +4,9 @@ Cognix is a local Ollama coding agent with a terminal interface, bounded tool
 loops, approved edits, and sandboxed verification. The
 [MVP specification](docs/mvp.md) defines the original scope; [validation evidence](docs/validation.md)
 records the Rust migration and subsequent tool and security checks.
+The [tool architecture decision](docs/tool-architecture.md) defines the future
+general patch/command direction and incremental migration; it does not change
+the currently supported tools or sandbox permissions.
 
 ## Setup
 
