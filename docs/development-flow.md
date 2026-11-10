@@ -23,6 +23,15 @@ both omitted requirements and unnecessary additions. Avoid speculative
 abstractions, unrelated refactors and unjustified frameworks or configuration.
 Simplicity must preserve required behavior and validation.
 
+For tool work, follow the [tool architecture decision](tool-architecture.md):
+prioritize composable general patching and policy-controlled command execution
+over adding one model-facing tool per filesystem operation. Retain specialized
+tools when evidence shows a reliability or security benefit. Share approval,
+policy and execution evidence without weakening operation-specific boundaries.
+The decision is a migration target; keep existing behavior until each replacement
+passes its documented compatibility and safety gates. In particular, an argv
+allowlist or approval alone does not authorize a write-capable command backend.
+
 Keep three categories distinct:
 
 - **Mandatory pre-merge acceptance:** requirements and checks achievable and

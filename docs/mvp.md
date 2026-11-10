@@ -85,6 +85,9 @@ The current implementation also supports the approved `create_file` extension
 from [Issue #14](https://github.com/takahirox/cognix/issues/14); see its
 [tool contract and constraints](implementation.md#tools-and-context). The table
 above records the original MVP tool scope.
+The later [tool architecture decision](tool-architecture.md) defines the next
+general-purpose patch/command direction and its migration gates. It leaves this
+historical MVP scope and the current runtime contracts intact.
 
 Validate arguments and return structured success/failure data for every tool,
 including useful errors for invalid calls. Semantic indexing and Git write tools
