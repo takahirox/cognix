@@ -5,6 +5,11 @@ the milestones below. This decision resolves the design scope of
 [Issue #16](https://github.com/takahirox/cognix/issues/16), not its future runtime
 work. Existing schemas, approvals and sandbox behavior remain unchanged.
 
+Milestone 2's [internal parser and read-only planner](patch-planning.md) is now
+implemented. V2 remains unavailable to models and has no executor or CLI mode;
+the validation record in that guide distinguishes pure coverage from native
+source checks blocked by host metadata. Later milestones remain future work.
+
 ## Decision and boundaries
 
 Prioritize a small set of composable tools: general `apply_patch` for reviewed

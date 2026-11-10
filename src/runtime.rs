@@ -21,6 +21,11 @@ use std::{
 #[path = "runtime_tests.rs"]
 mod tests;
 
+// Internal milestone-2 preparation only; deliberately absent from tool dispatch.
+#[allow(dead_code)]
+#[path = "patch.rs"]
+pub(crate) mod patch;
+
 pub use crate::action::Approval;
 #[cfg(test)]
 type CommitHook = Box<dyn FnMut(&str)>;
@@ -33,6 +38,7 @@ pub struct Runtime {
     pub timeout: Duration,
     pub output_limit: usize,
     pub seen: HashMap<String, String>,
+    patch_reads: HashMap<String, patch::ReadEvidence>,
     pub modified: BTreeSet<String>,
     pub events: Vec<Value>,
     #[cfg(test)]
@@ -139,6 +145,7 @@ impl Runtime {
             timeout: Duration::from_secs(30),
             output_limit: 16384,
             seen: HashMap::new(),
+            patch_reads: HashMap::new(),
             modified: BTreeSet::new(),
             events: vec![],
             #[cfg(test)]
@@ -263,12 +270,14 @@ impl Runtime {
     fn read_file(&mut self, path: &str) -> Result<Value, String> {
         let parts = Self::parts(path, false)?;
         let parent = self.directory(&parts[..parts.len() - 1])?;
-        let (raw, _) = Self::read(&parent, parts[parts.len() - 1])?;
+        let (raw, info) = Self::read(&parent, parts[parts.len() - 1])?;
         let text = std::str::from_utf8(&raw).map_err(err)?;
         if text.contains('\0') {
             return Err("Binary files are unsupported".into());
         }
         let digest = hash(&raw);
+        self.patch_reads
+            .insert(parts.join("/"), patch::ReadEvidence::new(&info, &digest));
         self.seen.insert(parts.join("/"), digest.clone());
         Ok(json!({"content":text,"sha256":digest}))
     }

@@ -3,7 +3,10 @@
 This guide describes current runtime behavior. The
 [tool architecture decision](tool-architecture.md) specifies a future general
 patch/command contract and validation-gated migration; those APIs and additional
-command permissions are not implemented here.
+command permissions are not implemented here. Milestone 2 now has an
+[internal v2 parser and read-only planner](patch-planning.md); it is neither
+advertised to models nor executable. The five current tool contracts below are
+unchanged.
 
 The supported implementation is the Rust `cognix` Cargo package. `src/agent.rs`
 owns the reusable in-memory conversation and bounded loop; `provider.rs` defines
