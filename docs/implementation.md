@@ -18,6 +18,37 @@ and Ctrl-C (ctrlc). HTTP redirects and inherited proxies are disabled. Inference
 uses only loopback HTTP; there is no hosted provider or implicit model download.
 Cargo.lock pins dependency versions. See the README for build/check commands.
 
+## Shared action lifecycle
+
+The first milestone of the architecture decision's
+[ordered roadmap](tool-architecture.md#ordered-implementation-roadmap) is an
+internal extraction with the five tool contracts unchanged. After schema and
+operation-specific preparation, `runtime.rs` constructs a private `ActionPlan`
+from `action.rs`. The plan owns an immutable preview: the existing patch diff
+and exact replacement, bounded escaped creation display, or JSON exact argv.
+Preparation and preview construction perform no writes. Each plan invokes the
+existing terminal callback once, then gives cancellation precedence over either
+answer. The callback sanitizes the complete terminal display and requires an
+explicit submitted `y`, defaulting to No on blank input, EOF or other answers.
+Plans are consumed per invocation; no approval is cached or shared across tools.
+The existing per-tool denied/canceled result fields are preserved.
+
+Approval returns control to the operation's existing revalidation and execution
+path. Descriptor-relative file checks, patch read hashes and atomic rename,
+creation's exclusive `linkat` publication and identity-owned staging cleanup stay
+in `runtime.rs`. They enforce different replacement/creation contracts and cannot
+be replaced by a generic write helper. Exact-command policy, Seatbelt isolation,
+bounded capture, scratch ownership and process kill/reap stay in `commands.rs`;
+approval alone never establishes those boundaries. No backend capability changes.
+
+The file commit helper records the modified path and computes its hash immediately
+after publication, before cleanup, hooks or cancellation checks. Each operation
+retains its read-first bookkeeping: patch updates the observed hash; creation
+invalidates any earlier observation. Shared result helpers preserve unexecuted
+statuses, bound errors and normalize success/cancellation without clearing committed
+evidence. Runtime dispatch and the agent's queued unrun calls use one event-recording
+helper, retaining arguments and result in order for the existing CLI report.
+
 ## Tools and context
 
 All argument objects are closed: missing/extra fields and incorrect types return
