@@ -53,8 +53,13 @@ preparation interfaces until the executor milestone connects them.
 
 Paths reject empty, absolute, trailing-slash, empty/`.`/`..` components, NUL and
 case-insensitive `.git`. There is no expansion. Components must also fit the
-host filesystem's reported name limit; unknown limits fail closed. Text cannot
-contain NUL. Every nonempty old span must match exactly once, including overlapping
+host filesystem's name rules: descriptor-relative no-follow lookups validate each
+component, accepting an existing entry or `ENOENT` and refusing all other errors,
+including `ENAMETOOLONG`. The reported `NAME_MAX` is not treated as a UTF-8 byte
+ceiling, which would reject valid macOS multibyte names. For missing parents,
+component validation uses the nearest existing ancestor's volume; the executor
+must revalidate against the actual parents before mutation. Text cannot contain
+NUL. Every nonempty old span must match exactly once, including overlapping
 occurrences. Matched intervals cannot overlap, and replacements use original
 bytes simultaneously, in source order. Neither newline normalization nor fuzzy
 matching occurs. Individual and combined no-ops are refused. Empty files can be
@@ -178,6 +183,8 @@ read-only success/failure snapshots and real ACL/xattr/flags refusals are exerci
 The pure mixed plan/preview golden and pure edit limits remain covered. Cargo's
 aggregate pass count does not convert the printed native skips into passes.
 
+The initial implementation checks were:
+
 | Check | Actual result |
 | --- | --- |
 | Current Issue and comments | Pass: fetched Issue #20 and its discussion (no comments) through the GitHub connector. |
@@ -202,3 +209,24 @@ aggregate pass count does not convert the printed native skips into passes.
 
 No Ollama model trials are required for this non-advertised milestone. Required
 post-merge verification: none required.
+
+### Review revision: native component validation
+
+The 2026-11-10 revision replaces the UTF-8 byte comparison against `NAME_MAX`
+with read-only native component lookup. New macOS regressions establish actual
+creation/lookup behavior for 100 and 255 Japanese characters, 200 and 255 accented
+characters, and 127 supplementary Unicode characters. They exercise existing
+source component feasibility and successful add planning through existing and
+missing multibyte parents, with unchanged tree/metadata snapshots. Native creation
+and planning both reject 256 ASCII/Japanese/accented characters and 128
+supplementary characters, including invalid components below planned parents.
+
+Pass on the revised tree: `cargo test --locked --all-targets` (86 tests, including
+the existing native runtime/agent/CLI/sandbox regressions), focused planner tests
+(16 groups with `--nocapture`), formatting, Clippy with warnings denied, the
+documentation checker (15 documents, zero errors), and whitespace checks. The
+same five native subcases above still print explicit provenance-related skips;
+these new name tests do not establish full native source-planning success or
+resolve the outstanding validation question. Production metadata checks remain
+enabled. The PR description uses a non-closing Issue reference while this
+mandatory evidence remains incomplete.

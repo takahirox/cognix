@@ -971,6 +971,102 @@ fn unsupported_source_metadata_and_invalid_text_fail_closed() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn native_multibyte_source_destination_and_parent_names_are_feasible() {
+    for name in [
+        "日".repeat(100),
+        "é".repeat(200),
+        "日".repeat(255),
+        "é".repeat(255),
+        "😀".repeat(127),
+    ] {
+        let t = tempfile::tempdir().unwrap();
+        // Actual creation establishes this volume's behavior before preparation.
+        fs::create_dir(t.path().join(&name)).unwrap();
+        fs::create_dir(t.path().join("existing")).unwrap();
+        let source = format!("existing/{name}");
+        write(t.path(), &source, "source\n");
+        let mut r = runtime(t.path());
+        read(&mut r, &source);
+        let events_before = r.events.len();
+        let parent = File::open(t.path().join("existing")).unwrap();
+        let reported = unsafe { libc::fpathconf(parent.as_raw_fd(), libc::_PC_NAME_MAX) };
+        assert!(reported > 0 && name.len() > reported as usize);
+        let before = snapshot(t.path());
+        // Test source component feasibility independently of the host's forced
+        // provenance xattr, without bypassing production source metadata checks.
+        name_feasible(&parent, &name, &source).unwrap();
+        assert_eq!(
+            component_identity(&parent, &name, &source).unwrap(),
+            Some(Identity::new(&t.path().join(&source).metadata().unwrap()))
+        );
+        let paths = [
+            format!("dest/{name}/{name}"), // missing multibyte parent and leaf
+            format!("{name}/added"),       // existing multibyte parent
+            format!("{name}/new/{name}"),  // leaf below another missing parent
+        ];
+        let plan = r
+            .prepare_v2(&intent(json!(
+                paths.iter().map(|p| add(p, "")).collect::<Vec<_>>()
+            )))
+            .unwrap();
+        assert_eq!(
+            plan.inspect()["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|op| op["path"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            paths.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            plan.inspect()["new_directories"],
+            json!([
+                {"path":"dest","first_change":0,"mode":448},
+                {"path":format!("dest/{name}"),"first_change":0,"mode":448},
+                {"path":format!("{name}/new"),"first_change":2,"mode":448},
+            ])
+        );
+        assert_eq!(snapshot(t.path()), before);
+        assert_eq!(r.events.len(), events_before);
+        assert!(r.modified.is_empty());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_overlong_components_are_refused_even_below_planned_parents() {
+    let t = tempfile::tempdir().unwrap();
+    let r = runtime(t.path());
+    let before = snapshot(t.path());
+    for name in [
+        "a".repeat(256),
+        "日".repeat(256),
+        "é".repeat(256),
+        "😀".repeat(128),
+    ] {
+        // Native creation must agree with the read-only feasibility result.
+        let failure = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(t.path().join(&name))
+            .unwrap_err();
+        assert_eq!(failure.raw_os_error(), Some(libc::ENAMETOOLONG));
+        for path in [
+            name.clone(),
+            format!("{name}/child"),
+            format!("missing/{name}"),
+            format!("missing/{name}/child"),
+        ] {
+            let failure = r.prepare_v2(&intent(json!([add(&path, "")]))).unwrap_err();
+            assert_eq!(failure.reason, Reason::Filesystem);
+            assert_eq!(failure.location, path);
+            assert_eq!(snapshot(t.path()), before);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn actual_macos_xattrs_acls_flags_and_parent_feasibility() {
     use std::process::Command;
     let t = tempfile::tempdir().unwrap();
