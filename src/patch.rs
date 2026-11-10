@@ -869,6 +869,9 @@ fn lookup(parent: &File, name: &str, location: &str) -> Result<Option<Identity>>
             ));
         }
     }
+    component_identity(parent, name, location)
+}
+fn component_identity(parent: &File, name: &str, location: &str) -> Result<Option<Identity>> {
     let c = CString::new(name).map_err(|e| io(location, e))?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: valid descriptor, component string and output storage; no symlink following.
@@ -957,15 +960,12 @@ fn directory_names(parent: &File, location: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 fn name_feasible(parent: &File, name: &str, location: &str) -> Result<()> {
-    let limit = unsafe { libc::fpathconf(parent.as_raw_fd(), libc::_PC_NAME_MAX) };
-    if limit <= 0 || name.len() > limit as usize {
-        return Err(error(
-            Reason::Filesystem,
-            location,
-            "Component exceeds filesystem name limit or limit is unknown",
-        ));
-    }
-    Ok(())
+    // Let the actual filesystem validate the component with a read-only lookup.
+    // In particular, macOS NAME_MAX is not a UTF-8 byte ceiling. Both an existing
+    // entry and ENOENT establish that the name passed lookup validation; all other
+    // errors (including ENAMETOOLONG) fail closed. For planned parents, use the
+    // nearest existing ancestor on the same volume; execution must revalidate.
+    component_identity(parent, name, location).map(|_| ())
 }
 fn creation_feasible(parent: &File, location: &str) -> Result<()> {
     safe_directory(parent, location)?;
