@@ -1,5 +1,5 @@
 //! Exact argv policy and macOS Seatbelt isolation. Never retry unsandboxed.
-use crate::{Cancellation, schema};
+use crate::{Cancellation, action::unexecuted, schema};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -227,14 +227,14 @@ pub fn run(
         .checked_add(timeout)
         .ok_or("Command timeout is too large")?;
     if cancel.is_canceled() {
-        return Ok(json!({"status":"canceled","executed":false}));
+        return Ok(unexecuted("canceled"));
     }
     let validation = validate_project_reads(root, cancel, deadline);
     if cancel.is_canceled() {
-        return Ok(json!({"status":"canceled","executed":false}));
+        return Ok(unexecuted("canceled"));
     }
     if Instant::now() >= deadline {
-        return Ok(json!({"status":"limit_reached","executed":false}));
+        return Ok(unexecuted("limit_reached"));
     }
     validation?;
     let temporary = tempfile::Builder::new()
@@ -282,7 +282,7 @@ pub fn run(
         });
     }
     if cancel.is_canceled() {
-        return Ok(json!({"status":"canceled","executed":false}));
+        return Ok(unexecuted("canceled"));
     }
     let mut child = command
         .spawn()

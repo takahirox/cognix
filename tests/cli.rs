@@ -90,6 +90,81 @@ fn create_file_preview_approval_defaults_and_eof() {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mixed_actions_require_separate_approval_and_preserve_committed_evidence() {
+    let path = "new\u{1b}[31m.txt";
+    let content = "before\u{202e}\n";
+    let argv = json!(["/usr/bin/printf", "%s", "arg\n\"\u{1b}"]);
+    let command_policy = argv.to_string();
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let captured = results.clone();
+    let server = Server::new(move |p, b| {
+        if p != "/api/chat" || b["messages"].as_array().unwrap().len() == 1 {
+            return ready(p, b);
+        }
+        if b["messages"].as_array().unwrap().len() == 2 {
+            let calls = [
+                ("create_file", json!({"path":path,"content":content})),
+                ("read_file", json!({"path":path})),
+                ("apply_patch", json!({"path":path,"sha256":cognix::runtime::hash(content.as_bytes()),"old_text":"before","new_text":"after"})),
+                ("run_command", json!({"argv":argv})),
+            ].into_iter().enumerate().map(|(i, (name, arguments))| {
+                json!({"id":format!("action-{i}"),"function":{"name":name,"arguments":arguments}})
+            }).collect::<Vec<_>>();
+            return Reply::json(
+                json!({"done":true,"message":{"role":"assistant","content":"","tool_calls":calls}}),
+            );
+        }
+        *captured.lock().unwrap() = b["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .cloned()
+            .collect();
+        final_answer()
+    });
+    let t = tempfile::tempdir().unwrap();
+    // Consent covers only creation. EOF must independently deny patch and command.
+    let out = run(
+        command(t.path(), &server.url).args([
+            "--task",
+            "edit and verify",
+            "--allow-command",
+            &command_policy,
+        ]),
+        "y\n",
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(fs::read_to_string(t.path().join(path)).unwrap(), content);
+    assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.matches("Approve this action? [y/N]").count(), 3);
+    let creation = stdout.find("Proposed create_file").unwrap();
+    let patch = stdout.find("Proposed patch").unwrap();
+    let command = stdout.find("Proposed command").unwrap();
+    assert!(creation < patch && patch < command);
+    assert!(stdout.contains("argv = [\"/usr/bin/printf\",\"%s\",\"arg\\n\\\"\\u001b\"]"));
+    assert!(!stdout.contains('\u{1b}') && !stdout.contains('\u{202e}'));
+    assert!(stdout.contains("\\x1b") && stdout.contains("\\x202e"));
+    assert!(stdout.contains(&format!("Modified files: {}", json!([path]))));
+    let results = results.lock().unwrap();
+    assert_eq!(results.len(), 4);
+    for (i, message) in results.iter().enumerate() {
+        assert_eq!(message["tool_call_id"], format!("action-{i}"));
+        let result: Value = serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+        if i == 0 {
+            assert_eq!(result["status"], "ok");
+            assert_eq!(result["executed"], true);
+            assert_eq!(result["sha256"], cognix::runtime::hash(content.as_bytes()));
+        } else if i >= 2 {
+            assert_eq!(result["status"], "denied");
+            assert_eq!(result["executed"], false);
+        }
+    }
+}
 fn finished(child: &mut Child) -> std::process::ExitStatus {
     let end = Instant::now() + Duration::from_secs(5);
     loop {

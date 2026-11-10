@@ -235,6 +235,7 @@ fn directory_limits() {
 fn exact_command_policy_and_denial() {
     let (_t, mut r) = setup();
     r.allowed_commands = vec![vec!["/usr/bin/true".into()]];
+    r.approve = Box::new(|_, _| panic!("Commands outside policy must not reach approval"));
     assert_eq!(
         r.execute("run_command", json!({"argv":["/bin/sh","-c","true"]}))["status"],
         "not_run"
@@ -250,4 +251,71 @@ fn exact_command_policy_and_denial() {
             "not_run"
         }
     );
+}
+
+#[test]
+fn shared_approval_preserves_previews_and_stopped_result_shapes() {
+    let mut tools = vec!["apply_patch", "create_file"];
+    if cfg!(target_os = "macos") {
+        tools.push("run_command");
+    }
+    for tool in tools {
+        // A canceled callback must stop execution whether it answered yes or no.
+        for (answer, interrupt) in [(false, false), (false, true), (true, true)] {
+            let t = tempfile::tempdir().unwrap();
+            fs::write(t.path().join("file"), "before\n").unwrap();
+            let cancel = Cancellation::default();
+            let mut r = Runtime::new(t.path(), Box::new(|_, _| true), cancel.clone()).unwrap();
+            let read = r.execute("read_file", json!({"path":"file"}));
+            r.allowed_commands = vec![vec!["/usr/bin/true".into()]];
+            let (args, expected_kind, expected_preview) = match tool {
+                "apply_patch" => (
+                    json!({"path":"./file","sha256":read["sha256"],"old_text":"before","new_text":"after"}),
+                    "patch",
+                    "--- file\n+++ file\n@@ -1 +1 @@\n-before\n+after\n\nExact replacement: \"before\" -> \"after\"",
+                ),
+                "create_file" => (
+                    json!({"path":"./new","content":"after\n"}),
+                    "create_file",
+                    "Create \"new\" (6 UTF-8 bytes)\n--- /dev/null\n+++ \"new\"\n+after\n",
+                ),
+                _ => (
+                    json!({"argv":["/usr/bin/true"]}),
+                    "command",
+                    "argv = [\"/usr/bin/true\"]\nRead-only project; no network; scratch writes only.",
+                ),
+            };
+            let count = Rc::new(RefCell::new(0));
+            let calls = count.clone();
+            let root = t.path().to_owned();
+            r.approve = Box::new(move |kind, preview| {
+                *calls.borrow_mut() += 1;
+                assert_eq!(kind, expected_kind);
+                assert_eq!(preview, expected_preview);
+                // Preparation must leave neither targets nor staging effects.
+                assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+                assert_eq!(fs::read_to_string(root.join("file")).unwrap(), "before\n");
+                if interrupt {
+                    cancel.cancel();
+                }
+                answer
+            });
+            let result = r.execute(tool, args.clone());
+            let mut expected =
+                json!({"status":if interrupt {"canceled"} else {"denied"},"executed":false});
+            if tool == "create_file" || (tool == "apply_patch" && !interrupt) {
+                expected["path"] = json!(if tool == "create_file" { "new" } else { "file" });
+            }
+            assert_eq!(result, expected, "{tool}");
+            assert_eq!(*count.borrow(), 1);
+            assert!(r.modified.is_empty());
+            assert_eq!(r.seen["file"], hash(b"before\n"));
+            assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
+            assert_eq!(r.events.len(), 2);
+            assert_eq!(
+                r.events[1],
+                json!({"tool":tool,"arguments":args,"result":expected})
+            );
+        }
+    }
 }

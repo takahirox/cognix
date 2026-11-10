@@ -95,10 +95,7 @@ impl<P: Provider> Agent<P> {
                 let arguments = call["function"]["arguments"].clone();
                 let result = if self.runtime.cancel.is_canceled() {
                     let result = json!({"status":"not_run","executed":false,"error":"Session canceled before this call"});
-                    self.runtime
-                        .events
-                        .push(json!({"tool":name,"arguments":arguments,"result":result}));
-                    result
+                    self.runtime.record_result(name, arguments, Ok(result))
                 } else {
                     (self.activity)(&format!("Tool: {name}"));
                     self.runtime.execute(name, arguments)
