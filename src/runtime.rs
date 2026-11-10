@@ -1,4 +1,8 @@
-use crate::{Cancellation, commands, schema};
+use crate::{
+    Cancellation,
+    action::{ActionPlan, finish_result, unexecuted},
+    commands, schema,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -17,7 +21,7 @@ use std::{
 #[path = "runtime_tests.rs"]
 mod tests;
 
-pub type Approval = Box<dyn FnMut(&str, &str) -> bool>;
+pub use crate::action::Approval;
 #[cfg(test)]
 type CommitHook = Box<dyn FnMut(&str)>;
 pub struct Runtime {
@@ -210,7 +214,7 @@ impl Runtime {
         let mut bytes = 0;
         loop {
             if self.cancel.is_canceled() {
-                return Ok(json!({"status":"canceled","executed":false}));
+                return Ok(unexecuted("canceled"));
             }
             let entry = unsafe { libc::readdir(guard.0) };
             if entry.is_null() {
@@ -294,17 +298,10 @@ impl Runtime {
         if after.len() > 65536 {
             return Err("Patched file exceeds 64 KiB".into());
         }
-        let diff = similar::TextDiff::from_lines(before, &after)
-            .unified_diff()
-            .header(&normalized, &normalized)
-            .to_string();
-        let preview = format!("{diff}\nExact replacement: {old:?} -> {new:?}");
-        let approved = (self.approve)("patch", &preview);
-        if self.cancel.is_canceled() {
-            return Ok(json!({"status":"canceled","executed":false}));
-        }
-        if !approved {
-            return Ok(json!({"status":"denied","path":normalized,"executed":false}));
+        if let Err(result) = ActionPlan::patch(&normalized, before, &after, old, new)
+            .approve(&mut self.approve, &self.cancel)
+        {
+            return Ok(result);
         }
         let fresh = self.directory(&parts[..parts.len() - 1])?;
         if !identity(
@@ -342,7 +339,7 @@ impl Runtime {
             h("before_commit");
         }
         if self.cancel.is_canceled() {
-            return Ok(json!({"status":"canceled","executed":false}));
+            return Ok(unexecuted("canceled"));
         }
         let target = cstring(name)?;
         if unsafe {
@@ -357,8 +354,7 @@ impl Runtime {
             return Err(err(std::io::Error::last_os_error()));
         }
         // No fallible/canceling operation between commit and ownership of evidence.
-        self.modified.insert(normalized.clone());
-        let digest = hash(after.as_bytes());
+        let digest = self.record_file_commit(&normalized, after.as_bytes());
         self.seen.insert(normalized.clone(), digest.clone());
         #[cfg(test)]
         if let Some(h) = &mut self.hook {
@@ -416,33 +412,10 @@ impl Runtime {
         self.creation_parent_unchanged(parent_parts, &parent)?;
         Self::destination_absent(&parent, &target)?;
 
-        // Bound the escaped display, not the raw text: terminal controls can
-        // expand when sanitized. The complete content stays in the event ledger.
-        const PREVIEW_CHARS: usize = 8192;
-        let display = crate::terminal::text(content);
-        let excerpt: String = display.chars().take(PREVIEW_CHARS).collect();
-        let mut preview = format!(
-            "Create {normalized:?} ({} UTF-8 bytes)\n--- /dev/null\n+++ {normalized:?}\n",
-            content.len()
-        );
-        for line in excerpt.split_inclusive('\n') {
-            preview.push('+');
-            preview.push_str(line);
-        }
-        if !excerpt.ends_with('\n') && !excerpt.is_empty() {
-            preview.push_str("\n\\ No newline at end of displayed content\n");
-        }
-        if display.chars().count() > PREVIEW_CHARS {
-            preview.push_str("[Creation preview truncated; full content is larger]\n");
-        } else if content.is_empty() {
-            preview.push_str("[Empty file: 0 additions]\n");
-        }
-        let approved = (self.approve)("create_file", &preview);
-        if self.cancel.is_canceled() {
-            return Ok(json!({"status":"canceled","path":normalized,"executed":false}));
-        }
-        if !approved {
-            return Ok(json!({"status":"denied","path":normalized,"executed":false}));
+        if let Err(result) =
+            ActionPlan::creation(&normalized, content).approve(&mut self.approve, &self.cancel)
+        {
+            return Ok(result);
         }
         self.creation_parent_unchanged(parent_parts, &parent)?;
         Self::destination_absent(&parent, &target)?;
@@ -493,8 +466,7 @@ impl Runtime {
             return Err(err(std::io::Error::last_os_error()));
         }
         // No fallible/canceling operation between publish and evidence ownership.
-        let digest = hash(content.as_bytes());
-        self.modified.insert(normalized.clone());
+        let digest = self.record_file_commit(&normalized, content.as_bytes());
         // Keep apply_patch's read-first contract, including stale observations
         // of a previous file that an external editor removed at this path.
         self.seen.remove(&normalized);
@@ -513,18 +485,8 @@ impl Runtime {
             );
         }
         commands::sandbox_argv(&self.root, &self.root, &argv)?;
-        let approved = (self.approve)(
-            "command",
-            &format!(
-                "argv = {}\nRead-only project; no network; scratch writes only.",
-                json!(argv)
-            ),
-        );
-        if self.cancel.is_canceled() {
-            return Ok(json!({"status":"canceled","executed":false}));
-        }
-        if !approved {
-            return Ok(json!({"status":"denied","executed":false}));
+        if let Err(result) = ActionPlan::command(&argv).approve(&mut self.approve, &self.cancel) {
+            return Ok(result);
         }
         if !identity(
             &self.root.metadata().map_err(err)?,
@@ -540,9 +502,27 @@ impl Runtime {
             self.output_limit,
         )
     }
+    // Called immediately after publication, before cleanup/hooks/cancellation.
+    // Read-first bookkeeping stays with each operation: patches update seen,
+    // while creation invalidates even a stale observation of a removed file.
+    fn record_file_commit(&mut self, path: &str, content: &[u8]) -> String {
+        self.modified.insert(path.to_owned());
+        hash(content)
+    }
+    pub(crate) fn record_result(
+        &mut self,
+        name: &str,
+        args: Value,
+        result: Result<Value, String>,
+    ) -> Value {
+        let result = finish_result(name, result, &self.cancel);
+        self.events
+            .push(json!({"tool":name,"arguments":args,"result":result}));
+        result
+    }
     pub fn execute(&mut self, name: &str, args: Value) -> Value {
         let result = if self.cancel.is_canceled() {
-            Ok(json!({"status":"canceled","executed":false}))
+            Ok(unexecuted("canceled"))
         } else {
             schema::validate(name, &args).and_then(|()| match name {
                 "list_files" => self.list(args["path"].as_str().unwrap()),
@@ -553,15 +533,6 @@ impl Runtime {
                 _ => Err("Unknown tool".into()),
             })
         };
-        let mut result=result.unwrap_or_else(|e|json!({"status":if name=="run_command"{"not_run"}else{"failed"},"executed":false,"error":e.chars().take(1000).collect::<String>()}));
-        if result.get("status").is_none() {
-            result["status"] = json!("ok");
-        }
-        if self.cancel.is_canceled() && matches!(result["status"].as_str(), Some("ok" | "passed")) {
-            result["status"] = json!("canceled");
-        }
-        self.events
-            .push(json!({"tool":name,"arguments":args,"result":result}));
-        result
+        self.record_result(name, args, result)
     }
 }
