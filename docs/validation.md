@@ -15,11 +15,12 @@ are historical evidence only. They are not Rust test results.
 ## Internal v2 patch preparation (Issue #20)
 
 The [milestone 2 implementation and validation record](patch-planning.md#validation-record)
-documents the internal parser/read-only planner, 84 passing Rust tests and
-format/lint/docs/release checks on 2026-11-10. Five native v2 source subcases
-remain skipped because the host enforces persistent provenance xattrs; the
-record preserves those mandatory AC7 gaps. V2 is not exposed or executable,
-and the passing legacy suites do not imply those native source checks passed.
+documents the internal parser/read-only planner and the 2026-11-11 revised
+unchanged-move/metadata-observation contract. All 88 Rust tests passed, including
+the five formerly skipped native source cases and ACL/xattr change detection.
+The record distinguishes native evidence from checks not run. V2 is not exposed
+to models or executable; metadata preservation/refusal belongs to the future
+executor.
 
 ## Safe file creation extension (Issue #14)
 

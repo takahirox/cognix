@@ -276,8 +276,10 @@ impl Runtime {
             return Err("Binary files are unsupported".into());
         }
         let digest = hash(&raw);
-        self.patch_reads
-            .insert(parts.join("/"), patch::ReadEvidence::new(&info, &digest));
+        self.patch_reads.insert(
+            parts.join("/"),
+            patch::ReadEvidence::new(&parent, parts[parts.len() - 1], &info, &digest),
+        );
         self.seen.insert(parts.join("/"), digest.clone());
         Ok(json!({"content":text,"sha256":digest}))
     }

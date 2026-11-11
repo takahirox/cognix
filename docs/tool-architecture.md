@@ -7,8 +7,8 @@ work. Existing schemas, approvals and sandbox behavior remain unchanged.
 
 Milestone 2's [internal parser and read-only planner](patch-planning.md) is now
 implemented. V2 remains unavailable to models and has no executor or CLI mode;
-the validation record in that guide distinguishes pure coverage from native
-source checks blocked by host metadata. Later milestones remain future work.
+the validation record in that guide includes native planning with source metadata
+observations and execution constraints. Later milestones remain future work.
 
 ## Decision and boundaries
 
@@ -117,7 +117,7 @@ returned by `read_file`, not a hash the model must compute:
     {"op":"add","path":"src/widget/mod.rs","content":"pub fn value() -> u32 { 1 }\n"},
     {"op":"update","path":"src/lib.rs","sha256":"<read_file sha256>","edits":[{"old_text":"mod old;","new_text":"mod widget;"}]},
     {"op":"delete","path":"tests/obsolete.rs","sha256":"<read_file sha256>"},
-    {"op":"move","path":"src/old.rs","to":"src/widget/value.rs","sha256":"<read_file sha256>","edits":[]}
+    {"op":"move","path":"src/old.rs","to":"src/widget/value.rs","sha256":"<read_file sha256>"}
   ]
 }
 ```
@@ -125,10 +125,10 @@ returned by `read_file`, not a hash the model must compute:
 The example uses hash placeholders for readability; they fail runtime validation.
 `add` takes complete content, including empty text. `update` requires one or more
 edits. `delete` removes one regular file. `move` transfers one source to an absent
-destination, optionally editing its content in the same reviewed operation;
-empty `edits` means a pure move. No directory deletion/move, overwrite, binary,
-chmod, ownership change or arbitrary metadata API is included. Empty directories
-are not a standalone patch operation; commands may eventually create them.
+destination with unchanged bytes and hash. It has exactly `op`, `path`, `to` and
+`sha256`; reject `edits` even when empty. Edits belong to updates only.
+No directory deletion/move, overwrite, binary, chmod, ownership change or arbitrary
+metadata API is included. Empty directories are not a standalone patch operation; commands may eventually create them.
 
 Advertise these four closed record shapes and the closed edit shape
 `{old_text: string, new_text: string}`. Use a discriminator plus `oneOf` for the
@@ -162,9 +162,10 @@ legacy mode rather than silently accepting extra fields or changing the contract
 - A path may participate in only one change, as source or destination. Reject
   duplicate/aliased paths, move cycles, swaps, case-only moves, and file/directory
   prefix conflicts. No operation may depend on another's output. Rename and
-  update references uses one move (with optional edits) plus updates to other
-  files. Supporting chained file operations would complicate stale-state
-  semantics; sharing newly created parent directories is allowed as below.
+  update references uses one unchanged move plus updates to other files. A moved
+  source/destination cannot also be updated in that patch. Supporting chained file
+  operations would complicate stale-state semantics; sharing newly created parent
+  directories is allowed as below.
 - Missing parent directories of adds/moves are created automatically as part of
   the approved patch. List them explicitly in the preview. Existing parents must
   be directories without symlinks; record/recheck their identities. Create new
@@ -174,9 +175,10 @@ legacy mode rather than silently accepting extra fields or changing the contract
   ancestor-first order when first needed. Later operations accept only the
   recorded identity of that plan-owned directory, not an externally substituted
   directory. Associate its effect with the first operation that created it.
-- Initial limits: eight changes, sixteen edits per source, 64 KiB per source or
-  resulting file, 256 KiB total resulting file content, and 1 MiB serialized
-  arguments, with at most 32 components per path and 32 new directories per plan.
+- Initial limits: eight changes, sixteen edits per update source, 64 KiB per source
+  or resulting file, 256 KiB total resulting file content (including unchanged move
+  destinations), and 1 MiB serialized arguments, with at most 32 components per
+  path and 32 new directories per plan.
   Contents are UTF-8 without NULs. These are safety ceilings, not a
   promise the model/context budget can produce that much. Reject over-limit,
   unknown-version, missing/extra-field, wrong-type, invalid-hash and malformed
@@ -186,12 +188,14 @@ legacy mode rather than silently accepting extra fields or changing the contract
 
 Perform complete syntax/policy validation and preflight all changes first, with
 no target mutations or directory creation. Produce one immutable plan containing
-root/parent/source identities, hashes, absent destinations/parents and ordered
-operations. One per-call approval covers exactly this plan and its digest.
+root/parent/source identities, hashes, source metadata observations and execution
+constraints, absent destinations/parents and ordered operations. One per-call
+approval covers exactly this plan and its digest.
 Show every source/destination, operation type, byte counts, directory creation,
-and bounded escaped diffs, including full-file deletion and move-plus-edit diffs.
-Never omit a path from the summary. Use an 8,192 escaped-character content preview
-budget with explicit truncation; provide a CLI option to inspect the complete
+metadata constraints and bounded escaped diffs, including full-file deletion.
+An unchanged move lists both paths, unchanged-content hash and byte count without
+a content diff. Never omit a path from the summary. Use an 8,192 escaped-character
+content preview budget with explicit truncation; provide a CLI option to inspect the complete
 escaped plan before submitting approval. EOF, blank, No and cancellation deny
 publication. Editing or refreshing the plan requires a new preview and approval.
 
@@ -215,11 +219,16 @@ Readers may observe intermediate batch states; tools remain sequential but
 external readers are not locked out.
 
 Preserve ordinary permission bits on updates/moves and use 0600 subject to umask
-for adds. Initially reject sources with special mode bits or ACLs/xattrs rather
-than silently discarding metadata; testing metadata detection is a prerequisite
-for v2 mutation. Existing v1 metadata behavior remains unchanged. Missing-parent
-creation is also a recorded substep: if subsequent file publication fails, empty
-directories may remain and must be reported. Do not automatically remove them
+for adds. Read-only planning records source special mode bits, flags, ACLs and
+xattrs, distinguishing observed presence/absence from inspection failure or
+unsupported detection. Ordinary OS provenance attributes must not block preview
+planning. Changed observations are stale state. Metadata inspection that cannot
+establish safety becomes an explicit execution constraint, never permission to
+mutate. Before any target write, the future executor must independently establish
+metadata support, safely preserve attributes or refuse execution, and revalidate
+after consent and before each mutation. Existing v1 metadata behavior remains
+unchanged. Missing-parent creation is also a recorded substep: if subsequent file
+publication fails, empty directories may remain and must be reported. Do not automatically remove them
 or reverse successful files; cleanup removes only identity-checked owned staging
 artifacts. Undo is a new reviewed patch against current hashes, never Git reset.
 
@@ -511,7 +520,7 @@ and rollback boundary. Do not build two competing execution frameworks.
 | Order | Deliverable and prerequisites | Measurable acceptance and compatibility |
 | --- | --- | --- |
 | 1 | Extract shared action-plan/approval/evidence helpers from current mutation/command paths. | Existing deterministic and real macOS security tests retain current schemas, previews, statuses and cancellation behavior; add only missing ownership assertions. Default behavior unchanged; revert extraction independently. |
-| 2 | Implement pure v2 parser, path/conflict validator and preview planner, including metadata feasibility checks. Depends on 1. | Golden add/update/delete/move plans, strict bounds and malformed inputs, real filesystem alias tests; zero target mutations during planning. No model exposure or execution; revert without changing v1. |
+| 2 | Implement pure v2 parser, path/conflict validator and preview planner, recording metadata observations and execution constraints. Depends on 1. | Golden add/update/delete/unchanged-move plans, strict bounds and malformed inputs, native source planning with ordinary OS attributes, real filesystem alias tests; zero target mutations during planning. No model exposure or execution; revert without changing v1. |
 | 3 | Implement descriptor-relative v2 executor behind an explicit experimental session mode. Depends on 2. | Failure/cancel/race injection proves per-substep effects, no-clobber publication, stale checks, parent creation and partial-result ledger; preview-before-consent CLI tests pass. No command-policy changes; v1 remains default. |
 | 4 | Add session-selected schema/provider support and real-model v1/v2 fixture comparison. Depends on 3. | Test both tags/schema transport and report the evaluation matrix above. Advertise exactly one `apply_patch` signature per session; v1 maps to shared primitives without imposing stricter v2 path/metadata rules, and `create_file` retains no-parent/no-overwrite semantics. Unsupported models keep v1. Never reinterpret an old in-flight call as v2. |
 | 5 | Introduce `exec_command` read-only contract as a wrapper around the existing exact-argv backend. Depends on 1 and 4. | Policy/unit and actual CLI/macOS tests show no extra permissions, cwd confinement, ceilings and evidence; `run_command` stays a compatible wrapper. Schema mode is fixed for a session, no duplicate command tool names advertised. Roll back to old advertisement without weakening isolation. |
