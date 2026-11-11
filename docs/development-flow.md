@@ -29,8 +29,16 @@ over adding one model-facing tool per filesystem operation. Retain specialized
 tools when evidence shows a reliability or security benefit. Share approval,
 policy and execution evidence without weakening operation-specific boundaries.
 The decision is a migration target; keep existing behavior until each replacement
-passes its documented compatibility and safety gates. In particular, an argv
-allowlist or approval alone does not authorize a write-capable command backend.
+passes its documented compatibility and safety gates. Keep read-only patch
+planning separate from execution permission: ordinary source extended attributes
+must not block a preview, and metadata constraints must reach the future executor.
+Use unchanged-content moves in initial v2 patches; update references in other
+files in the same patch. Follow the decision's
+[Issue #20/PR #21 handoff](tool-architecture.md#issue-20-and-pr-21-acceptance-changes)
+for the planner revision. Command extensions follow their own prerequisites;
+the read-only wrapper does not wait for patch model evaluation. In particular,
+an argv allowlist or approval alone does not authorize a write-capable command
+backend.
 
 Keep three categories distinct:
 

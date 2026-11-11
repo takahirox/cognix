@@ -6,7 +6,10 @@ loops, approved edits, and sandboxed verification. The
 records the Rust migration and subsequent tool and security checks.
 The [tool architecture decision](docs/tool-architecture.md) defines the future
 general patch/command direction and incremental migration; it does not change
-the currently supported tools or sandbox permissions.
+the currently supported tools or sandbox permissions. V2 remains a future
+experimental contract with unchanged-content moves and read-only metadata-aware
+previews; the read-only command wrapper can advance independently of patch model
+trials. V1 remains available during experimental rollout.
 
 ## Setup
 
