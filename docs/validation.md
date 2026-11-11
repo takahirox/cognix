@@ -12,6 +12,16 @@ performed by this implementation node. Review and integration remain downstream.
 The [Python validation record](validation-python.md) and its two raw JSON records
 are historical evidence only. They are not Rust test results.
 
+## Internal v2 patch preparation (Issue #20)
+
+The [milestone 2 implementation and validation record](patch-planning.md#validation-record)
+documents the internal parser/read-only planner and the 2026-11-11 revised
+unchanged-move/metadata-observation contract. All 88 Rust tests passed, including
+the five formerly skipped native source cases and ACL/xattr change detection.
+The record distinguishes native evidence from checks not run. V2 is not exposed
+to models or executable; metadata preservation/refusal belongs to the future
+executor.
+
 ## Safe file creation extension (Issue #14)
 
 Validated on 2026-11-09 in this Apple Silicon macOS worktree with Homebrew

@@ -182,6 +182,11 @@ for the exact tool contract, numeric limits, execution policy and limitations.
 
 ## Check and build
 
+The proposed v2 patch contract has an
+[internal parser and read-only preview planner](docs/patch-planning.md).
+V2 is not available to models or the CLI and cannot execute patches; the five
+existing tools and their approvals and sandbox permissions are unchanged.
+
 ```sh
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings

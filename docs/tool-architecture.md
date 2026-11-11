@@ -6,6 +6,11 @@ Status: architecture decision from
 delivery. Runtime work remains in the milestones below. Existing schemas,
 approvals and sandbox behavior remain unchanged.
 
+Milestone 2's [internal parser and read-only planner](patch-planning.md) is now
+implemented. V2 remains unavailable to models and has no executor or CLI mode;
+the validation record in that guide includes native planning with source metadata
+observations and execution constraints. Later milestones remain future work.
+
 ## Decision and boundaries
 
 Prioritize a small set of composable tools: general `apply_patch` for reviewed
@@ -163,9 +168,10 @@ legacy mode rather than silently accepting extra fields or changing the contract
 - A path may participate in only one change, as source or destination. Reject
   duplicate/aliased paths, move cycles, swaps, case-only moves, and file/directory
   prefix conflicts. No operation may depend on another's output. Rename and
-  update references uses one unchanged-content move plus updates to other
-  files. Supporting chained file operations would complicate stale-state
-  semantics; sharing newly created parent directories is allowed as below.
+  update references uses one unchanged move plus updates to other files. A moved
+  source/destination cannot also be updated in that patch. Supporting chained file
+  operations would complicate stale-state semantics; sharing newly created parent
+  directories is allowed as below.
 - Missing parent directories of adds/moves are created automatically as part of
   the approved patch. List them explicitly in the preview. Existing parents must
   be directories without symlinks; record/recheck their identities. Create new
@@ -175,10 +181,10 @@ legacy mode rather than silently accepting extra fields or changing the contract
   ancestor-first order when first needed. Later operations accept only the
   recorded identity of that plan-owned directory, not an externally substituted
   directory. Associate its effect with the first operation that created it.
-- Initial limits: eight changes, sixteen edits per source, 64 KiB per source or
-  resulting file, 256 KiB total resulting file content, and 1 MiB serialized
-  arguments, with at most 32 components per path and 32 new directories per plan.
-  Unchanged move destinations count toward the resulting-content limit.
+- Initial limits: eight changes, sixteen edits per update source, 64 KiB per source
+  or resulting file, 256 KiB total resulting file content (including unchanged move
+  destinations), and 1 MiB serialized arguments, with at most 32 components per
+  path and 32 new directories per plan.
   Contents are UTF-8 without NULs. These are safety ceilings, not a
   promise the model/context budget can produce that much. Reject over-limit,
   unknown-version, missing/extra-field, wrong-type, invalid-hash and malformed
@@ -190,11 +196,11 @@ Planning inspects the anchored filesystem without target mutations. Keep all
 path, prior-read hash, file identity, regular-file/single-hard-link, no-symlink,
 parent identity and destination-absence checks. A source extended attribute
 alone, including ordinary macOS `com.apple.provenance`, must not block a preview.
-Record relevant mode bits, ACL/xattr observations and execution constraints in
-the immutable plan and escaped preview. Metadata presence is distinct from an
-unsupported or failed inspection; record that distinction. If metadata safety
-cannot yet be established, mark execution eligibility as unestablished rather
-than treating missing evidence as permission. Failure to establish safe path or
+Record relevant mode bits, file flags, ACL/xattr observations and execution
+constraints in the immutable plan and escaped preview. Metadata presence is
+distinct from an unsupported or failed inspection; record that distinction. If
+metadata safety cannot yet be established, mark execution eligibility as
+unestablished rather than treating missing evidence as permission. Failure to establish safe path or
 file identity still fails planning.
 
 A plan is neither consent nor proof that the executor can publish safely. Before
@@ -217,13 +223,13 @@ mutation ships. V1 metadata behavior is unchanged.
 
 Perform complete syntax/policy validation and preflight all changes first, with
 no target mutations or directory creation. Produce one immutable plan containing
-root/parent/source identities, hashes, absent destinations/parents, metadata
-constraints and ordered operations. A preview can exist even when execution is
-unsupported; the internal planner never prompts for approval. The executor must
-establish execution eligibility before requesting consent. One per-call approval
-covers exactly this plan and its digest.
+root/parent/source identities, hashes, absent destinations/parents, source metadata
+observations, execution constraints and ordered operations. A preview can exist
+even when execution is unsupported; the internal planner never prompts for
+approval. The executor must establish execution eligibility before requesting
+consent. One per-call approval covers exactly this plan and its digest.
 Show every source/destination, operation type, byte counts, directory creation,
-and bounded escaped diffs, including full-file deletion. For moves show both
+metadata constraints and bounded escaped diffs, including full-file deletion. For moves show both
 paths, the unchanged-content hash/byte count and metadata constraints, without
 an edit diff.
 Never omit a path from the summary. Use an 8,192 escaped-character content preview

@@ -4,6 +4,14 @@ use serde_json::{Value, json};
 
 pub type Approval = Box<dyn FnMut(&str, &str) -> bool>;
 
+/// Pure diff construction shared by legacy approval and internal v2 preparation.
+pub(crate) fn patch_diff(from: &str, to: &str, before: &str, after: &str) -> String {
+    similar::TextDiff::from_lines(before, after)
+        .unified_diff()
+        .header(from, to)
+        .to_string()
+}
+
 /// An immutable preview built only after the backend's side-effect-free checks.
 /// The terminal callback still sanitizes the complete display and reads explicit
 /// default-No consent. Consuming a plan never authorizes a later action.
@@ -16,10 +24,7 @@ pub(crate) struct ActionPlan<'a> {
 
 impl<'a> ActionPlan<'a> {
     pub fn patch(path: &'a str, before: &str, after: &str, old: &str, new: &str) -> Self {
-        let diff = similar::TextDiff::from_lines(before, after)
-            .unified_diff()
-            .header(path, path)
-            .to_string();
+        let diff = patch_diff(path, path, before, after);
         Self {
             kind: "patch",
             preview: format!("{diff}\nExact replacement: {old:?} -> {new:?}"),
