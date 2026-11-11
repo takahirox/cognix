@@ -38,49 +38,9 @@ fn edit(old: &str, new: &str) -> Value {
 }
 fn write(root: &Path, path: &str, text: &str) {
     fs::write(root.join(path), text).unwrap();
-    // This host can automatically attach provenance even to synthetic fixtures.
-    // Ordinary sources must explicitly have no xattrs; production never strips them.
-    #[cfg(target_os = "macos")]
-    {
-        let file = File::open(root.join(path)).unwrap();
-        let result =
-            unsafe { libc::fremovexattr(file.as_raw_fd(), c"com.apple.provenance".as_ptr(), 0) };
-        if result != 0 {
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ENOATTR)
-            );
-        }
-    }
     fs::set_permissions(root.join(path), fs::Permissions::from_mode(0o644)).unwrap();
 }
 
-// Skip only the demonstrated host condition. A different metadata error must
-// fail these tests, including an accidentally broken ACL-absence detector.
-fn provenance_skip(root: &Path, path: &str, failure: &PatchError, check: &str) {
-    assert_eq!(failure.reason, Reason::UnsupportedMetadata, "{failure:?}");
-    assert_eq!(
-        failure.detail, "Extended attributes are unsupported",
-        "{failure:?}"
-    );
-    assert_eq!(failure.location, path);
-    #[cfg(target_os = "macos")]
-    {
-        let file = File::open(root.join(path)).unwrap();
-        let mut names = [0u8; 256];
-        let n = unsafe {
-            libc::flistxattr(file.as_raw_fd(), names.as_mut_ptr().cast(), names.len(), 0)
-        };
-        assert!(n >= 0);
-        assert_eq!(&names[..n as usize], b"com.apple.provenance\0");
-        eprintln!("SKIPPED native {check}: forced provenance xattr; {failure:?}");
-    }
-    #[cfg(not(target_os = "macos"))]
-    panic!(
-        "Unexpected native metadata failure for {check}: {failure:?} at {}",
-        root.join(path).display()
-    );
-}
 // Snapshot every entry, including hidden entries, directories, symlink targets,
 // inode, permissions, uid/gid, links, length, mtime/ctime and file bytes. atime is
 // deliberately excluded: ordinary kernel reads may update it on some mounts.
@@ -109,6 +69,30 @@ fn snapshot(root: &Path) -> Value {
                 },
                 size
             );
+            let mut values = BTreeMap::new();
+            for name in names.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+                let c = CString::new(name).unwrap();
+                let n = unsafe {
+                    libc::fgetxattr(fd.as_raw_fd(), c.as_ptr(), std::ptr::null_mut(), 0, 0, 0)
+                };
+                assert!(n >= 0);
+                let mut value = vec![0u8; n as usize];
+                assert_eq!(
+                    unsafe {
+                        libc::fgetxattr(
+                            fd.as_raw_fd(),
+                            c.as_ptr(),
+                            value.as_mut_ptr().cast(),
+                            value.len(),
+                            0,
+                            0,
+                        )
+                    },
+                    n
+                );
+                values.insert(format!("{name:?}"), value);
+            }
+            entry["xattr_values"] = json!(values);
             entry["flags"] = json!(m.st_flags());
             entry["xattr_names"] = json!(names);
             let mut attrs = libc::attrlist {
@@ -157,7 +141,7 @@ fn strict_parser_rejects_malformed_closed_contracts() {
         add("a", ""),
         update("a", &digest, json!([edit("x", "y")])),
         json!({"op":"delete","path":"a","sha256":digest}),
-        json!({"op":"move","path":"a","to":"b","sha256":digest,"edits":[]}),
+        json!({"op":"move","path":"a","to":"b","sha256":digest}),
     ];
     for change in valid {
         assert!(
@@ -206,6 +190,15 @@ fn strict_parser_rejects_malformed_closed_contracts() {
             )
             .unwrap_err()
             .reason,
+            Reason::Shape
+        );
+    }
+    for edits in [json!([]), json!([edit("x", "y")]), Value::Null] {
+        let raw = json!({"version":2,"changes":[{"op":"move","path":"a","to":"b","sha256":digest,"edits":edits}]});
+        assert_eq!(
+            PatchIntent::parse(raw.to_string().as_bytes())
+                .unwrap_err()
+                .reason,
             Reason::Shape
         );
     }
@@ -420,71 +413,25 @@ fn exact_original_bytes_handle_overlaps_ambiguity_and_noops() {
 #[test]
 fn mixed_plan_and_preview_are_golden_deterministic_and_read_only() {
     let t = tempfile::tempdir().unwrap();
-    write(t.path(), "update", "old\n");
+    write(t.path(), "update", "mod old;\n");
     write(t.path(), "delete", "gone\n");
-    write(t.path(), "move", "before\n");
+    write(t.path(), "old", "before\n");
     fs::create_dir(t.path().join(".hidden")).unwrap();
     write(t.path(), ".hidden/keep", "unchanged");
     let mut r = runtime(t.path());
     let u = read(&mut r, "update");
     let d = read(&mut r, "delete");
-    let m = read(&mut r, "move");
+    let m = read(&mut r, "old");
     let request = intent(json!([
-        add("new/shared/add", "new\n"), update("update", &u, json!([edit("old", "updated")])),
+        add("new/shared/add", "new\n"), update("update", &u, json!([edit("old", "moved")])),
         {"op":"delete","path":"delete","sha256":d},
-        {"op":"move","path":"move","to":"new/shared/moved","sha256":m,"edits":[edit("before", "after")]}
+        {"op":"move","path":"old","to":"new/shared/moved","sha256":m}
     ]));
     let before = snapshot(t.path());
     let events = r.events.clone();
     let seen = r.seen.clone();
-    // The pure golden remains executable on hosts that force system xattrs.
-    // Native preflight must still refuse those sources rather than weakening policy.
-    let fixture_plan = || PatchPlan {
-        version: 2,
-        root: Fingerprint::new(&t.path().metadata().unwrap()),
-        parents: BTreeMap::new(),
-        new_directories: vec![
-            NewDirectory {
-                path: "new".into(),
-                first_change: 0,
-                mode: 0o700,
-            },
-            NewDirectory {
-                path: "new/shared".into(),
-                first_change: 0,
-                mode: 0o700,
-            },
-        ],
-        operations: request
-            .changes
-            .iter()
-            .map(|c| {
-                let before = c.digest().map(|digest| {
-                    let evidence = r.patch_reads.get(c.path()).unwrap();
-                    Source {
-                        state: evidence.state.clone(),
-                        content: fs::read_to_string(t.path().join(c.path())).unwrap(),
-                        sha256: digest.into(),
-                    }
-                });
-                plan_operation(c, before).unwrap()
-            })
-            .collect(),
-        total_result_bytes: 18,
-        constraints: PLAN_CONSTRAINTS.to_vec(),
-    };
-    let (plan, second) = match r.prepare_v2(&request) {
-        Ok(p) => (p, r.prepare_v2(&request).unwrap()),
-        Err(e) => {
-            provenance_skip(
-                t.path(),
-                "update",
-                &e,
-                "mixed-source success (pure mixed golden still runs)",
-            );
-            (fixture_plan(), fixture_plan())
-        }
-    };
+    let plan = r.prepare_v2(&request).unwrap();
+    let second = r.prepare_v2(&request).unwrap();
     assert_eq!(plan.inspect(), second.inspect());
     assert_eq!(plan.digest(), second.digest());
     assert_eq!(plan.preview(), second.preview());
@@ -500,6 +447,10 @@ fn mixed_plan_and_preview_are_golden_deterministic_and_read_only() {
     for op in projected["operations"].as_array_mut().unwrap() {
         if let Some(before) = op["before"].as_object_mut() {
             before.remove("state");
+            let observed = before.remove("metadata").unwrap();
+            assert_eq!(observed["xattrs"]["status"], "observed");
+            assert_eq!(observed["acl"]["status"], "observed");
+            assert_eq!(observed["flags"]["status"], "observed");
         }
     }
     projected.as_object_mut().unwrap().remove("root");
@@ -508,31 +459,47 @@ fn mixed_plan_and_preview_are_golden_deterministic_and_read_only() {
         json!({
         "version":2,"parents":{}, "new_directories":[{"path":"new","first_change":0,"mode":448},{"path":"new/shared","first_change":0,"mode":448}],
             "operations":[
-                {"op":"add","path":"new/shared/add","to":null,"before":null,"after":"new\n","after_sha256":hash(b"new\n"),"before_bytes":0,"after_bytes":4,"destination_absent":true,"mode":384,"edits":[]},
-                {"op":"update","path":"update","to":null,"before":{"content":"old\n","sha256":u},"after":"updated\n","after_sha256":hash(b"updated\n"),"before_bytes":4,"after_bytes":8,"destination_absent":false,"mode":420,"edits":[edit("old","updated")]},
-                {"op":"delete","path":"delete","to":null,"before":{"content":"gone\n","sha256":d},"after":null,"after_sha256":null,"before_bytes":5,"after_bytes":0,"destination_absent":false,"mode":null,"edits":[]},
-                {"op":"move","path":"move","to":"new/shared/moved","before":{"content":"before\n","sha256":m},"after":"after\n","after_sha256":hash(b"after\n"),"before_bytes":7,"after_bytes":6,"destination_absent":true,"mode":420,"edits":[edit("before","after")]}
-            ],"total_result_bytes":18,"constraints":[
+                {"op":"add","path":"new/shared/add","to":null,"before":null,"after":"new\n","after_sha256":hash(b"new\n"),"before_bytes":0,"after_bytes":4,"destination_absent":true,"mode":384,"edits":[],"constraints":["establish destination metadata/inheritance support before writes; create 0600 subject to umask"]},
+                {"op":"update","path":"update","to":null,"before":{"content":"mod old;\n","sha256":u},"after":"mod moved;\n","after_sha256":hash(b"mod moved;\n"),"before_bytes":9,"after_bytes":11,"destination_absent":false,"mode":420,"edits":[edit("old","moved")],"constraints":["establish metadata support before writes; safely preserve source mode, flags, ACLs and xattrs or refuse execution"]},
+                {"op":"delete","path":"delete","to":null,"before":{"content":"gone\n","sha256":d},"after":null,"after_sha256":null,"before_bytes":5,"after_bytes":0,"destination_absent":false,"mode":null,"edits":[],"constraints":["establish metadata support before unlink; revalidate source mode, flags, ACLs and xattrs or refuse execution"]},
+                {"op":"move","path":"old","to":"new/shared/moved","before":{"content":"before\n","sha256":m},"after":"before\n","after_sha256":m,"before_bytes":7,"after_bytes":7,"destination_absent":true,"mode":420,"edits":[],"constraints":["establish metadata support before destination writes; safely preserve source mode, flags, ACLs and xattrs or refuse execution; revalidate before source unlink"]}
+            ],"total_result_bytes":22,"constraints":[
                 "not authorization; explicit consent to exact digest required", "revalidate whole plan after consent and each operation before mutation",
                 "recheck anchored root, parent/source identities, metadata and hashes, and every absence", "exclusive parent creation (0700) and destination publication; no clobber",
-                "sequential commits; record plan-owned directories and each committed substep; no rollback", "ordinary source modes preserved; add mode 0600; umask applies"]
+                "sequential commits; record plan-owned directories and each committed substep; no rollback", "metadata support required before any write; safely preserve source attributes or refuse execution; add mode 0600 subject to umask"]
         })
     );
+    let mut preview = plan
+        .preview()
+        .replace(&plan.digest(), "DIGEST")
+        .replace(&m, "MOVE_HASH");
+    for op in &plan.operations {
+        if let Some(source) = &op.before {
+            preview = preview.replace(&source.metadata.summary(), "METADATA");
+        }
+    }
     assert_eq!(
-        plan.preview().replace(&plan.digest(), "DIGEST"),
+        preview,
         concat!(
             "v2 patch plan DIGEST (not authorization)\n",
             "mkdir \"new\" (0700 subject to umask; change 0)\n",
             "mkdir \"new/shared\" (0700 subject to umask; change 0)\n",
             "0: add \"new/shared/add\" (0 -> 4 bytes)\n",
-            "1: update \"update\" (4 -> 8 bytes)\n",
+            "  constraint: establish destination metadata/inheritance support before writes; create 0600 subject to umask\n",
+            "1: update \"update\" (9 -> 11 bytes)\n",
+            "  metadata: METADATA\n",
+            "  constraint: establish metadata support before writes; safely preserve source mode, flags, ACLs and xattrs or refuse execution\n",
             "2: delete \"delete\" (5 -> 0 bytes)\n",
-            "3: move \"move\" -> \"new/shared/moved\" (7 -> 6 bytes)\n",
+            "  metadata: METADATA\n",
+            "  constraint: establish metadata support before unlink; revalidate source mode, flags, ACLs and xattrs or refuse execution\n",
+            "3: move \"old\" -> \"new/shared/moved\" (7 -> 7 bytes)\n",
+            "  unchanged content: sha256 MOVE_HASH (7 bytes)\n",
+            "  metadata: METADATA\n",
+            "  constraint: establish metadata support before destination writes; safely preserve source mode, flags, ACLs and xattrs or refuse execution; revalidate before source unlink\n",
             "Content diffs (8192 escaped-character budget):\n",
             "--- /dev/null\n+++ new/shared/add\n@@ -0,0 +1 @@\n+new\n",
-            "--- update\n+++ update\n@@ -1 +1 @@\n-old\n+updated\n",
+            "--- update\n+++ update\n@@ -1 +1 @@\n-mod old;\n+mod moved;\n",
             "--- delete\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n",
-            "--- move\n+++ new/shared/moved\n@@ -1 +1 @@\n-before\n+after\n"
         )
     );
     let mut copy = plan.inspect();
@@ -543,22 +510,33 @@ fn mixed_plan_and_preview_are_golden_deterministic_and_read_only() {
 #[test]
 fn preview_has_all_paths_and_directories_when_content_is_truncated() {
     let t = tempfile::tempdir().unwrap();
-    let r = runtime(t.path());
+    write(t.path(), "old", "unchanged\n");
+    let mut r = runtime(t.path());
+    let h = read(&mut r, "old");
+    let before = snapshot(t.path());
     let weird = "esc\x1b[31m\n\u{202e}file";
     let p = r
         .prepare_v2(&intent(json!([
             add("nested/big", &"x\n".repeat(FILE_BYTES / 2)),
-            add(weird, "\x1b\r\t\u{202e}")
+            add(weird, "\x1b\r\t\u{202e}"),
+            {"op":"move","path":"old","to":"nested/moved","sha256":h}
         ])))
         .unwrap();
     let preview = p.preview();
+    assert_eq!(snapshot(t.path()), before);
     assert!(preview.contains("truncated"));
+    assert!(preview.contains("move \"old\" -> \"nested/moved\""));
+    assert!(preview.contains(&format!("unchanged content: sha256 {h} (10 bytes)")));
+    assert!(preview.contains("metadata:"));
+    assert!(
+        preview.contains("safely preserve source mode, flags, ACLs and xattrs or refuse execution")
+    );
     assert!(preview.contains(&quoted(weird)));
     assert!(preview.contains("mkdir \"nested\""));
     assert!(!preview.contains('\x1b'));
     assert!(!preview.contains('\r'));
     assert!(!preview.contains('\u{202e}'));
-    assert!(preview.chars().count() < PREVIEW_CHARS + 1600);
+    assert!(preview.chars().count() < PREVIEW_CHARS + 2500);
     let complete = p.complete_escaped();
     assert!(!complete.contains('\x1b'));
     assert!(!complete.contains('\n'));
@@ -640,8 +618,10 @@ fn conflicts_dependencies_cycles_prefixes_and_aliases_are_rejected() {
         json!([add("a", ""), add("a/b", "")]),
         json!([add("a/b", ""), add("A", "")]),
         json!([add("é", ""), add("e\u{301}", "")]),
-        json!([{"op":"move","path":"a","to":"b","sha256":h,"edits":[]},{"op":"move","path":"b","to":"a","sha256":h,"edits":[]}]),
-        json!([{"op":"move","path":"a","to":"A","sha256":h,"edits":[]}]),
+        json!([{"op":"move","path":"a","to":"b","sha256":h},{"op":"move","path":"b","to":"a","sha256":h}]),
+        json!([{"op":"move","path":"a","to":"A","sha256":h}]),
+        json!([{"op":"move","path":"a","to":"b","sha256":h}, update("a", &h, json!([edit("x", "y")]))]),
+        json!([{"op":"move","path":"a","to":"b","sha256":h}, update("b", &h, json!([edit("x", "y")]))]),
         json!([add("a", ""), update("a", &h, json!([edit("x", "y")]))]),
         json!([{"op":"delete","path":"a","sha256":h},add("a", "")]),
     ] {
@@ -829,18 +809,13 @@ fn changed_state_between_inspections_never_becomes_a_plan() {
         let mut changes = vec![add("new/child", "new"), add("dir/add", "")];
         if race.starts_with("source-") || race == "metadata" {
             changes.push(update("dir/source", &h, json!([edit("old", "new")])));
-            if let Err(e) = r.prepare_v2(&intent(json!(changes.clone()))) {
-                provenance_skip(
-                    &root,
-                    "dir/source",
-                    &e,
-                    &format!("{race} between inspections"),
-                );
-                continue;
-            }
+            let before = snapshot(&root);
+            r.prepare_v2(&intent(json!(changes.clone()))).unwrap();
+            assert_eq!(snapshot(&root), before);
         }
         let request = intent(json!(changes));
         let mut called = false;
+        let mut after_race = None;
         let result = r.prepare_v2_checked(&request, || {
             called = true;
             match race {
@@ -866,9 +841,15 @@ fn changed_state_between_inspections_never_becomes_a_plan() {
                 }
                 _ => unreachable!(),
             }
+            after_race = Some(snapshot(&root));
         });
         assert!(called, "race hook must be reached: {race}");
         assert!(result.is_err(), "{race}");
+        assert_eq!(snapshot(&root), after_race.unwrap(), "{race}");
+        if race.starts_with("source-") || race == "metadata" {
+            assert_eq!(result.unwrap_err().reason, Reason::StaleState, "{race}");
+        }
+        eprintln!("PASS native between-inspection race: {race}");
         assert!(r.modified.is_empty());
         assert!(!root.join("new/child").exists());
     }
@@ -917,40 +898,44 @@ fn all_planning_limits_and_shared_parent_order_are_enforced() {
         let path = format!("f{i}");
         write(t.path(), &path, &"x".repeat(FILE_BYTES));
         let h = read(&mut r, &path);
-        changes
-            .push(json!({"op":"move","path":path,"to":format!("dest{i}"),"sha256":h,"edits":[]}));
+        changes.push(json!({"op":"move","path":path,"to":format!("dest{i}"),"sha256":h}));
     }
     let before = snapshot(t.path());
-    match r.prepare_v2(&intent(json!(changes[..4]))) {
-        Ok(_) => assert_eq!(
-            r.prepare_v2(&intent(json!(changes))).unwrap_err().reason,
-            Reason::Limit
-        ),
-        Err(e) => {
-            provenance_skip(t.path(), "f0", &e, "move aggregate-limit boundary");
-        }
-    }
+    let plan = r.prepare_v2(&intent(json!(changes[..4]))).unwrap();
+    assert_eq!(plan.total_result_bytes, TOTAL_BYTES);
+    assert!(
+        plan.operations
+            .iter()
+            .all(|op| op.after_sha256.as_ref() == op.before.as_ref().map(|b| &b.sha256))
+    );
+    assert_eq!(
+        r.prepare_v2(&intent(json!(changes))).unwrap_err().reason,
+        Reason::Limit
+    );
+    eprintln!("PASS native unchanged-move aggregate boundary: 256 KiB accepted; 320 KiB refused");
     assert_eq!(snapshot(t.path()), before);
 }
 
 #[test]
-fn unsupported_source_metadata_and_invalid_text_fail_closed() {
+fn source_special_mode_is_observed_and_invalid_text_fails_closed() {
     let t = tempfile::tempdir().unwrap();
     let mut r = runtime(t.path());
     write(t.path(), "mode", "x");
     fs::set_permissions(t.path().join("mode"), fs::Permissions::from_mode(0o4644)).unwrap();
     let h = read(&mut r, "mode");
     let before = snapshot(t.path());
-    assert_eq!(
-        r.prepare_v2(&intent(json!([update(
+    let plan = r
+        .prepare_v2(&intent(json!([update(
             "mode",
             &h,
             json!([edit("x", "y")])
         )])))
-        .unwrap_err()
-        .reason,
-        Reason::UnsupportedMetadata
+        .unwrap();
+    assert_eq!(
+        plan.inspect()["operations"][0]["before"]["metadata"]["special_mode_bits"],
+        0o4000
     );
+    assert!(plan.preview().contains("safely preserve source mode"));
     assert_eq!(snapshot(t.path()), before);
     for (path, bytes) in [
         ("binary", vec![0xff]),
@@ -986,14 +971,13 @@ fn native_multibyte_source_destination_and_parent_names_are_feasible() {
         let source = format!("existing/{name}");
         write(t.path(), &source, "source\n");
         let mut r = runtime(t.path());
-        read(&mut r, &source);
+        let digest = read(&mut r, &source);
         let events_before = r.events.len();
         let parent = File::open(t.path().join("existing")).unwrap();
         let reported = unsafe { libc::fpathconf(parent.as_raw_fd(), libc::_PC_NAME_MAX) };
         assert!(reported > 0 && name.len() > reported as usize);
         let before = snapshot(t.path());
-        // Test source component feasibility independently of the host's forced
-        // provenance xattr, without bypassing production source metadata checks.
+        // Establish descriptor lookup feasibility as well as real source planning.
         name_feasible(&parent, &name, &source).unwrap();
         assert_eq!(
             component_identity(&parent, &name, &source).unwrap(),
@@ -1004,16 +988,15 @@ fn native_multibyte_source_destination_and_parent_names_are_feasible() {
             format!("{name}/added"),       // existing multibyte parent
             format!("{name}/new/{name}"),  // leaf below another missing parent
         ];
-        let plan = r
-            .prepare_v2(&intent(json!(
-                paths.iter().map(|p| add(p, "")).collect::<Vec<_>>()
-            )))
-            .unwrap();
+        let mut changes = paths.iter().map(|p| add(p, "")).collect::<Vec<_>>();
+        changes.push(json!({"op":"move","path":source,"to":"existing/moved","sha256":digest}));
+        let plan = r.prepare_v2(&intent(json!(changes))).unwrap();
         assert_eq!(
             plan.inspect()["operations"]
                 .as_array()
                 .unwrap()
                 .iter()
+                .take(3)
                 .map(|op| op["path"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             paths.iter().map(String::as_str).collect::<Vec<_>>()
@@ -1095,14 +1078,6 @@ fn actual_macos_xattrs_acls_flags_and_parent_feasibility() {
         .status()
         .unwrap();
     assert!(status.success());
-    // Test ACL detection independently: this host's provenance xattr must not
-    // mask a broken ACL probe with an earlier xattr refusal.
-    assert_eq!(
-        safe_metadata(&File::open(t.path().join("acl")).unwrap(), "acl", false)
-            .unwrap_err()
-            .detail,
-        "ACL present or absence cannot be established"
-    );
     assert_eq!(
         unsafe {
             libc::fchflags(
@@ -1115,12 +1090,21 @@ fn actual_macos_xattrs_acls_flags_and_parent_feasibility() {
     for path in ["xattr", "acl", "flags"] {
         let h = read(&mut r, path);
         let before = snapshot(t.path());
-        assert_eq!(
-            r.prepare_v2(&intent(json!([{"op":"delete","path":path,"sha256":h}])))
-                .unwrap_err()
-                .reason,
-            Reason::UnsupportedMetadata,
-            "{path}"
+        let plan = r
+            .prepare_v2(&intent(json!([{"op":"delete","path":path,"sha256":h}])))
+            .unwrap();
+        let observed = &plan.operations[0].before.as_ref().unwrap().metadata;
+        match path {
+            "xattr" => assert!(
+                matches!(&observed.xattrs, Observation::Observed(v) if v.iter().any(|x| x.name == b"user.cognix-test" && x.value == BlobState::new(b"v")))
+            ),
+            "acl" => assert!(matches!(&observed.acl, Observation::Observed(v) if v.bytes > 0)),
+            "flags" => assert_eq!(observed.flags, Observation::Observed(libc::UF_NODUMP)),
+            _ => unreachable!(),
+        }
+        assert!(
+            plan.preview()
+                .contains("establish metadata support before unlink")
         );
         assert_eq!(snapshot(t.path()), before);
     }
@@ -1152,4 +1136,112 @@ fn actual_macos_xattrs_acls_flags_and_parent_feasibility() {
             .reason,
         Reason::UnsupportedMetadata
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_xattr_value_and_acl_changes_invalidate_observed_sources() {
+    use std::process::Command;
+    for race in ["xattr", "acl"] {
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "source", "old");
+        let file = File::open(t.path().join("source")).unwrap();
+        let set_xattr = |value: &[u8]| {
+            assert_eq!(
+                unsafe {
+                    libc::fsetxattr(
+                        file.as_raw_fd(),
+                        c"user.cognix-test".as_ptr(),
+                        value.as_ptr().cast(),
+                        value.len(),
+                        0,
+                        0,
+                    )
+                },
+                0
+            );
+        };
+        let set_acl = |rule: &str| {
+            assert!(
+                Command::new("/bin/chmod")
+                    .arg("+a")
+                    .arg(rule)
+                    .arg(t.path().join("source"))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        if race == "xattr" {
+            set_xattr(b"a");
+        } else {
+            set_acl("everyone allow read");
+        }
+        let mut r = runtime(t.path());
+        let h = read(&mut r, "source");
+        let request = intent(json!([update("source", &h, json!([edit("old", "new")]))]));
+        let before = snapshot(t.path());
+        let plan = r.prepare_v2(&request).unwrap();
+        assert_eq!(snapshot(t.path()), before);
+        let prior = &plan.operations[0].before.as_ref().unwrap().metadata;
+        let mut after_race = None;
+        let mut called = false;
+        let result = r.prepare_v2_checked(&request, || {
+            called = true;
+            if race == "xattr" {
+                set_xattr(b"b");
+            } else {
+                set_acl("everyone allow write");
+            }
+            after_race = Some(snapshot(t.path()));
+        });
+        assert!(called);
+        assert_eq!(result.unwrap_err().reason, Reason::StaleState);
+        assert_eq!(snapshot(t.path()), after_race.unwrap());
+        let fresh = inspect_metadata(&file, &file.metadata().unwrap());
+        if race == "xattr" {
+            assert_ne!(fresh.xattrs, prior.xattrs);
+        } else {
+            assert_ne!(fresh.acl, prior.acl);
+        }
+        // A later preparation must not silently refresh prior read evidence.
+        let before = snapshot(t.path());
+        assert_eq!(
+            r.prepare_v2(&request).unwrap_err().reason,
+            Reason::StaleState
+        );
+        assert_eq!(snapshot(t.path()), before);
+        read(&mut r, "source");
+        let refreshed = r.prepare_v2(&request).unwrap();
+        assert_ne!(refreshed.digest(), plan.digest());
+        assert_eq!(snapshot(t.path()), before);
+        eprintln!("PASS native metadata observation/change: {race}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unavailable_metadata_is_distinct_from_presence_and_blocks_execution() {
+    assert!(matches!(inspect_xattrs(-1), Observation::Unavailable(_)));
+    assert!(matches!(inspect_acl(-1), Observation::Unavailable(_)));
+    let t = tempfile::tempdir().unwrap();
+    write(t.path(), "source", "old");
+    let mut r = runtime(t.path());
+    let digest = read(&mut r, "source");
+    let request = intent(json!([update(
+        "source",
+        &digest,
+        json!([edit("old", "new")])
+    )]));
+    let mut plan = r.prepare_v2(&request).unwrap();
+    let mut source = plan.operations.pop().unwrap().before.unwrap();
+    // Exercise the pure operation/preview builder's explicit failure handoff.
+    source.metadata.xattrs = inspect_xattrs(-1);
+    let operation = plan_operation(&request.changes[0], Some(source)).unwrap();
+    assert!(operation.constraints.contains(
+        &"metadata inspection incomplete; execution blocked until safety is established"
+    ));
+    plan.operations.push(operation);
+    assert!(plan.preview().contains("xattrs inspection unavailable"));
+    assert!(plan.complete_escaped().contains("unavailable"));
 }

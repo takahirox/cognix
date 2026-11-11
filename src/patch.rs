@@ -80,7 +80,6 @@ enum Change {
         path: String,
         to: String,
         sha256: String,
-        edits: Vec<Edit>,
     },
 }
 #[derive(Debug, Deserialize, Serialize)]
@@ -115,7 +114,7 @@ impl Change {
     }
     fn edits(&self) -> &[Edit] {
         match self {
-            Self::Update { edits, .. } | Self::Move { edits, .. } => edits,
+            Self::Update { edits, .. } => edits,
             _ => &[],
         }
     }
@@ -228,7 +227,7 @@ impl PatchIntent {
                 return Err(error(
                     Reason::Limit,
                     &location,
-                    "Expected 1–16 update edits or 0–16 move edits",
+                    "Expected 1–16 update edits",
                 ));
             }
             for (j, edit) in edits.iter().enumerate() {
@@ -364,18 +363,32 @@ impl Fingerprint {
 pub(super) struct ReadEvidence {
     state: Fingerprint,
     sha256: String,
+    metadata: Option<MetadataObservation>,
 }
 impl ReadEvidence {
-    pub(super) fn new(m: &Metadata, sha256: &str) -> Self {
+    pub(super) fn new(parent: &File, name: &str, m: &Metadata, sha256: &str) -> Self {
+        // Additional v2 evidence must never change legacy read_file acceptance.
+        // A raced or failed descriptor capture leaves v2 evidence unavailable.
+        let state = Fingerprint::new(m);
+        let metadata = (|| {
+            let file = openat(parent, name, libc::O_RDONLY | libc::O_NONBLOCK, 0).ok()?;
+            if Fingerprint::new(&file.metadata().ok()?) != state {
+                return None;
+            }
+            let observed = inspect_metadata(&file, m);
+            (Fingerprint::new(&file.metadata().ok()?) == state).then_some(observed)
+        })();
         Self {
-            state: Fingerprint::new(m),
+            state,
             sha256: sha256.into(),
+            metadata,
         }
     }
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 struct Source {
     state: Fingerprint,
+    metadata: MetadataObservation,
     content: String,
     sha256: String,
 }
@@ -392,6 +405,7 @@ struct Operation {
     destination_absent: bool,
     mode: Option<u32>,
     edits: Vec<Value>,
+    constraints: Vec<&'static str>,
 }
 #[derive(Debug, Serialize)]
 struct NewDirectory {
@@ -442,11 +456,27 @@ impl PatchPlan {
                 op.before_bytes,
                 op.after_bytes
             ));
+            if op.op == "move" {
+                out.push_str(&format!(
+                    "  unchanged content: sha256 {} ({} bytes)\n",
+                    op.after_sha256.as_ref().unwrap(),
+                    op.after_bytes
+                ));
+            }
+            if let Some(source) = &op.before {
+                out.push_str(&format!("  metadata: {}\n", source.metadata.summary()));
+            }
+            for constraint in &op.constraints {
+                out.push_str(&format!("  constraint: {constraint}\n"));
+            }
         }
         out.push_str("Content diffs (8192 escaped-character budget):\n");
         let mut budget = PREVIEW_CHARS;
         let mut truncated = false;
         for op in &self.operations {
+            if op.op == "move" {
+                continue;
+            }
             let before = op.before.as_ref().map(|s| s.content.as_str()).unwrap_or("");
             let after = op.after.as_deref().unwrap_or("");
             let from = if op.before.is_none() {
@@ -645,14 +675,21 @@ impl<'a> Inspection<'a> {
                 "Source identity or metadata changed since read",
             ));
         }
-        if !m.is_file() || m.nlink() != 1 || m.mode() & 0o7000 != 0 {
+        if !m.is_file() || m.nlink() != 1 {
             return Err(error(
                 Reason::UnsupportedMetadata,
                 path,
-                "Need regular single-link source without special mode bits",
+                "Need regular single-link source",
             ));
         }
-        safe_metadata(&file, path, true)?;
+        let metadata = inspect_metadata(&file, &m);
+        if prior.metadata.as_ref() != Some(&metadata) {
+            return Err(error(
+                Reason::StaleState,
+                path,
+                "Source metadata changed since read or read evidence unavailable",
+            ));
+        }
         if !self.sources.insert((m.dev(), m.ino())) {
             return Err(error(
                 Reason::Conflict,
@@ -669,6 +706,7 @@ impl<'a> Inspection<'a> {
             return Err(error(Reason::Limit, path, "Source exceeds 64 KiB"));
         }
         if hash(&bytes) != digest
+            || inspect_metadata(&file, &file.metadata().map_err(|e| io(path, e))?) != metadata
             || Fingerprint::new(&file.metadata().map_err(|e| io(path, e))?) != state
         {
             return Err(error(
@@ -681,6 +719,7 @@ impl<'a> Inspection<'a> {
         validate_text(&content, path)?;
         Ok(Source {
             state,
+            metadata,
             content,
             sha256: digest.into(),
         })
@@ -705,14 +744,34 @@ fn plan_operation(change: &Change, before: Option<Source>) -> Result<Operation> 
     let after = match change {
         Change::Add { content, .. } => Some(content.clone()),
         Change::Delete { .. } => None,
-        _ => Some(edited(
+        Change::Move { .. } => Some(before.as_ref().unwrap().content.clone()),
+        Change::Update { .. } => Some(edited(
             &before.as_ref().unwrap().content,
             change.edits(),
             change.path(),
         )?),
     };
     let after_bytes = after.as_ref().map_or(0, String::len);
+    let mut constraints = vec![match change {
+        Change::Add { .. } => {
+            "establish destination metadata/inheritance support before writes; create 0600 subject to umask"
+        }
+        Change::Update { .. } => {
+            "establish metadata support before writes; safely preserve source mode, flags, ACLs and xattrs or refuse execution"
+        }
+        Change::Delete { .. } => {
+            "establish metadata support before unlink; revalidate source mode, flags, ACLs and xattrs or refuse execution"
+        }
+        Change::Move { .. } => {
+            "establish metadata support before destination writes; safely preserve source mode, flags, ACLs and xattrs or refuse execution; revalidate before source unlink"
+        }
+    }];
+    if before.as_ref().is_some_and(|b| b.metadata.incomplete()) {
+        constraints
+            .push("metadata inspection incomplete; execution blocked until safety is established");
+    }
     Ok(Operation {
+        constraints,
         op: change.kind().into(),
         path: change.path().into(),
         to: if let Change::Move { to, .. } = change {
@@ -741,7 +800,7 @@ const PLAN_CONSTRAINTS: &[&str] = &[
     "recheck anchored root, parent/source identities, metadata and hashes, and every absence",
     "exclusive parent creation (0700) and destination publication; no clobber",
     "sequential commits; record plan-owned directories and each committed substep; no rollback",
-    "ordinary source modes preserved; add mode 0600; umask applies",
+    "metadata support required before any write; safely preserve source attributes or refuse execution; add mode 0600 subject to umask",
 ];
 
 impl Runtime {
@@ -814,7 +873,14 @@ impl Runtime {
         };
         for (i, change) in intent.changes.iter().enumerate() {
             if let Some(digest) = change.digest() {
-                recheck.source(change.path(), digest, i)?;
+                let fresh = recheck.source(change.path(), digest, i)?;
+                if operations[i].before.as_ref() != Some(&fresh) {
+                    return Err(error(
+                        Reason::StaleState,
+                        change.path(),
+                        "Source changed between inspections",
+                    ));
+                }
             }
             if let Some(dest) = change.destination() {
                 recheck.destination(dest, i)?;
@@ -1006,86 +1072,201 @@ fn safe_directory(file: &File, location: &str) -> Result<()> {
         ));
     }
     // ACL inheritance and immutable flags can invalidate predicted create modes.
-    safe_metadata(file, location, false)
+    safe_parent_metadata(file, location)
 }
-fn safe_metadata(file: &File, location: &str, reject_xattrs: bool) -> Result<()> {
+// Observations are evidence for a future executor, never a grant to mutate.
+// Keep values out of previews/plans; hashes detect same-name value changes.
+const METADATA_BYTES: usize = 1024 * 1024;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", content = "detail", rename_all = "snake_case")]
+enum Observation<T> {
+    Observed(T),
+    Unavailable(String),
+}
+impl<T> Observation<T> {
+    fn unavailable(message: &str) -> Self {
+        Self::Unavailable(message.into())
+    }
+    fn failed(operation: &str) -> Self {
+        Self::Unavailable(format!(
+            "{operation}: errno {}",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        ))
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BlobState {
+    bytes: usize,
+    sha256: String,
+}
+impl BlobState {
+    fn new(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.len(),
+            sha256: hash(bytes),
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct XattrState {
+    name: Vec<u8>,
+    value: BlobState,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct MetadataObservation {
+    special_mode_bits: u32,
+    flags: Observation<u32>,
+    xattrs: Observation<Vec<XattrState>>,
+    acl: Observation<BlobState>,
+}
+impl MetadataObservation {
+    fn incomplete(&self) -> bool {
+        matches!(self.flags, Observation::Unavailable(_))
+            || matches!(self.xattrs, Observation::Unavailable(_))
+            || matches!(self.acl, Observation::Unavailable(_))
+    }
+    fn summary(&self) -> String {
+        let flags = match &self.flags {
+            Observation::Observed(n) => format!("observed {n}"),
+            Observation::Unavailable(_) => "inspection unavailable".into(),
+        };
+        let xattrs = match &self.xattrs {
+            Observation::Observed(v) => format!("observed {}", v.len()),
+            Observation::Unavailable(_) => "inspection unavailable".into(),
+        };
+        let acl = match &self.acl {
+            Observation::Observed(v) => format!("observed {} bytes", v.bytes),
+            Observation::Unavailable(_) => "inspection unavailable".into(),
+        };
+        format!(
+            "special mode {:#o}; flags {flags}; xattrs {xattrs}; ACL {acl}",
+            self.special_mode_bits
+        )
+    }
+}
+fn inspect_metadata(file: &File, m: &Metadata) -> MetadataObservation {
     #[cfg(target_os = "macos")]
     {
         use std::os::macos::fs::MetadataExt as _;
-        if file.metadata().map_err(|e| io(location, e))?.st_flags() != 0 {
-            return Err(error(
-                Reason::UnsupportedMetadata,
-                location,
-                "File flags are unsupported",
-            ));
-        }
-        let n = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
-        if n < 0 || (reject_xattrs && n != 0) {
-            return Err(error(
-                Reason::UnsupportedMetadata,
-                location,
-                if n < 0 {
-                    "Cannot establish absence of xattrs"
-                } else {
-                    "Extended attributes are unsupported"
-                },
-            ));
-        }
-        // Query the kernel's descriptor-relative extended-security attribute.
-        // An absent ACL has a zero-length attrreference; any security payload,
-        // including an explicitly empty ACL, is unsupported. Unlike libacl's
-        // ENOENT result this positively establishes absence on the live fd.
-        let mut attrs = libc::attrlist {
-            bitmapcount: libc::ATTR_BIT_MAP_COUNT,
-            reserved: 0,
-            commonattr: libc::ATTR_CMN_EXTENDED_SECURITY,
-            volattr: 0,
-            dirattr: 0,
-            fileattr: 0,
-            forkattr: 0,
-        };
-        let mut header = [0u32; 3]; // returned length + attrreference(offset, length)
-        let result = unsafe {
-            libc::fgetattrlist(
-                file.as_raw_fd(),
-                (&mut attrs as *mut libc::attrlist).cast(),
-                header.as_mut_ptr().cast(),
-                std::mem::size_of_val(&header),
-                0,
-            )
-        };
-        if result != 0 || header[0] != 12 || header[2] != 0 {
-            return Err(error(
-                Reason::UnsupportedMetadata,
-                location,
-                "ACL present or absence cannot be established",
-            ));
+        MetadataObservation {
+            special_mode_bits: m.mode() & 0o7000,
+            flags: Observation::Observed(m.st_flags()),
+            xattrs: inspect_xattrs(file.as_raw_fd()),
+            acl: inspect_acl(file.as_raw_fd()),
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "macos"))]
     {
-        // POSIX access/default ACLs are included in flistxattr on Linux.
-        // Conservatively refuse all parent attributes on this unvalidated platform.
-        let _ = reject_xattrs;
-        let n = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0) };
-        if n != 0 {
-            return Err(error(
-                Reason::UnsupportedMetadata,
-                location,
-                "xattrs/ACLs present or detection failed",
-            ));
+        let _ = file;
+        MetadataObservation {
+            special_mode_bits: m.mode() & 0o7000,
+            flags: Observation::unavailable("File flags inspection unsupported on this platform"),
+            xattrs: Observation::unavailable("Xattr inspection unsupported on this platform"),
+            acl: Observation::unavailable("ACL inspection unsupported on this platform"),
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+}
+#[cfg(target_os = "macos")]
+fn inspect_xattrs(fd: std::os::fd::RawFd) -> Observation<Vec<XattrState>> {
+    // Every allocation and total value read is bounded. No retries adopt raced
+    // state; a failed inspection is retained as an explicit execution constraint.
+    let n = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0, 0) };
+    if n < 0 {
+        return Observation::failed("flistxattr");
+    }
+    if n as usize > 65536 {
+        return Observation::unavailable("Xattr names exceed 64 KiB inspection bound");
+    }
+    let mut names = vec![0u8; n as usize];
+    if unsafe { libc::flistxattr(fd, names.as_mut_ptr().cast(), names.len(), 0) } != n {
+        return Observation::unavailable("Xattr listing changed or could not be inspected");
+    }
+    if !names.is_empty() && names.last() != Some(&0) {
+        return Observation::unavailable("Malformed xattr listing");
+    }
+    let mut attributes = Vec::new();
+    let mut total = 0;
+    for name in names.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        let c = CString::new(name).expect("split xattr name");
+        let size = unsafe { libc::fgetxattr(fd, c.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+        if size < 0 {
+            return Observation::failed("fgetxattr size");
+        }
+        total += size as usize;
+        if total > METADATA_BYTES {
+            return Observation::unavailable("Xattr values exceed 1 MiB inspection bound");
+        }
+        let mut value = vec![0u8; size as usize];
+        if unsafe { libc::fgetxattr(fd, c.as_ptr(), value.as_mut_ptr().cast(), value.len(), 0, 0) }
+            != size
+        {
+            return Observation::unavailable("Xattr value changed or could not be inspected");
+        }
+        attributes.push(XattrState {
+            name: name.to_vec(),
+            value: BlobState::new(&value),
+        });
+    }
+    attributes.sort_by(|a, b| a.name.cmp(&b.name));
+    Observation::Observed(attributes)
+}
+#[cfg(target_os = "macos")]
+fn inspect_acl(fd: std::os::fd::RawFd) -> Observation<BlobState> {
+    let mut attrs = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_EXTENDED_SECURITY,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // Aligned output storage: length plus attrreference(offset, length), payload.
+    let mut buffer = vec![0u32; 16384];
+    if unsafe {
+        libc::fgetattrlist(
+            fd,
+            (&mut attrs as *mut libc::attrlist).cast(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len() * 4,
+            0,
+        )
+    } != 0
     {
-        let _ = (file, reject_xattrs);
-        Err(error(
+        return Observation::failed("fgetattrlist ACL");
+    }
+    let length = buffer[0] as usize;
+    let offset = 4i64 + i64::from(buffer[1] as i32);
+    let bytes = buffer[2] as usize;
+    if length < 12
+        || length > buffer.len() * 4
+        || (bytes != 0 && (offset < 12 || offset as usize + bytes > length))
+    {
+        return Observation::unavailable("Invalid or oversized ACL response");
+    }
+    let raw = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), length) };
+    let payload = if bytes == 0 {
+        &[]
+    } else {
+        &raw[offset as usize..offset as usize + bytes]
+    };
+    Observation::Observed(BlobState::new(payload))
+}
+fn safe_parent_metadata(file: &File, location: &str) -> Result<()> {
+    // Existing publication parents retain the conservative feasibility policy.
+    // Source inspection above records observations without executor eligibility.
+    let m = file.metadata().map_err(|e| io(location, e))?;
+    let observed = inspect_metadata(file, &m);
+    if observed.incomplete()
+        || !matches!(observed.flags, Observation::Observed(0))
+        || !matches!(observed.acl, Observation::Observed(ref acl) if acl.bytes == 0)
+    {
+        return Err(error(
             Reason::UnsupportedMetadata,
             location,
-            "Safe metadata detection is unavailable",
-        ))
+            "Parent metadata safety cannot be established",
+        ));
     }
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     Ok(())
 }
 

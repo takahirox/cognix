@@ -14,9 +14,12 @@ diff builder in `action.rs`; v2 does not invoke `ActionPlan::approve`.
 `PatchIntent::parse(&[u8]) -> Result<PatchIntent, PatchError>` is pure. It bounds
 raw arguments before decoding UTF-8/JSON and produces private, typed intent.
 Only version 2 and the four closed operation shapes in the
-[contract](tool-architecture.md#format-choice) are accepted. Nested edits are
-closed, duplicate fields are rejected, hashes contain exactly 64 lowercase hex
-characters, and no malformed batch is repaired, truncated or partially accepted.
+[contract](tool-architecture.md#format-choice) are accepted. A move has exactly
+`op`, `path`, `to` and `sha256`, preserves the source bytes/hash and requires an
+absent destination. `edits` is rejected on a move even when empty; only updates
+accept the closed nested edit shape. Duplicate fields are rejected, hashes contain
+exactly 64 lowercase hex characters, and no malformed batch is repaired,
+truncated or partially accepted.
 Unknown fields, missing fields, wrong types, invalid Unicode escapes and unknown
 operations fail deserialization. Pure validation checks text, paths, edit shapes,
 case/canonical-equivalent targets and file/directory prefix dependencies.
@@ -27,7 +30,10 @@ read-only filesystem inspection and exact original-byte edit matching. It takes
 file ledger. `read_file` now also records private source identity/metadata evidence
 alongside its existing hash, without changing its result or acceptance policy.
 An externally populated legacy `seen` map cannot manufacture v2 read evidence.
-Re-read a file after legacy mutations before attempting v2 preparation.
+A best-effort descriptor capture adds metadata observations to the read evidence;
+if its identity changes or reopening fails, v2 requires another read while the
+legacy result remains unchanged. Re-read after legacy mutations before attempting
+v2 preparation.
 
 Errors expose a `reason`, `location` (field/index or affected path) and sanitized
 `detail`. Reasons distinguish JSON syntax, closed shape/type, version, limit,
@@ -43,9 +49,9 @@ preparation interfaces until the executor milestone connects them.
 | --- | --- |
 | Raw serialized JSON arguments | 1 MiB |
 | Changes | 1–8 |
-| Edits per source | 1–16 for update; 0–16 for move |
+| Edits per source | 1–16 for update only; moves reject the field |
 | Source or resulting file | 64 KiB UTF-8 bytes |
-| Total resulting content (deletions count zero) | 256 KiB |
+| Total resulting content (unchanged move destinations included; deletions count zero) | 256 KiB |
 | Path | 4,096 UTF-8 bytes; 32 components |
 | New parent directories | 32, deduplicated in first-use ancestor order |
 | Content diff display | 8,192 escaped characters across the batch |
@@ -80,20 +86,40 @@ parents can be shared. No filesystem probe creates a name to test equivalence.
 
 Sources must have prior in-session evidence at the supplied hash. Inspection
 compares identity, mode, uid/gid, link count, size, mtime/ctime with nanoseconds,
-and current bytes/hash. Sources must be regular single-link files without special
-mode bits. Reads use nonblocking opens to avoid FIFO hangs and bounded reads.
-On macOS, descriptor-based xattr listing and `fgetattrlist` extended-security
-inspection reject any source xattr/ACL, including empty ACL payloads, and file
-flags. Detection errors fail closed. Parent ACLs/flags and special mode bits are
-also refused to avoid unplanned inheritance or creation restrictions. Unmodified parent xattrs are
-inspected for availability but are retained and need not be absent. Effective
-write/search access and read-only mount flags are checked on existing publication
-parents or the nearest existing parent of planned directories. These checks
-establish feasibility, not available disk space or a guarantee of later success.
+current bytes/hash and metadata observations. Sources must be regular single-link
+files. Reads use nonblocking opens to avoid FIFO hangs and bounded reads. All
+path, identity, source-type and destination-absence checks remain fail-closed.
 
-Linux has an unvalidated conservative xattr/ACL check (including refusal of parent
-xattrs); other platforms cannot establish metadata safety and refuse it. This is
-not a new supported command sandbox. MacOS is the evaluated platform.
+On macOS, descriptor-based `flistxattr`/`fgetxattr` and `fgetattrlist` record source
+xattrs and ACLs. Each metadata aspect has an `observed` or `unavailable` status:
+an observed empty collection/payload establishes absence, a nonempty observation
+establishes presence, and an unavailable observation records inspection failure
+or missing platform support. File flags and special mode bits are also recorded.
+Ordinary OS provenance, other xattrs, ACLs, flags and special source modes do not
+prevent preview planning. They establish execution constraints, not permission to
+mutate. Xattr names use exact byte arrays, sorted by name; values and ACL payloads
+are represented by byte counts and SHA-256 hashes, never raw attribute values.
+Same-name, same-length value changes therefore change the observation and digest.
+
+Metadata inspection is bounded to 64 KiB of xattr names, 1 MiB of total xattr
+values and a 64 KiB ACL response. Exceeded bounds and failed calls become explicit
+unavailable observations, never assumed absence. Stable unavailable source
+observations allow a preview with an additional constraint blocking execution
+until safety is established. Changed observations invalidate prior read evidence
+or the first inspection rather than silently refreshing it.
+
+Existing publication parents retain conservative feasibility checks: special mode
+bits, ACLs, flags or unavailable metadata inspection are refused. Parent xattrs
+are inspected for availability and retained; they need not be absent. Effective
+write/search access and read-only mount flags are checked on existing publication
+parents or the nearest existing parent of planned directories. These establish
+feasibility, not available disk space or a guarantee of later success. Milestone 3
+must independently inspect parent metadata/inheritance before writing as well.
+
+MacOS is the evaluated platform. Other platforms record unavailable source
+metadata support and cannot establish the required parent metadata feasibility;
+this implementation does not claim native planning or command sandbox support
+there. No sandbox permissions changed.
 
 Preparation independently inspects every source/destination a second time,
 reopens recorded parents and checks the named root against the anchored descriptor.
@@ -102,9 +128,10 @@ These checks detect changes during inspection but cannot isolate a hostile
 same-user process or make a cross-file transaction. Ordinary reads can update
 kernel-managed access times depending on mount policy; the planner never calls
 metadata setters. Snapshot tests include directory and hidden-entry names, bytes,
-identity, modes, ownership, links, size and modification/change timestamps, excluding
-access times. The exact-byte pure builder can also be tested against fixed source
-snapshots independently of platform metadata availability.
+identity, modes, ownership, links, size, modification/change timestamps, file
+flags, xattr names/values and ACL payloads, excluding access times. Tests also
+compare the externally changed tree immediately after an injected race with the
+tree after refusal to distinguish the race's effects from planner mutations.
 
 ## Immutable plan and inspection
 
@@ -113,8 +140,9 @@ owned JSON copy. It includes version, anchored root fingerprint, every existing
 parent fingerprint, each absent new parent's path/mode/first owning change,
 ordered exact operations/edits, source bytes/hash/fingerprint, resulting
 bytes/hash, before/after byte counts, destination-absence expectations, intended
-ordinary file modes and explicit executor constraints. Absence is represented by
-null before/after content for add/delete and explicit destination/parent states.
+ordinary file modes, source metadata observations and per-operation executor
+constraints. Absence is represented by null before/after content for add/delete
+and explicit destination/parent states.
 
 `digest()` hashes the deterministic JSON serialization of the entire plan, without
 including the digest itself. Array order follows the request and parent first use;
@@ -122,9 +150,12 @@ existing-parent maps have sorted keys. Refreshing a plan can change its digest e
 if the textual diff is unchanged, because expected metadata is part of consent.
 
 `preview()` first lists **all** operations, source/destination paths, byte counts
-and planned directory creations. Only then does it spend the shared 8,192 escaped
-character content budget on unified add/update/delete/move-with-edit diffs.
-Truncation is explicit and never removes summary paths. Path spelling is quoted;
+and planned directory creations, with source metadata summaries and
+operation-specific execution constraints. An unchanged move shows both paths,
+its unchanged-content SHA-256 and byte count, and has no content diff. Only then
+does the preview spend the shared 8,192 escaped-character content budget on unified
+add/update/delete diffs. Truncation is explicit and never removes summary paths.
+Path spelling is quoted;
 controls, bidi and invisible characters are escaped, with real newlines retained
 only as diff line separators. Summary size is bounded by the path/change/directory
 ceilings separately from the content budget. `complete_escaped()` provides the
@@ -141,7 +172,14 @@ the whole plan and, immediately before each mutation, all of the following:
 
 - The anchored root and every existing parent's identity and expected state.
 - Each source's fresh in-session evidence, inode/device, regular/single-link
-  status, ordinary mode, unsupported metadata absence, bytes and hash.
+  status, bytes, hash, ordinary/special modes, flags, ACL and xattr observations
+  (including exact names/value hashes and inspection availability).
+- Metadata support **before any target write**: independently establish safe
+  inspection and handling for source attributes and destination/parent inheritance.
+  Preserve attributes safely for update/move or refuse execution with an explicit
+  unsupported result. A preview carrying attributes or an unavailable observation
+  is never permission to discard them or to bypass metadata safety. Delete must
+  establish safe unlink semantics and revalidate its metadata constraints too.
 - All destination absences using no-follow lookup, each new-parent absence and
   namespace conflicts/creation feasibility. An externally created parent is stale.
 - Exclusive creation of plan-owned directories, mode 0700 subject to umask, in
@@ -162,71 +200,36 @@ never be adopted as an owned effect.
 
 ## Validation record
 
-Validation took place on the assigned macOS worktree on 2026-11-10. Tests live in
-[patch_tests.rs](../src/patch_tests.rs). Native volume probes establish both
-case-insensitive and canonical-Unicode alias behavior rather than assuming it.
-
-The host automatically attaches `com.apple.provenance` to disposable files and
-retains it even when descriptor removal reports success. Production correctly
-refuses these sources. The mixed golden therefore exercises the pure operation
-builder using fixed snapshots on this host, while asserting the native refusal
-and unchanged tree. The test reports this explicitly; it does not suppress
-metadata detection. On a volume permitting ordinary xattr-free files it also runs
-the full native mixed success path.
-
-Native mixed-source success, three source-specific between-inspection races
-(bytes, inode and metadata), and the aggregate move-content limit boundary are
-**Skipped** here for that concrete host limitation. These remain mandatory native
-validation gaps for AC7 before claiming full Issue completion. Source identity/hash
-changes before inspection, add-parent/destination/root races, alias refusals,
-read-only success/failure snapshots and real ACL/xattr/flags refusals are exercised.
-The pure mixed plan/preview golden and pure edit limits remain covered. Cargo's
-aggregate pass count does not convert the printed native skips into passes.
-
-The initial implementation checks were:
+The 2026-11-11 revision applies the approved Issue #20 contract: moves preserve
+content, and read-only source inspection records metadata observations separately
+from executor eligibility. This supersedes the previous xattr-free-volume
+prerequisite and its five printed native skips; no human result is substituted.
+The checks below ran in the assigned Apple Silicon macOS worktree. Tests live in
+[patch_tests.rs](../src/patch_tests.rs). The native volume demonstrated both case
+and canonical-Unicode aliasing. Ordinary OS provenance remains in source fixtures;
+tests no longer attempt to remove it or fall back to fabricated mixed plans.
 
 | Check | Actual result |
 | --- | --- |
-| Current Issue and comments | Pass: fetched Issue #20 and its discussion (no comments) through the GitHub connector. |
-| `cargo test --locked --all-targets` | Pass: 84 Rust tests, including the existing runtime, agent, CLI, provider, launcher, creation and real macOS sandbox suites. Five native v2 subcases remain skipped as described above; zero ignored test functions does not mean those subcases ran. |
-| `cargo test --locked --lib runtime::patch -- --nocapture` | Pass: 14 test groups, with actual case/canonical alias observations and explicit native-skip messages. |
+| Current Issue and discussion | Pass: fetched Issue #20 and its discussion; the current Issue explicitly supersedes the old xattr-free evidence request. |
+| `cargo test --locked --all-targets` | Pass: 88 tests, zero failures/ignored tests; existing runtime, agent, CLI, provider, launcher, creation and real macOS sandbox regressions executed. |
+| `cargo test --locked --lib runtime::patch -- --nocapture` | Pass: 18 planner test groups. Native mixed-source success, source byte/inode/mode races and aggregate unchanged-move boundary all executed, with no skipped subcases. Native ACL and xattr value observation/change cases also passed. |
 | `cargo fmt --all -- --check` | Pass. |
 | `cargo clippy --locked --all-targets -- -D warnings` | Pass. |
 | `cargo run --locked --example check_docs` | Pass: 15 Markdown documents, zero errors. |
 | `git diff --check` and staged equivalent | Pass. |
-| `cargo build --locked --release` | Pass on rustc 1.94.0, Apple Silicon macOS. The advertised 1.87 minimum was respected in syntax; a 1.87 toolchain was not installed or separately tested. |
 
 | Acceptance | Implementation and evidence |
 | --- | --- |
-| AC1 | Closed derived records, bounded byte parser and structured errors; malformed/duplicate/missing/extra/type/version/hash/Unicode tests. |
-| AC2 | Parser ceilings and strict paths; original-byte unique-span/overlap/no-op/result-boundary tests; native new-directory and filesystem-name ceilings. Native aggregate move boundary remains skipped. |
-| AC3 | Whole-batch target/prefix checks, actual descriptor namespace identities, full case folding/canonical normalization, real-volume alias fixtures, shared parent first-use ordering. |
-| AC4 | Anchored no-follow traversal, source read fingerprints/hashes, absence and feasibility checks, native xattr/ACL/flags/special-mode refusals. Post-inspection source race evidence remains skipped. |
-| AC5 | Ordered immutable exact plan, digest, escaped complete inspection and bounded previews; pure mixed golden and deterministic real add plans. |
-| AC6 | Successful/failed native before/after snapshots including hidden entries, directory identity, flags, xattr names and ACL payloads; unchanged legacy regression suites. Kernel-managed atime is excluded as explained above. |
-| AC7 | **Incomplete native validation**: five subcases require an xattr-free source volume. All other executed checks above passed; full Issue completion remains blocked by these mandatory gaps. |
-| AC8 | This guide, implementation/decision links and README boundary; explicit executor revalidation and consent requirements. |
+| AC1 | Closed four-field moves, rejection of empty/nonempty/null move edits; strict parser shape/type/version/hash/Unicode and argument-boundary coverage. |
+| AC2 | Strict path/text/edit ceilings and original-byte matching; native unchanged moves accept exactly 256 KiB total and reject 320 KiB. |
+| AC3 | Whole-batch source/destination conflicts, including updates of a moved source or destination; native namespace aliases, missing-parent ordering and component feasibility. Native multibyte source moves now plan successfully. |
+| AC4 | Anchored no-follow traversal and prior read evidence; metadata presence/inspection-failure distinction, native source special mode/flags/ACL/xattrs, same-length xattr value and ACL change detection, fail-closed identity/path/destination checks. |
+| AC5 | Immutable ordered exact plans and native mixed plan/preview goldens; unchanged move paths/hash/bytes, metadata summaries and operation-specific constraints remain visible when content is truncated. |
+| AC6 | Native success/failure/race snapshots include hidden entries, directories, identities, flags, xattr names/values and ACL payloads; unchanged legacy regressions pass. Kernel-managed atime is excluded as explained above. |
+| AC7 | All five formerly skipped native subcases executed successfully. Byte/inode/mode and ACL/xattr races detect stale state; native ACL/xattr/flag observations, case/Unicode aliases and multibyte component limits also pass. |
+| AC8 | Revised contract, plan/preview interface and metadata handoff documented here and in the architecture decision; v2 remains unavailable to models. |
 
-No Ollama model trials are required for this non-advertised milestone. Required
-post-merge verification: none required.
-
-### Review revision: native component validation
-
-The 2026-11-10 revision replaces the UTF-8 byte comparison against `NAME_MAX`
-with read-only native component lookup. New macOS regressions establish actual
-creation/lookup behavior for 100 and 255 Japanese characters, 200 and 255 accented
-characters, and 127 supplementary Unicode characters. They exercise existing
-source component feasibility and successful add planning through existing and
-missing multibyte parents, with unchanged tree/metadata snapshots. Native creation
-and planning both reject 256 ASCII/Japanese/accented characters and 128
-supplementary characters, including invalid components below planned parents.
-
-Pass on the revised tree: `cargo test --locked --all-targets` (86 tests, including
-the existing native runtime/agent/CLI/sandbox regressions), focused planner tests
-(16 groups with `--nocapture`), formatting, Clippy with warnings denied, the
-documentation checker (15 documents, zero errors), and whitespace checks. The
-same five native subcases above still print explicit provenance-related skips;
-these new name tests do not establish full native source-planning success or
-resolve the outstanding validation question. Production metadata checks remain
-enabled. The PR description uses a non-closing Issue reference while this
-mandatory evidence remains incomplete.
+Skipped mandatory native cases: none. Non-macOS validation, separate release/MSRV
+builds and optional fuzzing: not run in this revision. No Ollama model trials are
+required for this internal milestone. Required post-merge verification: none.
