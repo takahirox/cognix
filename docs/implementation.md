@@ -8,6 +8,13 @@ command permissions are not implemented here. Milestone 2 now has an
 advertised to models nor executable. The five current tool contracts below are
 unchanged.
 
+The revised design separates read-only v2 planning from executor metadata
+support, uses unchanged-content moves and schedules command expansion independently
+of patch model evaluation. The
+[Issue #20/PR #21 acceptance handoff](tool-architecture.md#issue-20-and-pr-21-acceptance-changes)
+defines the implemented planner requirements; execution and model exposure remain
+later milestones. These future rules do not change the current v1 contracts below.
+
 The supported implementation is the Rust `cognix` Cargo package. `src/agent.rs`
 owns the reusable in-memory conversation and bounded loop; `provider.rs` defines
 the narrow async `Provider` interface and Ollama adapter; `runtime.rs` and
