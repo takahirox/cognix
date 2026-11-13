@@ -13,12 +13,12 @@ Describe what changed and why each change is needed for the stated outcome.
 
 ## Related Issues and remaining scope
 
-Use `Closes #<number>` only for a complete Issue resolution. A partial PR must use
-`Related to #<number>`, list remaining implementation and validation by criterion,
-and leave the source Issue open. Record the existing maintainer/workflow
-authorization for an explicitly scoped partial integration. State "None" when no
-scope remains. Genuinely post-merge-only checks may remain pending for an otherwise
-complete implementation.
+Use `Closes #<number>` for complete implementation with applicable mandatory
+pre-merge acceptance satisfied; preserve it when only post-merge verification is
+pending. A partial PR must use `Related to #<number>`, list remaining implementation
+and validation by criterion, and leave the source Issue open. Record the existing
+maintainer/workflow authorization for an explicitly scoped partial integration.
+State "None" when no scope remains.
 
 ## Mandatory pre-merge acceptance and validation
 
@@ -51,4 +51,7 @@ Report additional checks using the same statuses and evidence, or state
 List only genuinely required checks possible after merge, why they require merge
 and the expected evidence, or state "None required." Keep these **Pending** until
 performed, then record actual statuses, evidence and follow-up work. Pre-merge
-results do not establish deployment or publication success.
+results do not establish deployment or publication success. Follow the
+[merge, closure and defect follow-up lifecycle](https://github.com/takahirox/cognix/blob/main/docs/development-flow.md#merge-and-follow-up)
+to close a resolved Issue after merge, record evidence and track any actual
+defects in linked Issues.

@@ -1,8 +1,8 @@
 # Development flow
 
 Work in cognix follows **Issue → implementation → PR → review → revision as needed
-→ merge**. Add post-merge work only when actually required. Target `main` unless
-the Issue or authorized workflow specifies another branch.
+→ merge and close Issue → required post-merge verification, if any**. Target
+`main` unless the Issue or authorized workflow specifies another branch.
 
 ## Collaboration language
 
@@ -71,8 +71,9 @@ relative links and heading anchors, cross-document consistency and whitespace.
 Run `git diff --check`, or `git diff --cached --check` for staged changes. Inspect
 the complete diff including new files; an unstaged diff alone omits untracked
 files. Use available tooling and add no dependency solely for this baseline.
-Unrelated runtime suites, deployed-site checks and human design approval are not
-required for documentation-only work.
+Unrelated runtime suites, deployments, physical-device checks, heavyweight model
+downloads and routine manual approval are not required for documentation-only
+work.
 
 ## PR, review and revision
 
@@ -82,8 +83,10 @@ Map evidence to every required Issue criterion at the current PR head. Report
 Pass, Fail, Skipped and Not run accurately with reasons for gaps; pending CI is
 not a pass. Keep optional validation and post-merge verification separate.
 
-Use closing references only for complete Issue resolution. A partial PR must use
-a non-closing reference, preserve unmet criteria and remaining work, and leave
+Use the normal `Closes #N` reference for complete implementation with all
+applicable mandatory pre-merge acceptance satisfied. Preserve it when only
+post-merge-only verification remains pending. A partial PR must use a
+non-closing reference, preserve unmet criteria and remaining work, and leave
 the source Issue open. An explicitly scoped partial integration is permitted
 under existing maintainer/workflow authorization; it does not establish full
 Issue completion. Pending genuinely post-merge-only verification does not make
@@ -103,7 +106,21 @@ review guide defines readiness, including explicitly authorized partial scope;
 these documents neither grant merge permission nor add a blanket human-approval
 requirement.
 
-Keep genuinely required post-merge-only verification pending until performed,
-then record actual results and follow-up. Pre-merge success does not prove
-deployment success. This documentation/template baseline needs no post-merge
-verification.
+After successful merge of a complete resolution, close the original Issue, then
+perform any genuinely required post-merge checks. Keep unperformed checks pending
+and record actual statuses, commands or methods, affected revision, evidence and
+limitations in the merged PR, closed Issue or a linked validation report. Report
+unperformed or environment-blocked checks honestly with their reason and resume
+condition. Issue closure does not claim these checks passed; pre-merge success
+does not prove deployment success. An unavailable test environment alone is not
+evidence of a product defect.
+
+If verification finds an actual defect, check for an existing equivalent Issue
+first. Use that Issue or create a new linked Issue with reproduction steps,
+affected revision, expected and actual behavior, and links to the original Issue
+and PR. Do not keep or reopen the original Issue solely for post-merge follow-up.
+
+This lifecycle supersedes older instructions to keep an implemented Issue open
+solely for post-merge verification. Preserve historical test outcomes and evidence
+without rewriting those results. Require post-merge checks only when the actual
+change needs them; this documentation/template change requires none.
