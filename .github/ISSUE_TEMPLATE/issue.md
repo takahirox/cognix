@@ -25,6 +25,11 @@ Include relevant examples, logs, prior decisions and related Issues. For a bug,
 give reproduction steps, expected results and actual results. Otherwise explain
 why reproduction does not apply.
 
+For a defect found after merge, follow the
+[follow-up lifecycle](https://github.com/takahirox/cognix/blob/main/docs/development-flow.md#merge-and-follow-up),
+including checking for an equivalent Issue first. Include the affected revision
+and links to the original Issue and PR.
+
 ## Mandatory pre-merge acceptance
 
 List concrete implementation requirements and checks verifiable before merge.
@@ -54,5 +59,7 @@ List useful additional checks separately from mandatory acceptance, or state
 List only genuinely required checks possible after merge, explaining why they
 require merge and what evidence is needed, or state "None required." Keep them
 pending until performed. A merge-triggered deployment cannot be a pre-merge gate.
+For a complete resolution, merge and close this Issue before these checks; record
+evidence and any linked defect Issues using the follow-up lifecycle above.
 
 See the [review and merge guidelines](https://github.com/takahirox/cognix/blob/main/docs/review-guidelines.md).
