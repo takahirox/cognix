@@ -5,12 +5,20 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read, Write},
+    path::Path,
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-fn command(root: &std::path::Path, url: &str) -> Command {
+fn cli(home: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_cognix"));
+    c.env("HOME", home)
+        .env_remove("COGNIX_MODEL")
+        .env_remove("COGNIX_OLLAMA_URL");
+    c
+}
+fn command(root: &Path, url: &str) -> Command {
+    let mut c = cli(root);
     c.args([
         "--root",
         root.to_str().unwrap(),
@@ -179,6 +187,7 @@ fn finished(child: &mut Child) -> std::process::ExitStatus {
     }
 }
 #[test]
+#[cfg(target_os = "macos")]
 fn interactive_task_approval_and_exit() {
     let server = Server::new(|p, b| {
         if p != "/api/chat" || b["messages"].as_array().unwrap().len() == 1 {
@@ -191,23 +200,34 @@ fn interactive_task_approval_and_exit() {
         }
     });
     let t = tempfile::tempdir().unwrap();
-    let out = run(
-        command(t.path(), &server.url).args(["--allow-command", "[\"/usr/bin/true\"]"]),
-        "verify\ny\n/exit\n",
-    );
+    let out = run(&mut command(t.path(), &server.url), "verify\ny\n/exit\n");
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("Proposed command"));
+    assert!(s.contains("Proposed command:\nargv = [\"/usr/bin/true\"]"));
     assert!(s.contains("Approve this action?"));
     assert!(s.contains("Tool: run_command"));
     assert!(s.contains("executed=true"));
     assert!(s.contains("not verification evidence"));
     assert!(!s.contains('\u{1b}'));
     assert!(s.contains("\\x1b"));
+    let requests = server.requests.lock().unwrap();
+    let messages = requests.last().unwrap()["body"]["messages"]
+        .as_array()
+        .unwrap();
+    assert!(
+        !messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("allowlist")
+    );
+    let result: Value =
+        serde_json::from_str(messages.last().unwrap()["content"].as_str().unwrap()).unwrap();
+    assert_eq!(result["status"], "passed");
+    assert_eq!(result["executed"], true);
 }
 #[cfg(target_os = "macos")]
 fn check_approved_hard_link_command(git_alias: bool) {
@@ -368,8 +388,9 @@ fn approved_command_cannot_use_inherited_outside_descriptors() {
         "outside descriptor marker"
     );
 }
+#[cfg(target_os = "macos")]
 #[test]
-fn eof_denies_and_invalid_options_fail() {
+fn runtime_command_denial_and_eof_leave_it_unexecuted() {
     let server = Server::new(|p, b| {
         if p == "/api/chat" && b["messages"].as_array().unwrap().len() > 1 {
             if b["messages"].as_array().unwrap().len() == 2 {
@@ -382,63 +403,180 @@ fn eof_denies_and_invalid_options_fail() {
         }
     });
     let t = tempfile::tempdir().unwrap();
-    let out = run(
-        command(t.path(), &server.url).args([
-            "--task",
-            "verify",
-            "--allow-command",
-            "[\"/usr/bin/true\"]",
-        ]),
-        "",
-    );
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("denied"));
-    for opts in [
-        vec!["--max-steps", "0"],
-        vec!["--num-ctx", "8191"],
-        vec!["--task", " "],
-        vec!["--root", "/missing-cognix-root"],
-        vec!["--allow-command", "[\"relative\"]"],
-        vec!["--command-timeout", "no"],
-        vec!["--unknown"],
-    ] {
+    for answer in ["n\n", "", "y"] {
+        let out = run(
+            command(t.path(), &server.url).args(["--task", "verify"]),
+            answer,
+        );
+        assert_eq!(out.status.code(), Some(1));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("Proposed command"));
         assert!(
-            !run(command(t.path(), &server.url).args(opts), "")
-                .status
-                .success()
+            stdout.contains("denied") && stdout.contains("executed=false"),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
+fn invalid_options_fail() {
+    let t = tempfile::tempdir().unwrap();
+    for (opts, detail) in [
+        (vec!["--max-steps", "0"], "must be greater than zero"),
+        (vec!["--num-ctx", "8191"], "must be at least 8192"),
+        (vec!["--task", " "], "--task must contain a request"),
+        (vec!["--root", "/missing-cognix-root"], "No such file"),
+        (
+            vec!["--allow-command", "[\"relative\"]"],
+            "absolute executable",
+        ),
+        (
+            vec!["--command-timeout", "no"],
+            "must be a positive integer",
+        ),
+        (vec!["--unknown"], "unexpected argument"),
+    ] {
+        let out = run(
+            cli(t.path())
+                .current_dir(t.path())
+                .args(["--ollama-url", "http://127.0.0.1:1"])
+                .args(opts),
+            "",
+        );
+        let message = String::from_utf8_lossy(&out.stderr).into_owned()
+            + &String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !out.status.success() && message.contains(detail),
+            "{message}"
         );
     }
 }
 #[test]
-fn configurable_default_and_single_task() {
-    let server = Server::new(|p, b| {
+fn startup_configuration_precedence_from_a_project_directory() {
+    let handler = |p: &str, b: &Value| {
         if p == "/api/chat" && b["messages"].as_array().unwrap().len() > 1 {
             final_answer()
         } else {
             ready(p, b)
         }
-    });
-    let t = tempfile::tempdir().unwrap();
-    let mut c = Command::new(env!("CARGO_BIN_EXE_cognix"));
-    c.args(["--root", t.path().to_str().unwrap(), "--task", "inspect"])
-        .env("COGNIX_MODEL", "deepseek:fixture")
-        .env("COGNIX_OLLAMA_URL", &server.url);
-    let out = run(&mut c, "");
+    };
+    let config_server = Server::new(handler);
+    let env_server = Server::new(handler);
+    let flag_server = Server::new(handler);
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let config = home.path().join(".cognix");
+    fs::create_dir(&config).unwrap();
+    // With no settings file, only the endpoint flag is needed for the fixture.
+    let mut defaults = cli(home.path());
+    defaults.args(["--ollama-url", &flag_server.url]);
+    let out = run(defaults.current_dir(project.path()), "/exit\n");
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("Verification: not run"));
-    assert!(
-        server
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| r["path"] == "/api/chat")
-            .all(|r| r["body"]["model"] == "deepseek:fixture")
+    let requests = flag_server.requests.lock().unwrap();
+    assert_eq!(requests.last().unwrap()["body"]["model"], "qwen3-coder:30b");
+    assert_eq!(
+        requests.last().unwrap()["body"]["options"]["num_ctx"],
+        16384
     );
+    drop(requests);
+
+    fs::write(
+        config.join("config.toml"),
+        format!(
+            r#"
+model = "saved:local"
+ollama_url = "{}"
+num_ctx = 12288
+"#,
+            config_server.url
+        ),
+    )
+    .unwrap();
+    // A project file cannot supply user configuration.
+    fs::create_dir(project.path().join(".cognix")).unwrap();
+    fs::write(project.path().join(".cognix/config.toml"), "broken").unwrap();
+
+    for (layer, server, model, ctx) in [
+        ("file", &config_server, "saved:local", 12288),
+        ("env", &env_server, "env:local", 12288),
+        ("flag", &flag_server, "flag:local", 16384),
+    ] {
+        let mut command = cli(home.path());
+        command.current_dir(project.path());
+        if layer != "file" {
+            command
+                .env("COGNIX_MODEL", "env:local")
+                .env("COGNIX_OLLAMA_URL", &env_server.url);
+        }
+        if layer == "flag" {
+            command.args([
+                "--model",
+                model,
+                "--ollama-url",
+                &server.url,
+                "--num-ctx",
+                "16384",
+            ]);
+        }
+        let out = run(&mut command, "inspect\n/exit\n");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains(&format!(
+                "Project: {}",
+                project.path().canonicalize().unwrap().display()
+            )),
+            "{stdout}"
+        );
+        assert!(stdout.contains("Verification: not run"));
+        let requests = server.requests.lock().unwrap();
+        let body = &requests.last().unwrap()["body"];
+        assert_eq!(body["model"], model);
+        assert_eq!(body["options"]["num_ctx"], ctx);
+        assert_eq!(body["messages"][1]["content"], "inspect");
+    }
+}
+
+#[test]
+fn invalid_user_configuration_names_the_file_and_setting() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join(".cognix");
+    fs::create_dir(&dir).unwrap();
+    let config = dir.join("config.toml");
+    for (contents, detail) in [
+        ("model = [", "TOML parse error"),
+        ("modle = 'typo'", "unknown field"),
+        ("model = ''", "nonempty local model tag"),
+        ("ollama_url = 'https://example.com'", "local HTTP origin"),
+        ("max_steps = 0", "max_steps must be greater than zero"),
+        ("num_ctx = 8191", "num_ctx must be at least 8192"),
+        (
+            "model_timeout = 86401",
+            "model_timeout must be at most 86400 seconds",
+        ),
+        ("command_timeout = '30'", "invalid type"),
+        ("output_limit = 0", "output_limit must be greater than zero"),
+    ] {
+        fs::write(&config, contents).unwrap();
+        let out = run(&mut cli(home.path()), "");
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(config.to_str().unwrap()) && stderr.contains(detail),
+            "{stderr}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "invalid config must fail before startup"
+        );
+    }
     assert!(
-        Command::new(env!("CARGO_BIN_EXE_cognix"))
+        cli(home.path())
             .arg("--help")
-            .current_dir(t.path())
             .output()
             .unwrap()
             .status

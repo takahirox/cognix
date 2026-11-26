@@ -48,36 +48,41 @@ pub struct Ollama {
     client: reqwest::Client,
     timeout: Duration,
 }
+pub(crate) fn validate_ollama_url(url: &str) -> Result<(), &'static str> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid Ollama URL")?;
+    if parsed.scheme() != "http"
+        || !matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("Ollama URL must be a local HTTP origin (localhost/loopback)");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_model(model: &str) -> Result<(), &'static str> {
+    if model.is_empty()
+        || model.chars().any(char::is_whitespace)
+        || model.to_lowercase().contains("cloud")
+    {
+        return Err("Select a nonempty local model tag without whitespace or cloud backing");
+    }
+    Ok(())
+}
+
 impl Ollama {
     pub fn new(model: &str, url: &str, timeout: Duration, num_ctx: usize) -> Result<Self, Error> {
-        let fail = |s: &str| Error::Provider(s.into());
-        let parsed = reqwest::Url::parse(url).map_err(|_| fail("Invalid Ollama URL"))?;
-        if parsed.scheme() != "http"
-            || !matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || !matches!(parsed.path(), "" | "/")
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
-            return Err(fail(
-                "Ollama URL must be a local HTTP origin (localhost/loopback)",
-            ));
-        }
-        if model.is_empty()
-            || model.chars().any(char::is_whitespace)
-            || model.to_lowercase().contains("cloud")
-        {
-            return Err(fail(
-                "Select a nonempty local model tag without whitespace or cloud backing",
-            ));
-        }
+        validate_ollama_url(url).map_err(|e| Error::Provider(e.into()))?;
+        validate_model(model).map_err(|e| Error::Provider(e.into()))?;
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .build()
-            .map_err(|e| fail(&e.to_string()))?;
+            .map_err(|e| Error::Provider(e.to_string()))?;
         Ok(Self {
             model: model.into(),
             version: "unknown".into(),

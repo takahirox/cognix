@@ -3,29 +3,6 @@
 set -u
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P) || exit 1
-endpoint=${COGNIX_OLLAMA_URL-http://127.0.0.1:11434}
-# Read only the endpoint override; leave the original argv untouched for Cognix.
-# Skip values of the other CLI options, even when a value looks like an option.
-read_endpoint() {
-    while (($#)); do
-        case $1 in
-            --ollama-url=*) endpoint=${1#*=} ;;
-            --ollama-url)
-                (($# >= 2)) || { echo 'dev.sh: --ollama-url needs a value' >&2; exit 1; }
-                endpoint=$2; shift ;;
-            --root|--model|--task|--allow-command|--max-steps|--num-ctx|--model-timeout|--command-timeout|--output-limit)
-                (($# < 2)) || shift ;;
-            --) break ;;
-        esac
-        shift
-    done
-}
-read_endpoint "$@"
-if [[ ! $endpoint =~ ^http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?/?$ ]]; then
-    echo 'dev.sh: Ollama URL must be a local HTTP origin (localhost/loopback)' >&2
-    exit 1
-fi
-endpoint=${endpoint%/}
 timeout=${COGNIX_DEV_STARTUP_TIMEOUT:-30}
 if [[ ! $timeout =~ ^[1-9][0-9]*$ ]] || ((${#timeout} > 3)) || ((timeout > 300)); then
     echo 'dev.sh: COGNIX_DEV_STARTUP_TIMEOUT must be 1–300 seconds' >&2
@@ -82,7 +59,7 @@ cleanup() {
         kill -KILL "$provision_pid" 2>/dev/null || :
         wait "$provision_pid" 2>/dev/null || :
     fi
-    rm -f "$scratch/version" "$scratch/curl-error"
+    rm -f "$scratch/version" "$scratch/curl-error" "$scratch/endpoint"
     # Keep startup logs for inspection; remove the directory when none exists.
     rmdir "$scratch" 2>/dev/null || :
     ((signal_status == 0)) || status=$signal_status
@@ -99,6 +76,29 @@ fail() {
     [[ ! -f $scratch/ollama.log ]] || echo "dev.sh: Ollama startup log: $scratch/ollama.log" >&2
     exit 1
 }
+
+# Build from any working directory and keep the caller's project directory.
+set -m
+(cd -- "$repo" && exec cargo build --locked --manifest-path "$repo/Cargo.toml" --target-dir "$repo/target" --bin cognix --bin cognix-dev-model) &
+build_pid=$!
+set +m
+check_canceled
+wait "$build_pid"
+status=$?
+check_canceled
+((status == 0)) || exit "$status"
+build_pid=
+
+# Resolve the endpoint with the same CLI and config parser as Cognix.
+"$repo/target/debug/cognix-dev-model" --launcher-endpoint "$@" >"$scratch/endpoint" &
+provision_pid=$!
+check_canceled
+wait "$provision_pid"
+status=$?
+check_canceled
+((status == 0)) || exit "$status"
+provision_pid=
+IFS= read -r endpoint <"$scratch/endpoint" || endpoint=
 
 # 0 = compatible server, 2 = connection refused, 1 = incompatible/unresponsive.
 # Do not follow redirects or consult proxies. Only a refused connection permits
@@ -121,10 +121,15 @@ probe() {
     [[ -n $version ]]
 }
 
-probe
-health=$?
-check_canceled
-case $health in
+if [[ -s $scratch/endpoint ]]; then
+    if [[ ! $endpoint =~ ^http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?/?$ ]]; then
+        fail 'Ollama URL must be a local HTTP origin (localhost/loopback)'
+    fi
+    endpoint=${endpoint%/}
+    probe
+    health=$?
+    check_canceled
+    case $health in
     0) echo "dev.sh: Reusing Ollama at $endpoint" >&2 ;;
     1) fail "No valid Ollama /api/version response at $endpoint; port may be occupied by another service or unresponsive. Start/check Ollama manually." ;;
     2)
@@ -151,31 +156,17 @@ case $health in
         done
         ((health == 0)) || fail "Ollama did not become ready within $timeout seconds."
         ;;
-esac
-check_canceled
-
-# Build from any working directory, then run the native executable directly so
-# signals reach Cognix rather than only a cargo run parent. Keep the caller's cwd.
-set -m
-(cd -- "$repo" && exec cargo build --locked --manifest-path "$repo/Cargo.toml" --target-dir "$repo/target" --bin cognix --bin cognix-dev-model) &
-build_pid=$!
-set +m
-check_canceled
-wait "$build_pid"
-status=$?
-check_canceled
-((status == 0)) || exit "$status"
-build_pid=
-# The helper shares Cognix's CLI parser, original argv and unbuffered stdin.
-# Keep it in the foreground terminal group so interactive consent works.
-"$repo/target/debug/cognix-dev-model" "$@" <&0 &
-provision_pid=$!
-check_canceled
-wait "$provision_pid"
-status=$?
-check_canceled
-((status == 0)) || exit "$status"
-provision_pid=
+    esac
+    # Keep the helper in the foreground terminal group for interactive consent.
+    "$repo/target/debug/cognix-dev-model" "$@" <&0 &
+    provision_pid=$!
+    check_canceled
+    wait "$provision_pid"
+    status=$?
+    check_canceled
+    ((status == 0)) || exit "$status"
+    provision_pid=
+fi
 "$repo/target/debug/cognix" "$@" <&0 &
 cognix_pid=$!
 check_canceled

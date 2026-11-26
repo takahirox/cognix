@@ -237,7 +237,7 @@ fn exact_command_policy_and_denial() {
     r.allowed_commands = vec![vec!["/usr/bin/true".into()]];
     r.approve = Box::new(|_, _| panic!("Commands outside policy must not reach approval"));
     assert_eq!(
-        r.execute("run_command", json!({"argv":["/bin/sh","-c","true"]}))["status"],
+        r.execute("run_command", json!({"argv":["/usr/bin/true","different"]}))["status"],
         "not_run"
     );
     r.approve = Box::new(|_, _| false);
@@ -251,6 +251,30 @@ fn exact_command_policy_and_denial() {
             "not_run"
         }
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unrestricted_proposals_still_require_an_installed_absolute_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (t, mut r) = setup();
+    let program = t.path().join("project-program");
+    fs::copy("/usr/bin/true", &program).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    r.approve = Box::new(|_, _| panic!("Invalid executable must not reach approval"));
+    for executable in ["true", "/usr/bin", program.to_str().unwrap()] {
+        let result = r.execute("run_command", json!({"argv":[executable]}));
+        assert_eq!(result["status"], "not_run");
+        assert_eq!(result["executed"], false);
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("absolute executable"),
+            "{result}"
+        );
+    }
 }
 
 #[test]

@@ -219,19 +219,19 @@ async fn cancellation_at_approval_records_queued_unrun_calls() {
 }
 #[tokio::test]
 async fn unsupported_model_claim_cannot_change_evidence() {
-    for denied in [true, false] {
+    for restricted in [true, false] {
         let (_t, mut a) = setup(vec![
             calls(vec![call("run_command", json!({"argv":["/usr/bin/true"]}))]),
             answer("All tests passed!"),
         ]);
-        if denied {
-            a.runtime.allowed_commands = vec![vec!["/usr/bin/true".into()]];
+        if restricted {
+            a.runtime.allowed_commands = vec![vec!["/usr/bin/false".into()]];
         }
         a.runtime.approve = Box::new(|_, _| false);
         let r = a.run("verify").await;
         assert_eq!(
             r["checks"][0]["result"]["status"],
-            if denied && cfg!(target_os = "macos") {
+            if !restricted && cfg!(target_os = "macos") {
                 "denied"
             } else {
                 "not_run"
@@ -300,9 +300,7 @@ async fn fixture_inspect_fail_patch_verify_recovery() {
         "-p",
         "test_*.py",
     ];
-    let mut runtime =
-        Runtime::new(t.path(), Box::new(|_, _| true), Cancellation::default()).unwrap();
-    runtime.allowed_commands = vec![argv.iter().map(|s| s.to_string()).collect()];
+    let runtime = Runtime::new(t.path(), Box::new(|_, _| true), Cancellation::default()).unwrap();
     let mut a = Agent::new(
         Fixture {
             phase: 0,
