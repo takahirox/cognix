@@ -110,6 +110,8 @@ Normal Cognix exit codes pass through; Ctrl-C, termination and hangup exit with
 After building, the helper resolves the endpoint and model with Cognix's CLI
 parser. It checks that exact model through `/api/show` on the configured
 endpoint. Installed models start without prompts, updates or downloads.
+If effective settings change between the endpoint probe, model provisioning
+and CLI startup, the launcher stops and asks you to run it again.
 Help/version and invalid CLI options are handled by the same parser without
 provisioning.
 
@@ -148,8 +150,9 @@ for focused checks.
 
 Start `cognix` in a project directory or select it with `cognix --root /path/to/project`.
 
-Each patch displays a diff and exact replacement. Commands show the exact
-argument array (argv) and run in a read-only project sandbox. Type `y` at
+Each patch displays a diff and exact replacement. Commands show the submitted
+argument array (argv) and any resolved executable path that differs from it.
+They run in a read-only project sandbox. Type `y` at
 `Approve this action? [y/N]` for each action you want to approve. Any other
 response, including EOF, denies the action. Use repeatable `--allow-command JSON_ARGV`
 flags if you want to restrict proposals to exact argument arrays. Approval is

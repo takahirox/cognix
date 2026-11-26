@@ -496,9 +496,10 @@ impl Runtime {
                 json!({"status":"not_run","executed":false,"error":"Command is outside the exact --allow-command policy"}),
             );
         }
-        commands::sandbox_argv(&self.root, &self.root, &argv)?;
-        commands::validate_executable(&argv[0])?;
-        if let Err(result) = ActionPlan::command(&argv).approve(&mut self.approve, &self.cancel) {
+        let prepared = commands::PreparedCommand::new(&argv)?;
+        if let Err(result) = ActionPlan::command(&argv, prepared.executable())
+            .approve(&mut self.approve, &self.cancel)
+        {
             return Ok(result);
         }
         if !identity(
@@ -507,9 +508,9 @@ impl Runtime {
         ) {
             return Err("Project root changed during session".into());
         }
-        commands::run(
+        commands::run_prepared(
             &self.root,
-            &argv,
+            prepared,
             &self.cancel,
             self.timeout,
             self.output_limit,
