@@ -27,7 +27,7 @@ pub fn tools() -> Value {
         ),
         (
             "run_command",
-            "Run an exact allowed verification argv after approval, in a read-only sandbox.",
+            "Propose a verification argv for user approval in a read-only sandbox. Use an absolute system-installed executable and literal arguments.",
             json!({"argv":{"type":"array","items":string,"minItems":1,"maxItems":64}}),
         ),
     ];

@@ -34,6 +34,7 @@ pub struct Runtime {
     root_fd: File,
     pub approve: Approval,
     pub cancel: Cancellation,
+    /// Nonempty lists restrict proposals to exact argv matches.
     pub allowed_commands: Vec<Vec<String>>,
     pub timeout: Duration,
     pub output_limit: usize,
@@ -490,12 +491,13 @@ impl Runtime {
     }
     fn run_command(&mut self, args: &Value) -> Result<Value, String> {
         let argv = schema::argv(&args["argv"])?;
-        if !self.allowed_commands.contains(&argv) {
+        if !self.allowed_commands.is_empty() && !self.allowed_commands.contains(&argv) {
             return Ok(
                 json!({"status":"not_run","executed":false,"error":"Command is outside the exact --allow-command policy"}),
             );
         }
         commands::sandbox_argv(&self.root, &self.root, &argv)?;
+        commands::validate_executable(&argv[0])?;
         if let Err(result) = ActionPlan::command(&argv).approve(&mut self.approve, &self.cancel) {
             return Ok(result);
         }

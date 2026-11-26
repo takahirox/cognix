@@ -1,5 +1,5 @@
 //! Internal development-launcher helper; the core agent never provisions models.
-use clap::{Parser, error::ErrorKind};
+use clap::error::ErrorKind;
 use cognix::{Cancellation, cli::Args, provider::Ollama, terminal};
 use reqwest::{Client, Response, StatusCode};
 use serde_json::{Value, json};
@@ -222,12 +222,25 @@ async fn provision(args: &Args, cancel: &Cancellation) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() {
-    let args = match Args::try_parse() {
+    let mut argv: Vec<_> = std::env::args_os().collect();
+    let print_endpoint = argv.get(1).is_some_and(|arg| arg == "--launcher-endpoint");
+    if print_endpoint {
+        argv.remove(1);
+    }
+    let args = match Args::try_parse_configured(argv) {
         Ok(args) => args,
         // Let the actual Cognix invocation print help/version exactly once.
         Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => return,
         Err(e) => e.exit(),
     };
+    if print_endpoint {
+        if args.ollama_url.contains(['\r', '\n', '\0']) {
+            report("Ollama URL must be a local HTTP origin (localhost/loopback)");
+            std::process::exit(1);
+        }
+        println!("{}", args.ollama_url);
+        return;
+    }
     let cancel = Cancellation::default();
     let signal = cancel.clone();
     if let Err(e) = ctrlc::set_handler(move || signal.cancel()) {

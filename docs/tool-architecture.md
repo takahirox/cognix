@@ -3,8 +3,7 @@
 Status: architecture decision from
 [Issue #16](https://github.com/takahirox/cognix/issues/16), revised by
 [Issue #22](https://github.com/takahirox/cognix/issues/22) to simplify initial v2
-delivery. Runtime work remains in the milestones below. Existing schemas,
-approvals and sandbox behavior remain unchanged.
+delivery. Runtime work remains in the milestones below.
 
 Milestone 2's [internal parser and read-only planner](patch-planning.md) is now
 implemented. V2 remains unavailable to models and has no executor or CLI mode;
@@ -38,9 +37,9 @@ local Ollama, without automatic model/provider fallback or downloads.
 
 ## Current implementation and its limits
 
-This analysis applies to the source inherited from `ff984a9` (the runtime is
-unchanged by this decision). Canonical current behavior is documented in the
-[implementation guide](implementation.md); the
+This analysis began with the source inherited from `ff984a9` and reflects the
+runtime command approval policy from Issue #26. The
+[implementation guide](implementation.md) documents current behavior, and the
 [MVP specification](mvp.md#f4--minimal-tools) preserves the original four-tool
 scope and the later creation extension.
 
@@ -50,7 +49,7 @@ scope and the later creation extension.
 | `read_file(path)` | Reads a regular, single-hard-link UTF-8 file without NULs, at most 64 KiB. | Returns content and SHA-256; records the normalized path/hash in the runtime's seen map. No binary or large-file editing. |
 | `apply_patch(path, sha256, old_text, new_text)` | Replaces exactly one unique nonempty span in a previously read existing file. | Rejects stale hashes, ambiguous/no-op spans and oversized results. Diff and exact replacement precede approval; same-directory atomic replacement preserves ordinary mode bits, but not ACLs/xattrs. No add/delete/move/multiple-file operation. |
 | `create_file(path, content)` | Publishes one new regular file with complete UTF-8 content, at most 64 KiB, including empty content. | Existing parents only; no overwrite. Preview/approval and descriptor-relative exclusive publication; mode 0600 subject to umask. Read it before subsequently patching. |
-| `run_command(argv)` | Executes one exact startup-allowlisted argv after separate approval. | Absolute installed runtime executable, no shell expansion, project read-only, scratch writes only, no network or descendants, `.git` unreadable. Commands are disabled by default. |
+| `run_command(argv)` | Executes one exact argv after separate approval, subject to any configured allowlist. | Absolute installed runtime executable, no shell expansion, project read-only, scratch writes only, no network or descendants, `.git` unreadable. |
 
 [runtime.rs](../src/runtime.rs) opens a canonical root once and traverses file
 paths with directory descriptors and `O_NOFOLLOW`. Absolute paths, parent
@@ -304,7 +303,7 @@ write roots or shell command string. Literal metacharacters are argv data.
 
 | Permission class | Read/write boundary and purpose | Authorization and availability |
 | --- | --- | --- |
-| `read_only` | Project/runtime reads, private scratch writes; no Git metadata or network. Search and compatible verification. | Exact argv startup policy and per-action approval. Can wrap today's backend; descendants remain denied. |
+| `read_only` | Project/runtime reads, private scratch writes; no Git metadata or network. Search and compatible verification. | Per-action approval and any configured exact argv restriction. Can wrap today's backend; descendants remain denied. |
 | `build` | Read-only source snapshot; writes only to a fresh private output/cache tree, HOME and TMP. Supports validated compiler/test descendants. | New isolated backend and explicit session opt-in, approved executable/argument/output profile and per-action approval. Not available today. |
 | `project_write` | Writes only to an isolated working copy of the project, then proposes a diff for import through the general patch tool. No live-root writes by the process. | Requires validated build isolation, explicit write opt-in and two approvals: command execution, then actual resulting patch import. Not available today. |
 | `git_read` | Trusted host-generated read-only metadata snapshot plus project reads; no access to live Git administration paths. | Separate opt-in and exact approved Git inspection argv/profile; validated snapshot support required. Not available today. |
@@ -329,7 +328,7 @@ admit specific argument patterns (e.g. bounded search paths or build targets),
 but must reject response files, configuration/plugin loading, output/path escapes,
 Git `-C`/`--git-dir`/config overrides and interpreter options outside that profile.
 Use fixed canonical executable identity and revalidate at launch; PATH lookup
-must not select project programs. Project code executed by an already-allowlisted
+must not select project programs. Project code executed by an approved
 read-only interpreter remains constrained by today's sandbox. New write-capable
 script/build profiles require the isolated backend, with snapshot hashes and
 permitted descendants bound to approval. Exact argv alone does not make an

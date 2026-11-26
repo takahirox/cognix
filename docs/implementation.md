@@ -85,7 +85,7 @@ a server lying about its configuration is outside the client trust boundary.
 | `read_file` | `path` | UTF-8 regular file, content and SHA-256; no binary/NUL data. |
 | `apply_patch` | `path`, `sha256`, `old_text`, `new_text` | Previously read existing file; replace one unique nonempty span after preview/approval. |
 | `create_file` | `path`, `content` | One new UTF-8 regular file in an existing directory, after creation preview/approval; exclusive publication, never overwrite. |
-| `run_command` | `argv` | Exact allowlisted argument array, approval, sandbox, bounded result. |
+| `run_command` | `argv` | Exact argument array, optional allowlist, approval, sandbox and bounded result. |
 
 Patching intentionally supports existing files only, not creation, deletion,
 renaming, or whole-project patches. `old_text` must occur exactly once. Reads
@@ -152,14 +152,15 @@ A root change also prevents creation and command execution.
 
 ## Verification policy and isolation
 
-No commands are enabled by default. The user supplies repeatable
-`--allow-command JSON_ARGV` options at startup. Each must contain an existing
-absolute executable in a system runtime directory; policy comparisons use the
-exact full argv, including the executable string. Model calls cannot extend or
-rewrite this list. There is no shell parsing or expansion and no inherited stdin.
-An explicitly chosen shell or interpreter is still constrained by the sandbox.
-Approval is required even for an allowlisted invocation. An unsupported sandbox
-or sandbox launch failure never triggers an unsandboxed retry.
+The model can propose a command with an existing absolute executable in a system
+runtime directory. If the user supplies any repeatable `--allow-command JSON_ARGV`
+options, the command must match one exact full argv, including the executable
+string. Model calls cannot extend or rewrite the list. Every eligible invocation
+shows its exact argv and requires separate approval. The launcher passes
+arguments directly with no shell parsing, expansion or inherited stdin. The
+sandbox also constrains explicitly chosen shells and interpreters. An
+unsupported sandbox or sandbox launch failure never triggers an unsandboxed
+retry.
 
 After approval, every command checks the readable project tree before launch.
 Any regular file with multiple hard links refuses the entire command with
@@ -204,7 +205,7 @@ not executable under this policy. On the evaluation Mac use
 `/opt/homebrew/bin/python3`; Apple's `/usr/bin/python3` needs Xcode directories
 that this policy does not expose. Sandbox isolation protects the filesystem and
 network, not total resource consumption: commands can still consume memory/CPU
-until their deadline. Keep the allowlist small and review each action.
+until their deadline. Review each proposed command before approval.
 
 ## Limits, cancellation and reporting
 

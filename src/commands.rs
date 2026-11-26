@@ -47,26 +47,28 @@ pub fn parse_command(text: &str) -> Result<Vec<String>, String> {
     let v: Value =
         serde_json::from_str(text).map_err(|e| format!("--allow-command needs JSON argv: {e}"))?;
     let argv = schema::argv(&v)?;
-    let p = Path::new(&argv[0]);
-    let canonical = p
-        .canonicalize()
-        .map_err(|_| "Allowed commands need an existing absolute executable")?;
-    if !p.is_absolute()
-        || !canonical.is_file()
-        || fs::metadata(&canonical)
-            .map_err(|e| e.to_string())?
-            .permissions()
-            .mode()
-            & 0o111
-            == 0
+    validate_executable(&argv[0]).map_err(|e| format!("--allow-command: {e}"))?;
+    Ok(argv)
+}
+
+pub(crate) fn validate_executable(program: &str) -> Result<(), &'static str> {
+    let path = Path::new(program);
+    let error = "Command needs an existing absolute executable installed in a documented system runtime directory";
+    if !path.is_absolute() {
+        return Err(error);
+    }
+    let canonical = path.canonicalize().map_err(|_| error)?;
+    let metadata = canonical.metadata().map_err(|_| error)?;
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o111 == 0
         || !RUNTIME_DIRS
             .iter()
             .filter_map(|s| Path::new(s).canonicalize().ok())
             .any(|dir| canonical.starts_with(dir))
     {
-        return Err("Allowed commands need an absolute executable installed in a documented system runtime directory".into());
+        return Err(error);
     }
-    Ok(argv)
+    Ok(())
 }
 pub fn sandbox_argv(root: &Path, scratch: &Path, argv: &[String]) -> Result<Vec<String>, String> {
     if !cfg!(target_os = "macos") || !Path::new("/usr/bin/sandbox-exec").is_file() {
@@ -237,6 +239,7 @@ pub fn run(
         return Ok(unexecuted("limit_reached"));
     }
     validation?;
+    validate_executable(argv.first().ok_or("Command needs an executable")?)?;
     let temporary = tempfile::Builder::new()
         .prefix("cognix-check-")
         .tempdir()
