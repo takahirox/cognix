@@ -83,6 +83,11 @@ struct PatchSource {
     info: Metadata,
 }
 
+enum PatchPublication {
+    Applied,
+    RecoveryRequired,
+}
+
 // Own both the inode and its staging name so cleanup can check identity.
 struct PatchTemporary<'a> {
     parent: &'a File,
@@ -304,7 +309,7 @@ impl Runtime {
         staging: &str,
         target: &CString,
         before: &PatchSource,
-    ) -> Result<(), String> {
+    ) -> Result<PatchPublication, String> {
         let staged_info = temporary.file.metadata().map_err(err)?;
         // Keep the entry found at the target by the syscall until it has been verified.
         temporary.exchange(target).map_err(|error| {
@@ -335,7 +340,7 @@ impl Runtime {
             // The preview keeps the original inode open, so it cannot be recycled.
             // Cleanup now owns the verified original instead of the published file.
             temporary.file = displaced.file;
-            return Ok(());
+            return Ok(PatchPublication::Applied);
         }
 
         // Restore only while the target still looks like our output. Even if a
@@ -349,9 +354,12 @@ impl Runtime {
             return Err(STALE_PATCH.into());
         }
         temporary.preserve = true;
-        Err(format!(
-            "{STALE_PATCH}. Inspect the preserved entry {staging:?} beside the patch target"
-        ))
+        Ok(PatchPublication::RecoveryRequired)
+    }
+    fn record_patch_effect(&mut self, path: &str) {
+        self.modified.insert(path.to_owned());
+        self.seen.remove(path);
+        self.patch_reads.remove(path);
     }
     fn patch(&mut self, args: &Value) -> Result<Value, String> {
         let parts = Self::parts(args["path"].as_str().unwrap())?;
@@ -445,20 +453,32 @@ impl Runtime {
             h("before_publish");
         }
 
-        if let Some(before) = &before {
-            self.publish_update(&mut temporary, &staging, &target, before)?;
+        let publication = if let Some(before) = &before {
+            self.publish_update(&mut temporary, &staging, &target, before)?
         } else {
             let fd = parent.as_raw_fd();
             // linkat enforces destination absence, including dangling links.
             if unsafe { libc::linkat(fd, temporary.name.as_ptr(), fd, target.as_ptr(), 0) } < 0 {
                 return Err(err(std::io::Error::last_os_error()));
             }
-        }
+            PatchPublication::Applied
+        };
         // Own the evidence before cleanup or reporting cancellation.
-        self.modified.insert(normalized.clone());
+        self.record_patch_effect(&normalized);
+        if let PatchPublication::RecoveryRequired = publication {
+            // Both names were affected by the exchange and require inspection.
+            let recovery_path = Path::new(&normalized).with_file_name(&staging);
+            let recovery_path = recovery_path.to_str().unwrap();
+            self.record_patch_effect(recovery_path);
+            return Ok(json!({
+                "status": "partial",
+                "executed": true,
+                "path": normalized,
+                "recovery_path": recovery_path,
+                "error": "File changed after preview and the patch could not be fully rolled back. Inspect the target and recovery paths before retrying."
+            }));
+        }
         let digest = hash(after.as_bytes());
-        self.seen.remove(&normalized);
-        self.patch_reads.remove(&normalized);
         drop(temporary);
         #[cfg(test)]
         if let Some(h) = &mut self.hook {
