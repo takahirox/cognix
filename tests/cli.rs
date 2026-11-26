@@ -62,7 +62,10 @@ fn create_file_preview_approval_defaults_and_eof() {
             if p != "/api/chat" || b["messages"].as_array().unwrap().len() == 1 {
                 ready(p, b)
             } else if b["messages"].as_array().unwrap().len() == 2 {
-                tool("create_file", json!({"path":"new.txt","content":"hello\n"}))
+                tool(
+                    "apply_patch",
+                    json!({"path":"new.txt","old_text":null,"new_text":"hello\n"}),
+                )
             } else {
                 final_answer()
             }
@@ -73,7 +76,7 @@ fn create_file_preview_approval_defaults_and_eof() {
             input,
         );
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let preview = stdout.find("Proposed create_file").unwrap();
+        let preview = stdout.find("Proposed patch").unwrap();
         let addition = stdout.find("+hello").unwrap();
         let approval = stdout.find("Approve this action? [y/N]").unwrap();
         assert!(preview < addition && addition < approval, "{stdout}");
@@ -114,9 +117,8 @@ fn mixed_actions_require_separate_approval_and_preserve_committed_evidence() {
         }
         if b["messages"].as_array().unwrap().len() == 2 {
             let calls = [
-                ("create_file", json!({"path":path,"content":content})),
-                ("read_file", json!({"path":path})),
-                ("apply_patch", json!({"path":path,"sha256":cognix::runtime::hash(content.as_bytes()),"old_text":"before","new_text":"after"})),
+                ("apply_patch", json!({"path":path,"old_text":null,"new_text":content})),
+                ("apply_patch", json!({"path":path,"old_text":"before","new_text":"after"})),
                 ("run_command", json!({"argv":argv})),
             ].into_iter().enumerate().map(|(i, (name, arguments))| {
                 json!({"id":format!("action-{i}"),"function":{"name":name,"arguments":arguments}})
@@ -150,8 +152,8 @@ fn mixed_actions_require_separate_approval_and_preserve_committed_evidence() {
     assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(stdout.matches("Approve this action? [y/N]").count(), 3);
-    let creation = stdout.find("Proposed create_file").unwrap();
-    let patch = stdout.find("Proposed patch").unwrap();
+    let creation = stdout.find("Proposed patch").unwrap();
+    let patch = stdout.rfind("Proposed patch").unwrap();
     let command = stdout.find("Proposed command").unwrap();
     assert!(creation < patch && patch < command);
     assert!(stdout.contains("argv = [\"/usr/bin/printf\",\"%s\",\"arg\\n\\\"\\u001b\"]"));
@@ -159,7 +161,7 @@ fn mixed_actions_require_separate_approval_and_preserve_committed_evidence() {
     assert!(stdout.contains("\\x1b") && stdout.contains("\\x202e"));
     assert!(stdout.contains(&format!("Modified files: {}", json!([path]))));
     let results = results.lock().unwrap();
-    assert_eq!(results.len(), 4);
+    assert_eq!(results.len(), 3);
     for (i, message) in results.iter().enumerate() {
         assert_eq!(message["tool_call_id"], format!("action-{i}"));
         let result: Value = serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
@@ -167,7 +169,7 @@ fn mixed_actions_require_separate_approval_and_preserve_committed_evidence() {
             assert_eq!(result["status"], "ok");
             assert_eq!(result["executed"], true);
             assert_eq!(result["sha256"], cognix::runtime::hash(content.as_bytes()));
-        } else if i >= 2 {
+        } else {
             assert_eq!(result["status"], "denied");
             assert_eq!(result["executed"], false);
         }
@@ -251,8 +253,7 @@ fn check_approved_hard_link_command(git_alias: bool) {
             ready(p, b)
         } else {
             match b["messages"].as_array().unwrap().len() {
-                2 => tool("read_file", json!({"path":"nested/alias"})),
-                4 => tool("run_command", json!({"argv":request})),
+                2 => tool("run_command", json!({"argv":request})),
                 _ => final_answer(),
             }
         }
@@ -280,8 +281,7 @@ fn check_approved_hard_link_command(git_alias: bool) {
         .filter(|m| m["role"] == "tool")
         .map(|m| serde_json::from_str(m["content"].as_str().unwrap()).unwrap())
         .collect();
-    assert_eq!(results[0]["status"], "failed");
-    let result = &results[1];
+    let result = &results[0];
     assert_eq!(result["status"], "not_run", "{result}");
     assert_eq!(result["executed"], false, "{result}");
     assert!(
@@ -429,7 +429,7 @@ fn invalid_options_fail() {
         (vec!["--root", "/missing-cognix-root"], "No such file"),
         (
             vec!["--allow-command", "[\"relative\"]"],
-            "absolute executable",
+            "Command not found",
         ),
         (
             vec!["--command-timeout", "no"],
@@ -727,16 +727,10 @@ fn sigint_after_patch_and_during_command_preserves_evidence() {
             let n = *state.lock().unwrap();
             *state.lock().unwrap() += 1;
             match n {
-                0 => tool("read_file", json!({"path":"file"})),
-                1 => {
-                    let last = b["messages"].as_array().unwrap().last().unwrap();
-                    let read: Value =
-                        serde_json::from_str(last["content"].as_str().unwrap()).unwrap();
-                    tool(
-                        "apply_patch",
-                        json!({"path":"file","sha256":read["sha256"],"old_text":"before","new_text":"after"}),
-                    )
-                }
+                0 => tool(
+                    "apply_patch",
+                    json!({"path":"file","old_text":"before","new_text":"after"}),
+                ),
                 _ if command_running => tool("run_command", json!({"argv":allow})),
                 _ => {
                     let mut r = final_answer();
@@ -754,7 +748,7 @@ fn sigint_after_patch_and_during_command_preserves_evidence() {
         child.stdin.as_mut().unwrap().write_all(b"y\ny\n").unwrap();
         let end = Instant::now() + Duration::from_secs(4);
         loop {
-            if *stage.lock().unwrap() >= 3 {
+            if *stage.lock().unwrap() >= 2 {
                 break;
             }
             assert!(Instant::now() < end);

@@ -12,6 +12,23 @@ performed by this implementation node. Review and integration remain downstream.
 The [Python validation record](validation-python.md) and its two raw JSON records
 are historical evidence only. They are not Rust test results.
 
+## Two core tools (Issue #28)
+
+Validated on Apple Silicon macOS with Rust 1.94.0 and Ollama 0.34.4.
+
+| Criterion | Evidence |
+| --- | --- |
+| Two advertised tools | The HTTP provider test checks the exact names `apply_patch` and `run_command`. The runtime rejects the three retired tool names. |
+| Project inspection | The scripted division task uses real sandboxed `ls`, `cat`, and `grep` with bare names. Runtime tests cover command denial, exact argv policy, executable lookup, and sandbox boundaries. |
+| Approved creation and updates | CLI tests exercise separate preview and approval. Filesystem tests cover refusal to overwrite, stale bytes and inode replacement at publication, cleanup, path boundaries, and cancellation. |
+| Real division trial | The installed `qwen3-coder:30b` used only the two core tools. Unittest initially ran two tests, reported `ZeroDivisionError`, and exited 1. The model updated `main.py` and created `test_division_edges.py`. The same sandboxed command then ran three tests, printed `OK`, and exited 0. The original tests were byte-for-byte unchanged. |
+| Repository checks | All 98 tests passed under `cargo test --locked --all-targets`. rustfmt, Clippy with warnings denied, the documentation checker (15 documents), and the release build passed. |
+
+Run the fixture evaluator with
+`cargo run --locked --example evaluate_ollama -- --model qwen3-coder:30b --runs 1 --output /tmp/cognix-trial.json`.
+Its event log contains the exact approved argv, captured test output, and exit
+codes. The final trial's recorded source hashes matched the implementation.
+
 ## Internal v2 patch preparation (Issue #20)
 
 The [milestone 2 implementation and validation record](patch-planning.md#validation-record)

@@ -99,7 +99,7 @@ pub fn render(report: &Value) -> String {
     for event in checks {
         let r = &event["result"];
         out.push_str(&format!(
-            "Check argv: {}\n  {}; executed={}; exit={}\n",
+            "Command argv: {}\n  {}; executed={}; exit={}\n",
             event["arguments"]["argv"], r["status"], r["executed"], r["exit_code"]
         ));
         for key in ["output", "error"] {

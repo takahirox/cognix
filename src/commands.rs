@@ -43,6 +43,8 @@ pub const RUNTIME_DIRS: &[&str] = &[
     "/opt/homebrew/lib",
     "/opt/homebrew/bin",
 ];
+const COMMAND_PATH: &str = "/usr/bin:/bin:/opt/homebrew/bin";
+
 pub fn parse_command(text: &str) -> Result<Vec<String>, String> {
     let v: Value =
         serde_json::from_str(text).map_err(|e| format!("--allow-command needs JSON argv: {e}"))?;
@@ -51,28 +53,46 @@ pub fn parse_command(text: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
-fn resolve_executable(program: &str) -> Result<(PathBuf, fs::Metadata), &'static str> {
+fn resolve_executable(program: &str) -> Result<(PathBuf, PathBuf, fs::Metadata), &'static str> {
     let path = Path::new(program);
-    let error = "Command needs an existing absolute executable installed in a documented system runtime directory";
-    if !path.is_absolute() {
-        return Err(error);
+    if path.is_absolute() {
+        return installed_executable(path)
+            .map(|(canonical, metadata)| (path.to_owned(), canonical, metadata))
+            .ok_or("Absolute executable must resolve to a file in a documented system runtime directory");
     }
-    let canonical = path.canonicalize().map_err(|_| error)?;
-    let metadata = canonical.symlink_metadata().map_err(|_| error)?;
-    if !metadata.is_file()
-        || metadata.permissions().mode() & 0o111 == 0
-        || !RUNTIME_DIRS
+    if program.is_empty() || program.contains('/') || matches!(program, "." | "..") {
+        return Err("Use a bare command name or an absolute executable path");
+    }
+    for dir in COMMAND_PATH.split(':') {
+        let invocation = Path::new(dir).join(program);
+        if let Some((canonical, metadata)) = installed_executable(&invocation) {
+            return Ok((invocation, canonical, metadata));
+        }
+    }
+    Err(
+        "Command not found in /usr/bin, /bin or /opt/homebrew/bin. Use an installed command or an eligible absolute path",
+    )
+}
+
+fn installed_executable(path: &Path) -> Option<(PathBuf, fs::Metadata)> {
+    let canonical = path.canonicalize().ok()?;
+    let metadata = canonical.symlink_metadata().ok()?;
+    if metadata.is_file()
+        && metadata.permissions().mode() & 0o111 != 0
+        && RUNTIME_DIRS
             .iter()
             .filter_map(|s| Path::new(s).canonicalize().ok())
             .any(|dir| canonical.starts_with(dir))
     {
-        return Err(error);
+        Some((canonical, metadata))
+    } else {
+        None
     }
-    Ok((canonical, metadata))
 }
 
 pub(crate) struct PreparedCommand<'a> {
     submitted_argv: &'a [String],
+    invocation: PathBuf,
     executable: PathBuf,
     metadata: fs::Metadata,
 }
@@ -81,9 +101,10 @@ impl<'a> PreparedCommand<'a> {
     pub(crate) fn new(argv: &'a [String]) -> Result<Self, String> {
         sandbox_available()?;
         let program = argv.first().ok_or("Command needs an executable")?;
-        let (executable, metadata) = resolve_executable(program)?;
+        let (invocation, executable, metadata) = resolve_executable(program)?;
         Ok(Self {
             submitted_argv: argv,
+            invocation,
             executable,
             metadata,
         })
@@ -93,11 +114,16 @@ impl<'a> PreparedCommand<'a> {
         &self.executable
     }
 
+    pub(crate) fn invocation(&self) -> &Path {
+        &self.invocation
+    }
+
     fn check_executable(&self) -> Result<(), String> {
         let changed = "Command executable changed after preview; command not run";
-        let (resolved, current) =
+        let (invocation, resolved, current) =
             resolve_executable(&self.submitted_argv[0]).map_err(|_| changed)?;
-        if resolved != self.executable
+        if invocation != self.invocation
+            || resolved != self.executable
             || current.dev() != self.metadata.dev()
             || current.ino() != self.metadata.ino()
             || current.ctime() != self.metadata.ctime()
@@ -272,7 +298,9 @@ pub fn run(
     if cancel.is_canceled() {
         return Ok(unexecuted("canceled"));
     }
-    run_prepared(root, PreparedCommand::new(argv)?, cancel, timeout, limit)
+    let prepared = PreparedCommand::new(argv)?;
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    run_prepared(&root, prepared, cancel, timeout, limit)
 }
 
 pub(crate) fn run_prepared(
@@ -288,6 +316,12 @@ pub(crate) fn run_prepared(
     if cancel.is_canceled() {
         return Ok(unexecuted("canceled"));
     }
+    let scratch_parent = std::env::temp_dir()
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if scratch_parent.starts_with(root) {
+        return Err("Command scratch directory would be inside the read-only project".into());
+    }
     let validation = validate_project_reads(root, cancel, deadline);
     if cancel.is_canceled() {
         return Ok(unexecuted("canceled"));
@@ -298,18 +332,24 @@ pub(crate) fn run_prepared(
     validation?;
     let temporary = tempfile::Builder::new()
         .prefix("cognix-check-")
-        .tempdir()
+        .tempdir_in(scratch_parent)
         .map_err(|e| e.to_string())?;
     let scratch = temporary.path().canonicalize().map_err(|e| e.to_string())?;
     // Some runtimes, including Python virtual environments, use the invocation path.
-    let wrapped = sandbox_argv(root, &scratch, prepared.submitted_argv)?;
+    let mut argv = prepared.submitted_argv.to_vec();
+    argv[0] = prepared
+        .invocation
+        .to_str()
+        .ok_or("Non-UTF8 command path")?
+        .into();
+    let wrapped = sandbox_argv(root, &scratch, &argv)?;
     let mut command = Command::new(&wrapped[0]);
     command
         .args(&wrapped[1..])
         .current_dir(root)
         .env_clear()
         .envs([
-            ("PATH", "/usr/bin:/bin:/opt/homebrew/bin"),
+            ("PATH", COMMAND_PATH),
             ("HOME", scratch.to_str().ok_or("Non-UTF8 scratch")?),
             ("TMPDIR", scratch.to_str().unwrap()),
             ("TMP", scratch.to_str().unwrap()),

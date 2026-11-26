@@ -48,7 +48,10 @@ fn creation_interruptions_and_publish_races_clean_up_owned_staging() {
                 _ => (),
             }
         }));
-        let result = r.execute("create_file", json!({"path":"dir/new","content":"agent"}));
+        let result = r.execute(
+            "apply_patch",
+            json!({"path":"dir/new","old_text":null,"new_text":"agent"}),
+        );
         let committed = phase == "after_commit";
         assert_eq!(
             result["status"],
@@ -64,7 +67,6 @@ fn creation_interruptions_and_publish_races_clean_up_owned_staging() {
         assert_eq!(r.events.last().unwrap()["result"], result);
         if committed {
             assert_eq!(result["sha256"], hash(b"agent"));
-            assert!(!r.seen.contains_key("dir/new"));
             assert_eq!(
                 std::fs::read_to_string(root.join("dir/new")).unwrap(),
                 "agent"
@@ -140,7 +142,6 @@ fn interruption_before_and_after_commit_preserves_evidence() {
         std::fs::write(t.path().join("file"), "before").unwrap();
         let cancel = Cancellation::default();
         let mut r = Runtime::new(t.path(), Box::new(|_, _| true), cancel.clone()).unwrap();
-        let read = r.execute("read_file", json!({"path":"file"}));
         r.hook = Some(Box::new(move |p| {
             if p == phase {
                 cancel.cancel();
@@ -148,7 +149,7 @@ fn interruption_before_and_after_commit_preserves_evidence() {
         }));
         let result = r.execute(
             "apply_patch",
-            json!({"path":"file","sha256":read["sha256"],"old_text":"before","new_text":"after"}),
+            json!({"path":"file","old_text":"before","new_text":"after"}),
         );
         assert_eq!(result["status"], "canceled");
         let committed = phase == "after_commit";
@@ -161,7 +162,6 @@ fn interruption_before_and_after_commit_preserves_evidence() {
         assert_eq!(r.events.last().unwrap()["result"], result);
         if committed {
             assert_eq!(result["sha256"], hash(b"after"));
-            assert_eq!(r.seen["file"], hash(b"after"));
         }
         assert!(std::fs::read_dir(t.path()).unwrap().all(|e| {
             !e.unwrap()
@@ -169,5 +169,48 @@ fn interruption_before_and_after_commit_preserves_evidence() {
                 .to_string_lossy()
                 .starts_with(".cognix-")
         }));
+    }
+}
+
+#[test]
+fn patch_rechecks_bytes_and_identity_at_publication() {
+    for replace_inode in [false, true] {
+        let t = tempfile::tempdir().unwrap();
+        let file = t.path().join("file");
+        std::fs::write(&file, "before").unwrap();
+        let mut r = Runtime::new(t.path(), Box::new(|_, _| true), Cancellation::default()).unwrap();
+        let moved = file.clone();
+        let expected = if replace_inode {
+            "before"
+        } else {
+            "before and a user edit"
+        };
+        r.hook = Some(Box::new(move |phase| {
+            if phase == "before_commit" {
+                if replace_inode {
+                    std::fs::rename(&moved, moved.with_file_name("original")).unwrap();
+                }
+                std::fs::write(&moved, expected).unwrap();
+            }
+        }));
+
+        let result = r.execute(
+            "apply_patch",
+            json!({"path":"file","old_text":"before","new_text":"after"}),
+        );
+        assert_eq!(result["status"], "failed", "{result}");
+        assert_eq!(result["executed"], false);
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("changed after preview")
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
+        assert!(r.modified.is_empty());
+        assert_eq!(
+            std::fs::read_dir(t.path()).unwrap().count(),
+            if replace_inode { 2 } else { 1 }
+        );
     }
 }

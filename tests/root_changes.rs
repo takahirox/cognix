@@ -1,6 +1,27 @@
 use cognix::{Cancellation, runtime::Runtime};
 use serde_json::json;
 use std::fs;
+
+#[cfg(target_os = "macos")]
+#[test]
+fn command_refuses_scratch_inside_project() {
+    let mut runtime = Runtime::new(
+        &std::env::temp_dir(),
+        Box::new(|_, _| true),
+        Cancellation::default(),
+    )
+    .unwrap();
+    let result = runtime.execute("run_command", json!({"argv":["true"]}));
+    assert_eq!(result["status"], "not_run", "{result}");
+    assert_eq!(result["executed"], false);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("scratch directory")
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn command_rejects_replaced_project_root() {

@@ -15,7 +15,10 @@ fn setup() -> (tempfile::TempDir, Runtime) {
     (t, r)
 }
 fn create(r: &mut Runtime, path: &str, content: &str) -> Value {
-    r.execute("create_file", json!({"path":path,"content":content}))
+    r.execute(
+        "apply_patch",
+        json!({"path":path,"old_text":null,"new_text":content}),
+    )
 }
 fn no_staging_files(path: &std::path::Path) {
     assert!(fs::read_dir(path).unwrap().all(|e| {
@@ -33,7 +36,7 @@ fn creation_preview_content_and_evidence() {
     fs::write(t.path().join("user-edit"), "preserve").unwrap();
     let target = t.path().join("src/module.rs");
     r.approve = Box::new(move |kind, preview| {
-        assert_eq!(kind, "create_file");
+        assert_eq!(kind, "patch");
         assert!(!target.exists());
         assert!(preview.contains("src/module.rs"));
         assert!(preview.contains("--- /dev/null"));
@@ -57,20 +60,14 @@ fn creation_preview_content_and_evidence() {
     assert_eq!(info.nlink(), 1);
     assert_eq!(info.mode() & 0o777, 0o600);
     assert!(r.modified.contains("src/module.rs"));
-    assert_eq!(r.events.last().unwrap()["tool"], "create_file");
-    assert_eq!(r.events.last().unwrap()["arguments"]["content"], content);
+    assert_eq!(r.events.last().unwrap()["tool"], "apply_patch");
+    assert_eq!(r.events.last().unwrap()["arguments"]["new_text"], content);
     assert_eq!(r.events.last().unwrap()["result"], result);
     assert_eq!(
         fs::read_to_string(t.path().join("user-edit")).unwrap(),
         "preserve"
     );
     no_staging_files(&t.path().join("src"));
-    // Creation must not relax apply_patch's read-first contract.
-    let patch =
-        json!({"path":"src/module.rs","sha256":result["sha256"],"old_text":"//", "new_text":"///"});
-    assert_eq!(r.execute("apply_patch", patch)["status"], "failed");
-    let read = r.execute("read_file", json!({"path":"src/module.rs"}));
-    assert_eq!(read["content"], content);
 }
 
 #[test]
@@ -91,7 +88,7 @@ fn empty_and_maximum_content_and_bounded_escaped_preview() {
         true
     });
     // The byte limit is inclusive and measured before terminal escaping.
-    let content = "\u{1b}".repeat(schema::MAX_CREATE_BYTES);
+    let content = "\u{1b}".repeat(65536);
     assert_eq!(create(&mut r, "maximum", &content)["status"], "ok");
     assert_eq!(
         fs::read_to_string(t.path().join("maximum")).unwrap(),
@@ -108,26 +105,27 @@ fn schema_and_content_reject_before_approval() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|t| t["function"]["name"] == "create_file")
+        .find(|t| t["function"]["name"] == "apply_patch")
         .unwrap();
     assert_eq!(def["function"]["parameters"]["additionalProperties"], false);
     assert_eq!(
         def["function"]["parameters"]["required"],
-        json!(["content", "path"])
+        json!(["new_text", "old_text", "path"])
     );
     r.approve = Box::new(|_, _| panic!("Invalid call must not ask for approval"));
     for args in [
-        json!({"path":"new"}),
-        json!({"content":""}),
-        json!({"path":"new","content":"", "extra":true}),
-        json!({"path":1,"content":""}),
-        json!({"path":"new","content":null}),
-        json!({"path":"new","content":"é".repeat(32769)}),
-        json!({"path":"new","content":"x\0y"}),
-        json!({"path":"x".repeat(4097),"content":""}),
-        json!({"path":"new","content":"x".repeat(1024 * 1024)}),
+        json!({"path":"new","new_text":""}),
+        json!({"path":"new","old_text":true,"new_text":""}),
+        json!({"old_text":null,"new_text":""}),
+        json!({"path":"new","old_text":null,"new_text":"", "extra":true}),
+        json!({"path":1,"old_text":null,"new_text":""}),
+        json!({"path":"new","old_text":null,"new_text":null}),
+        json!({"path":"new","old_text":null,"new_text":"é".repeat(32769)}),
+        json!({"path":"new","old_text":null,"new_text":"x\0y"}),
+        json!({"path":"x".repeat(4097),"old_text":null,"new_text":""}),
+        json!({"path":"new","old_text":null,"new_text":"x".repeat(1024 * 1024)}),
     ] {
-        let result = r.execute("create_file", args);
+        let result = r.execute("apply_patch", args);
         assert_eq!(result["status"], "failed");
         assert_eq!(result["executed"], false);
         assert!(result["error"].is_string());
