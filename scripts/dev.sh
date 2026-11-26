@@ -89,7 +89,8 @@ check_canceled
 ((status == 0)) || exit "$status"
 build_pid=
 
-# Resolve and normalize the loopback endpoint using Cognix's parser.
+# Resolve the loopback endpoint and capture a digest of the effective settings.
+unset COGNIX_DEV_SETTINGS_DIGEST
 "$repo/target/debug/cognix-dev-model" --launcher-endpoint "$@" >"$scratch/endpoint" &
 provision_pid=$!
 check_canceled
@@ -98,7 +99,6 @@ status=$?
 check_canceled
 ((status == 0)) || exit "$status"
 provision_pid=
-IFS= read -r endpoint <"$scratch/endpoint" || endpoint=
 
 # 0 = compatible server, 2 = connection refused, 1 = incompatible/unresponsive.
 # Do not follow redirects or consult proxies. Only a refused connection permits
@@ -122,6 +122,12 @@ probe() {
 }
 
 if [[ -s $scratch/endpoint ]]; then
+    {
+        IFS= read -r endpoint && IFS= read -r COGNIX_DEV_SETTINGS_DIGEST
+    } <"$scratch/endpoint" || fail 'Could not read Cognix startup settings.'
+    [[ -n $endpoint && $COGNIX_DEV_SETTINGS_DIGEST =~ ^[0-9a-f]{64}$ ]] || \
+        fail 'Invalid Cognix startup settings.'
+    export COGNIX_DEV_SETTINGS_DIGEST
     probe
     health=$?
     check_canceled

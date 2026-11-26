@@ -236,6 +236,7 @@ async fn main() {
     });
     if print_endpoint {
         println!("{endpoint}");
+        println!("{}", args.launcher_settings_digest());
         return;
     }
     let cancel = Cancellation::default();

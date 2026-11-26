@@ -674,6 +674,82 @@ fn launcher_reuses_the_normalized_endpoint_and_model_from_user_configuration() {
 }
 
 #[test]
+fn launcher_rejects_settings_changes_during_probe_or_download() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+    let other_server = Server::new(ready);
+    for edit_at in ["/api/version", "/api/pull"] {
+        let f = provisioning_fixture();
+        f.native_cognix();
+        fs::create_dir(f.path("home/.cognix")).unwrap();
+        let config = f.path("home/.cognix/config.toml");
+        let edited_config = config.clone();
+        let other_url = other_server.url.clone();
+        let installed = AtomicBool::new(false);
+        let server = Server::new(move |path, body| {
+            if path == edit_at {
+                let edited = if path == "/api/version" {
+                    format!("model = 'original:local'\nollama_url = '{other_url}'\n")
+                } else {
+                    fs::read_to_string(&edited_config)
+                        .unwrap()
+                        .replace("original:local", "edited:local")
+                };
+                fs::write(&edited_config, edited).unwrap();
+            }
+            match path {
+                "/api/show" if !installed.load(Relaxed) => missing(body["model"].as_str().unwrap()),
+                "/api/pull" => {
+                    installed.store(true, Relaxed);
+                    Reply {
+                        status: 200,
+                        body: "{\"status\":\"success\"}\n".into(),
+                        delay: Duration::ZERO,
+                    }
+                }
+                _ => ready(path, body),
+            }
+        });
+        fs::write(
+            &config,
+            format!("model = 'original:local'\nollama_url = '{}'\n", server.url),
+        )
+        .unwrap();
+        let mut command = f.command();
+        let mut terminal = terminal_input(&mut command);
+        let child = command.spawn().unwrap();
+        terminal.write_all(b"y\n\x04").unwrap();
+        let out = finished(child);
+        status(&out, 2);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("settings changed during development launcher startup"),
+            "{stderr}"
+        );
+
+        let requests = server.requests.lock().unwrap();
+        let paths: Vec<_> = requests
+            .iter()
+            .map(|r| r["path"].as_str().unwrap())
+            .collect();
+        if edit_at == "/api/version" {
+            assert_eq!(paths, ["/api/version"]);
+        } else {
+            assert_eq!(
+                paths,
+                ["/api/version", "/api/show", "/api/pull", "/api/show"]
+            );
+            assert!(
+                requests[1..]
+                    .iter()
+                    .all(|r| r["body"]["model"] == "original:local")
+            );
+        }
+    }
+    assert!(other_server.requests.lock().unwrap().is_empty());
+}
+
+#[test]
 fn decline_default_eof_and_noninteractive_never_download_or_start_cognix() {
     for answer in [
         Some("n\n"),

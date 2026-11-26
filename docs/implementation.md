@@ -156,8 +156,10 @@ The model can propose a command with an existing absolute executable in a system
 runtime directory. If the user supplies any repeatable `--allow-command JSON_ARGV`
 options, the command must match one exact full argv, including the executable
 string. Model calls cannot extend or rewrite the list. Every eligible invocation
-shows its exact argv and requires separate approval. The launcher passes
-arguments directly with no shell parsing, expansion or inherited stdin. The
+shows its submitted argv and any distinct resolved executable path for separate
+approval. Cognix rechecks the resolved path and file identity before launch,
+refuses a change, and passes the approved path and arguments directly with no
+shell parsing, expansion or inherited stdin. The
 sandbox also constrains explicitly chosen shells and interpreters. An
 unsupported sandbox or sandbox launch failure never triggers an unsandboxed
 retry.

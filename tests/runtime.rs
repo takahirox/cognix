@@ -277,6 +277,49 @@ fn unrestricted_proposals_still_require_an_installed_absolute_executable() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn approval_is_bound_to_the_resolved_executable() {
+    use std::os::unix::fs::symlink;
+
+    let (t, mut r) = setup();
+    let alias = t.path().join("command");
+    symlink("/usr/bin/true", &alias).unwrap();
+    let args = json!({"argv":[alias]});
+    r.allowed_commands = vec![vec![alias.to_str().unwrap().into()]];
+    r.approve = Box::new(|_, _| panic!("The resolved argv is outside the submitted allowlist"));
+    let result = r.execute("run_command", json!({"argv":["/usr/bin/true"]}));
+    assert_eq!(result["status"], "not_run");
+    assert!(result["error"].as_str().unwrap().contains("allow-command"));
+
+    let approve = |preview: &str| {
+        assert!(
+            preview.contains("Resolved executable = \"/usr/bin/true\""),
+            "{preview}"
+        );
+        true
+    };
+    r.approve = Box::new(move |_, preview| approve(preview));
+    let result = r.execute("run_command", args.clone());
+    assert_eq!(result["status"], "passed", "{result}");
+
+    r.approve = Box::new(move |_, preview| {
+        assert!(approve(preview));
+        fs::remove_file(&alias).unwrap();
+        symlink("/usr/bin/false", &alias).unwrap();
+        true
+    });
+    let result = r.execute("run_command", args);
+    assert_eq!(result["status"], "not_run", "{result}");
+    assert_eq!(result["executed"], false);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("executable changed")
+    );
+}
+
 #[test]
 fn shared_approval_preserves_previews_and_stopped_result_shapes() {
     let mut tools = vec!["apply_patch", "create_file"];
