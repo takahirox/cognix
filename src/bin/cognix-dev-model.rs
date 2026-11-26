@@ -1,6 +1,11 @@
 //! Internal development-launcher helper; the core agent never provisions models.
 use clap::error::ErrorKind;
-use cognix::{Cancellation, cli::Args, provider::Ollama, terminal};
+use cognix::{
+    Cancellation,
+    cli::Args,
+    provider::{normalize_ollama_url, validate_model},
+    terminal,
+};
 use reqwest::{Client, Response, StatusCode};
 use serde_json::{Value, json};
 use std::{
@@ -164,15 +169,8 @@ async fn pull(client: &Client, endpoint: &str, model: &str) -> Result<(), String
     Ok(())
 }
 
-async fn provision(args: &Args, cancel: &Cancellation) -> Result<(), String> {
-    // Reuse the core provider's URL/model policy without changing its behavior.
-    Ollama::new(
-        &args.model,
-        &args.ollama_url,
-        Duration::from_secs(10),
-        args.num_ctx,
-    )
-    .map_err(|e| e.to_string())?;
+async fn provision(args: &Args, endpoint: &str, cancel: &Cancellation) -> Result<(), String> {
+    validate_model(&args.model)?;
     if model_key(&args.model).is_none() {
         return Err("Select a valid local Ollama model name (optional namespace and :tag); cloud-backed tags are unsupported".into());
     }
@@ -188,7 +186,6 @@ async fn provision(args: &Args, cancel: &Cancellation) -> Result<(), String> {
         .connect_timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| e.to_string())?;
-    let endpoint = args.ollama_url.trim_end_matches('/');
     if installed(&client, endpoint, &args.model).await? {
         return Ok(());
     }
@@ -233,12 +230,12 @@ async fn main() {
         Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => return,
         Err(e) => e.exit(),
     };
+    let endpoint = normalize_ollama_url(&args.ollama_url).unwrap_or_else(|e| {
+        report(e);
+        std::process::exit(1);
+    });
     if print_endpoint {
-        if args.ollama_url.contains(['\r', '\n', '\0']) {
-            report("Ollama URL must be a local HTTP origin (localhost/loopback)");
-            std::process::exit(1);
-        }
-        println!("{}", args.ollama_url);
+        println!("{endpoint}");
         return;
     }
     let cancel = Cancellation::default();
@@ -249,7 +246,7 @@ async fn main() {
     }
     let result = tokio::select! { biased;
         _ = cancel.wait() => Err("Model provisioning canceled; Cognix was not started. Ollama-managed partial data was left intact".into()),
-        result = provision(&args, &cancel) => result,
+        result = provision(&args, &endpoint, &cancel) => result,
     };
     if let Err(e) = result {
         report(&e);

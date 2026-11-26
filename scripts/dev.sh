@@ -89,7 +89,7 @@ check_canceled
 ((status == 0)) || exit "$status"
 build_pid=
 
-# Resolve the endpoint with the same CLI and config parser as Cognix.
+# Resolve and normalize the loopback endpoint using Cognix's parser.
 "$repo/target/debug/cognix-dev-model" --launcher-endpoint "$@" >"$scratch/endpoint" &
 provision_pid=$!
 check_canceled
@@ -122,10 +122,6 @@ probe() {
 }
 
 if [[ -s $scratch/endpoint ]]; then
-    if [[ ! $endpoint =~ ^http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?/?$ ]]; then
-        fail 'Ollama URL must be a local HTTP origin (localhost/loopback)'
-    fi
-    endpoint=${endpoint%/}
     probe
     health=$?
     check_canceled

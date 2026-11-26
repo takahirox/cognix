@@ -485,7 +485,7 @@ fn startup_configuration_precedence_from_a_project_directory() {
         format!(
             r#"
 model = "saved:local"
-ollama_url = "{}"
+ollama_url = "{} "
 num_ctx = 12288
 "#,
             config_server.url
