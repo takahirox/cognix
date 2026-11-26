@@ -1,33 +1,18 @@
 use serde_json::{Value, json};
 
-pub const MAX_CREATE_BYTES: usize = 65536;
+pub(crate) const PATCH_FILE_BYTES: usize = 65536;
 
 pub fn tools() -> Value {
     let string = json!({"type":"string"});
     let defs = [
         (
-            "list_files",
-            "List one project directory without symlinks; '.' is root.",
-            json!({"path":string}),
-        ),
-        (
-            "read_file",
-            "Read a bounded UTF-8 file and its SHA-256.",
-            json!({"path":string}),
-        ),
-        (
             "apply_patch",
-            "Replace exactly one unique nonempty span in a previously read existing file, using its sha256. User approves a diff; no new files or deletions.",
-            json!({"path":string,"sha256":string,"old_text":string,"new_text":string}),
-        ),
-        (
-            "create_file",
-            "Create one new UTF-8 file (at most 64 KiB, no NULs) in an existing project directory after preview and approval. Never overwrite or create directories; empty content is allowed.",
-            json!({"path":{"type":"string","maxLength":4096},"content":{"type":"string","maxLength":MAX_CREATE_BYTES}}),
+            "Preview and approve one project-relative UTF-8 file change (64 KiB maximum, no NULs). Use old_text: null to create a new file with complete new_text in an existing directory. To update, use an exact unique old_text span and replacement new_text. An empty old_text matches only an empty existing file. No file deletion, moves, or new directories.",
+            json!({"path":{"type":"string","maxLength":4096},"old_text":{"type":["string","null"],"maxLength":PATCH_FILE_BYTES},"new_text":{"type":"string","maxLength":PATCH_FILE_BYTES}}),
         ),
         (
             "run_command",
-            "Propose a verification argv for user approval in a read-only sandbox. Use an absolute system-installed executable and literal arguments.",
+            "Inspect, search, or verify the project with an approved read-only sandboxed command. Use a bare installed command name (e.g. ls, cat, rg, or grep) or an absolute executable path, plus literal arguments. Runs from the project root with no shell expansion, network, or project writes.",
             json!({"argv":{"type":"array","items":string,"minItems":1,"maxItems":64}}),
         ),
     ];
@@ -74,16 +59,26 @@ pub fn validate(name: &str, args: &Value) -> Result<(), String> {
     for (key, value) in obj {
         if key == "argv" {
             argv(value)?;
-        } else if !value.is_string() {
+        } else if !(value.is_string() || (key == "old_text" && value.is_null())) {
+            if key == "old_text" {
+                return Err("old_text must be a string or null".into());
+            }
             return Err(format!("{key} must be a string"));
         }
     }
-    if name == "create_file" {
-        if args["content"].as_str().unwrap().len() > MAX_CREATE_BYTES {
-            return Err("New file exceeds 64 KiB of UTF-8 content".into());
+    if name == "apply_patch" {
+        for field in ["old_text", "new_text"] {
+            if let Some(text) = args[field].as_str() {
+                if text.len() > PATCH_FILE_BYTES {
+                    return Err(format!("{field} exceeds 64 KiB of UTF-8 content"));
+                }
+                if text.contains('\0') {
+                    return Err(format!("{field} must be text without NULs"));
+                }
+            }
         }
         if args["path"].as_str().unwrap().len() > 4096 {
-            return Err("Destination path exceeds 4096 bytes".into());
+            return Err("File path exceeds 4096 bytes".into());
         }
     }
     Ok(())

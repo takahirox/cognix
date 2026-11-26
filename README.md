@@ -1,7 +1,7 @@
 # Cognix
 
 Cognix is a local Ollama coding agent with a terminal interface, bounded tool
-loops, approved edits, and sandboxed verification. The
+loops, approved edits, and sandboxed project commands. The
 [MVP specification](docs/mvp.md) defines the original scope; [validation evidence](docs/validation.md)
 records the Rust migration and subsequent tool and security checks.
 The [tool architecture decision](docs/tool-architecture.md) defines the future
@@ -71,8 +71,9 @@ Configuration errors identify the file and the problem.
 
 **Qwen3.8 27B is an evaluated target, not a dependency.** Both `qwen3.8:27b`
 and `qwen3-coder:30b` passed the tool-call probe and three fixture trials each on
-Ollama 0.34.4. The target tag was explicitly downloaded for evaluation; the direct
-`cognix` binary never downloads models. The launcher asks before any download.
+Ollama 0.34.4 using the earlier tool interface. The target tag was explicitly
+downloaded for evaluation. The direct `cognix` binary never downloads models.
+The launcher asks before any download.
 See the validation record for exact model digests, observed results and platform
 limitations.
 
@@ -150,39 +151,47 @@ for focused checks.
 
 Start `cognix` in a project directory or select it with `cognix --root /path/to/project`.
 
-Each patch displays a diff and exact replacement. Commands show the submitted
-argument array (argv) and any resolved executable path that differs from it.
-They run in a read-only project sandbox. Type `y` at
-`Approve this action? [y/N]` for each action you want to approve. Any other
-response, including EOF, denies the action. Use repeatable `--allow-command JSON_ARGV`
-flags if you want to restrict proposals to exact argument arrays. Approval is
-still required for each matching proposal. Ctrl-C cancels work and exits with
-code 130. `/exit`
-or EOF at the task prompt ends the session. `--task 'request'` runs one task while
-retaining interactive approvals. Progress shows model waits, tool names and
-structured result statuses.
+Cognix uses two tools. `run_command` lists files, reads source, searches text,
+and runs checks from the project root. For example, it can submit
+`["ls", "-1"]`, `["cat", "src/main.rs"]`, or `["grep", "-n", "fn main", "src/main.rs"]`.
+Use `rg` if installed in an eligible runtime directory. Bare command names are
+resolved in `/usr/bin`, `/bin`, and `/opt/homebrew/bin`, in that order. Use an
+eligible absolute path to select a different installed executable. Arguments
+are literal. The macOS sandbox allows project reads and scratch writes, and
+blocks network access and project writes. Checks that need subprocesses, builds
+that write into the project, or tools outside the permitted runtime may fail.
 
-`create_file` takes a project-relative `path` and complete UTF-8 `content` (up to
-64 KiB, including empty text; no NULs). It displays the destination, byte count
-and a bounded add-only preview before the same per-action approval prompt.
-The parent directory must already exist. Absolute paths, `..`, `.git`, symlinked
-parents and existing destinations are rejected; publication never overwrites,
-even if a destination appears during approval. It creates one regular file with
-owner-only permissions (0600, subject to umask), and records it in modified files
-and session evidence. Denial, EOF or cancellation before publication leaves no
-new file. Cancellation after publication preserves the approved file and its
-execution evidence. Creating directories, deleting and renaming remain unsupported;
-`apply_patch` still requires reading an existing file first.
+`apply_patch` creates or updates one UTF-8 file at a time using a project-relative
+`path`. For an update, supply an exact, unique `old_text` span and its
+`new_text` replacement. An empty `old_text` updates an empty existing file.
+For creation, set `old_text` to `null` and supply the complete file in
+`new_text`, which may be empty.
 
-Results list modified files and exact checks, exit codes and captured output.
-They distinguish `passed`, `failed`, `not_run`, `denied`, `canceled` and
-`limit_reached`. No command means verification was not run. A zero exit code is
-recorded as passed; it does not prove test coverage or task correctness. Final
-model responses are sanitized and displayed separately from recorded execution
-evidence, which determines check statuses. A no-tool response ends a turn, not
-proof of success.
-In single-task mode, any failed/denied action makes the exit code 1 even if a
-later correction succeeds; inspect the check ledger for recovery evidence.
+```json
+{"path":"src/new_module.rs","old_text":null,"new_text":"pub fn answer() -> u32 { 42 }\n"}
+```
+
+Each patch shows a diff or a bounded add-only preview. Cognix snapshots an
+existing file while preparing the preview and checks its contents and identity
+again before writing. Creation requires an existing directory and refuses to
+overwrite any destination. Files are limited to 64 KiB of UTF-8 without NULs.
+Absolute patch paths, traversal, `.git`, and symlinks are refused. File deletion,
+moves, directory creation, and multi-file patches are unsupported.
+
+Commands show the submitted argv and any distinct executable path. Type `y`
+at `Approve this action? [y/N]` to approve an individual command or patch.
+Other responses, including EOF, deny it. Use repeatable
+`--allow-command JSON_ARGV` flags to restrict commands to exact submitted arrays.
+For example, `--allow-command '["cat","src/main.rs"]'` permits that exact proposal
+to reach approval. Ctrl-C cancels work and exits with code 130. Use `/exit` or EOF
+at the task prompt to end the session, or `--task 'request'` for one task with
+interactive approvals.
+
+Results record modified files and commands with their exit codes and output.
+They distinguish `passed`, `failed`, `not_run`, `denied`, `canceled`, and
+`limit_reached`. A `passed` command exited with code 0. Use the recorded test
+command and its output to identify which tests ran. In single-task mode, any
+failed or denied action makes the exit code 1, even if a later action succeeds.
 
 ### Verify a fix
 
@@ -196,25 +205,23 @@ cd "$project"
 cognix
 ```
 
-At the prompt, ask Cognix to fix the zero denominator in `main.py` by returning
-`None`, then verify with this argv. The example uses Homebrew Python on Apple
-Silicon.
+Paste the following as a single task at the prompt.
 
 ```text
-Fix the division-by-zero bug in main.py so it returns None for zero. Verify with ["/opt/homebrew/bin/python3","-I","-B","-m","unittest","discover","-s",".","-p","test_*.py"].
+List the files and inspect main.py and test_main.py. Run ["/opt/homebrew/bin/python3","-I","-B","-m","unittest","discover","-s",".","-p","test_*.py"] before making changes. Fix divide(a, 0) to return None, preserve the existing tests, and create test_division_edges.py with one unittest asserting divide(6, -2) == -3. Run the same command again and report the test results.
 ```
 
-Review and approve the patch and test command when prompted. Cognix returns the
-sandboxed test output and exit code to the model and displays them in the
-session's verification results. See [development and security details](docs/implementation.md)
-for the exact tool contract, numeric limits, execution policy and limitations.
+The example selects Homebrew Python on Apple Silicon. Review and approve the
+exploration commands, patches, and test runs. The test command should initially
+report `ZeroDivisionError` and exit 1. After the fix and the new test, it should
+report three tests passing and exit 0. See the [implementation guide](docs/implementation.md)
+for details on approval, limits, and sandbox policy.
 
 ## Check and build
 
 The proposed v2 patch contract has an
 [internal parser and read-only preview planner](docs/patch-planning.md).
-V2 is not available to models or the CLI and cannot execute patches; the five
-existing tools and their approvals and sandbox permissions are unchanged.
+V2 is an internal design experiment. The CLI uses the two tool contracts above.
 
 ```sh
 cargo fmt --all -- --check
@@ -242,9 +249,9 @@ cargo run --locked --example evaluate_ollama -- --model qwen3.8:27b \
   --python /opt/homebrew/bin/python3 --runs 3 --output /tmp/cognix-target-trials.json
 ```
 
-This fixture-only evaluator approves `main.py` patches and its one exact test
-command in disposable projects, recording every decision. It does not enable
-automatic approvals in normal sessions.
+This fixture-only evaluator uses disposable projects and records every decision.
+It approves exact fixture exploration and test commands, an update to `main.py`,
+and creation of `test_division_edges.py`. Normal sessions require explicit approval.
 
 - [Development flow](docs/development-flow.md)
 - [Review and merge guidelines](docs/review-guidelines.md)

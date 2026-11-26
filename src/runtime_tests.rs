@@ -48,7 +48,10 @@ fn creation_interruptions_and_publish_races_clean_up_owned_staging() {
                 _ => (),
             }
         }));
-        let result = r.execute("create_file", json!({"path":"dir/new","content":"agent"}));
+        let result = r.execute(
+            "apply_patch",
+            json!({"path":"dir/new","old_text":null,"new_text":"agent"}),
+        );
         let committed = phase == "after_commit";
         assert_eq!(
             result["status"],
@@ -64,7 +67,6 @@ fn creation_interruptions_and_publish_races_clean_up_owned_staging() {
         assert_eq!(r.events.last().unwrap()["result"], result);
         if committed {
             assert_eq!(result["sha256"], hash(b"agent"));
-            assert!(!r.seen.contains_key("dir/new"));
             assert_eq!(
                 std::fs::read_to_string(root.join("dir/new")).unwrap(),
                 "agent"
@@ -140,7 +142,6 @@ fn interruption_before_and_after_commit_preserves_evidence() {
         std::fs::write(t.path().join("file"), "before").unwrap();
         let cancel = Cancellation::default();
         let mut r = Runtime::new(t.path(), Box::new(|_, _| true), cancel.clone()).unwrap();
-        let read = r.execute("read_file", json!({"path":"file"}));
         r.hook = Some(Box::new(move |p| {
             if p == phase {
                 cancel.cancel();
@@ -148,7 +149,7 @@ fn interruption_before_and_after_commit_preserves_evidence() {
         }));
         let result = r.execute(
             "apply_patch",
-            json!({"path":"file","sha256":read["sha256"],"old_text":"before","new_text":"after"}),
+            json!({"path":"file","old_text":"before","new_text":"after"}),
         );
         assert_eq!(result["status"], "canceled");
         let committed = phase == "after_commit";
@@ -161,7 +162,6 @@ fn interruption_before_and_after_commit_preserves_evidence() {
         assert_eq!(r.events.last().unwrap()["result"], result);
         if committed {
             assert_eq!(result["sha256"], hash(b"after"));
-            assert_eq!(r.seen["file"], hash(b"after"));
         }
         assert!(std::fs::read_dir(t.path()).unwrap().all(|e| {
             !e.unwrap()
@@ -169,5 +169,154 @@ fn interruption_before_and_after_commit_preserves_evidence() {
                 .to_string_lossy()
                 .starts_with(".cognix-")
         }));
+    }
+}
+
+#[test]
+fn patch_rechecks_bytes_and_identity_at_publication() {
+    for replace_inode in [false, true] {
+        let t = tempfile::tempdir().unwrap();
+        let file = t.path().join("file");
+        std::fs::write(&file, "before").unwrap();
+        let mut r = Runtime::new(t.path(), Box::new(|_, _| true), Cancellation::default()).unwrap();
+        let moved = file.clone();
+        let expected = if replace_inode {
+            "before"
+        } else {
+            "before and a user edit"
+        };
+        r.hook = Some(Box::new(move |phase| {
+            if phase == "before_commit" {
+                if replace_inode {
+                    std::fs::rename(&moved, moved.with_file_name("original")).unwrap();
+                }
+                std::fs::write(&moved, expected).unwrap();
+            }
+        }));
+
+        let result = r.execute(
+            "apply_patch",
+            json!({"path":"file","old_text":"before","new_text":"after"}),
+        );
+        assert_eq!(result["status"], "failed", "{result}");
+        assert_eq!(result["executed"], false);
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("changed after preview")
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
+        assert!(r.modified.is_empty());
+        assert_eq!(
+            std::fs::read_dir(t.path()).unwrap().count(),
+            if replace_inode { 2 } else { 1 }
+        );
+    }
+}
+
+#[test]
+fn patch_preserves_editor_save_after_final_check() {
+    let t = tempfile::tempdir().unwrap();
+    let file = t.path().join("file");
+    let save = t.path().join("editor-save");
+    std::fs::write(&file, "before").unwrap();
+    std::fs::write(&save, "concurrent editor content").unwrap();
+    let saved_inode = std::fs::metadata(&save).unwrap().ino();
+    let mut runtime =
+        Runtime::new(t.path(), Box::new(|_, _| true), Cancellation::default()).unwrap();
+    let target = file.clone();
+    runtime.hook = Some(Box::new(move |phase| {
+        if phase == "before_publish" {
+            std::fs::rename(&save, &target).unwrap();
+        }
+    }));
+
+    let result = runtime.execute(
+        "apply_patch",
+        json!({"path":"file","old_text":"before","new_text":"after"}),
+    );
+    assert_eq!(result["status"], "failed", "{result}");
+    assert_eq!(result["executed"], false);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("changed after preview")
+    );
+    assert!(runtime.modified.is_empty());
+    assert_eq!(runtime.events.last().unwrap()["result"], result);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "concurrent editor content"
+    );
+    assert_eq!(std::fs::metadata(&file).unwrap().ino(), saved_inode);
+    assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn patch_reports_target_and_recovery_when_a_later_save_prevents_restoration() {
+    for replace_target in [false, true] {
+        let t = tempfile::tempdir().unwrap();
+        let nested = t.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let target = nested.join("file");
+        let first = t.path().join("first-save");
+        let second = t.path().join("second-save");
+        std::fs::write(&target, "before").unwrap();
+        std::fs::write(&first, "first save").unwrap();
+        std::fs::write(&second, "second save").unwrap();
+        let mut runtime =
+            Runtime::new(t.path(), Box::new(|_, _| true), Cancellation::default()).unwrap();
+        let file = target.clone();
+        runtime.hook = Some(Box::new(move |phase| match phase {
+            "before_publish" => std::fs::rename(&first, &file).unwrap(),
+            "after_exchange" if replace_target => std::fs::rename(&second, &file).unwrap(),
+            "after_exchange" => std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file)
+                .unwrap()
+                .write_all(b" and a user edit")
+                .unwrap(),
+            _ => (),
+        }));
+
+        let result = runtime.execute(
+            "apply_patch",
+            json!({"path":"./nested//file","old_text":"before","new_text":"after"}),
+        );
+        assert_eq!(result["status"], "partial", "{result}");
+        assert_eq!(result["executed"], true);
+        assert_eq!(result["path"], "nested/file");
+        assert!(result.get("sha256").is_none());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            if replace_target {
+                "second save"
+            } else {
+                "after and a user edit"
+            }
+        );
+        let preserved = std::fs::read_dir(&nested)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path != &target)
+            .unwrap();
+        let recovery_path = preserved.strip_prefix(t.path()).unwrap().to_str().unwrap();
+        assert_eq!(result["recovery_path"], recovery_path);
+        assert_eq!(std::fs::read_to_string(&preserved).unwrap(), "first save");
+        assert_eq!(runtime.events.last().unwrap()["result"], result);
+        let report = json!({"modified_files":runtime.modified,"checks":[],"events":runtime.events});
+        assert_eq!(
+            report["modified_files"],
+            json!([recovery_path, "nested/file"])
+        );
+        let rendered = crate::terminal::render(&report);
+        let patch_line = rendered
+            .lines()
+            .find(|line| line.starts_with("\"apply_patch\": "))
+            .unwrap_or_else(|| panic!("missing patch result in {rendered}"));
+        assert!(patch_line.contains("nested/file"), "{patch_line}");
+        assert!(patch_line.contains(recovery_path), "{patch_line}");
     }
 }

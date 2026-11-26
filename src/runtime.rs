@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashMap},
-    ffi::{CStr, CString},
+    ffi::CString,
     fs::{File, Metadata},
     io::{Read, Write},
     os::{
@@ -38,7 +38,7 @@ pub struct Runtime {
     pub allowed_commands: Vec<Vec<String>>,
     pub timeout: Duration,
     pub output_limit: usize,
-    pub seen: HashMap<String, String>,
+    seen: HashMap<String, String>,
     patch_reads: HashMap<String, patch::ReadEvidence>,
     pub modified: BTreeSet<String>,
     pub events: Vec<Value>,
@@ -74,27 +74,33 @@ fn openat(parent: &File, name: &str, flags: i32, mode: u32) -> Result<File, Stri
 fn identity(a: &Metadata, b: &Metadata) -> bool {
     a.ino() == b.ino() && a.dev() == b.dev()
 }
-struct Temporary<'a> {
-    parent: &'a File,
-    name: CString,
-}
-impl Drop for Temporary<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0);
-        }
-    }
+const STALE_PATCH: &str =
+    "File changed after preview. Prepare a new patch against the current file";
+
+struct PatchSource {
+    file: File,
+    bytes: Vec<u8>,
+    info: Metadata,
 }
 
-// Creation owns a descriptor as well as a name. Cleanup must not unlink a file
-// another process substituted for our staging file.
-struct CreationTemporary<'a> {
+enum PatchPublication {
+    Applied,
+    RecoveryRequired,
+}
+
+// Own both the inode and its staging name so cleanup can check identity.
+struct PatchTemporary<'a> {
     parent: &'a File,
     name: CString,
     file: File,
+    preserve: bool,
 }
-impl CreationTemporary<'_> {
+impl PatchTemporary<'_> {
     fn owns_name(&self) -> bool {
+        self.file_at(&self.name)
+    }
+
+    fn file_at(&self, name: &CString) -> bool {
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
         let Ok(info) = self.file.metadata() else {
             return false;
@@ -103,7 +109,7 @@ impl CreationTemporary<'_> {
         if unsafe {
             libc::fstatat(
                 self.parent.as_raw_fd(),
-                self.name.as_ptr(),
+                name.as_ptr(),
                 st.as_mut_ptr(),
                 libc::AT_SYMLINK_NOFOLLOW,
             )
@@ -117,10 +123,33 @@ impl CreationTemporary<'_> {
         let device = st.st_dev as u64;
         device == info.dev() && st.st_ino == info.ino()
     }
+
+    fn exchange(&self, target: &CString) -> std::io::Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let fd = self.parent.as_raw_fd();
+            #[cfg(target_os = "macos")]
+            let (rename, flag) = (libc::renameatx_np, libc::RENAME_SWAP);
+            #[cfg(target_os = "linux")]
+            let (rename, flag) = (libc::renameat2, libc::RENAME_EXCHANGE);
+            // SAFETY: both names are NUL-terminated and relative to a live directory fd.
+            let result = unsafe { rename(fd, self.name.as_ptr(), fd, target.as_ptr(), flag) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("Atomic patch update is unavailable for {target:?}"),
+        ))
+    }
 }
-impl Drop for CreationTemporary<'_> {
+impl Drop for PatchTemporary<'_> {
     fn drop(&mut self) {
-        if self.owns_name() {
+        if !self.preserve && self.owns_name() {
             unsafe {
                 libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0);
             }
@@ -153,7 +182,7 @@ impl Runtime {
             hook: None,
         })
     }
-    fn parts(path: &str, directory: bool) -> Result<Vec<&str>, String> {
+    fn parts(path: &str) -> Result<Vec<&str>, String> {
         if path.is_empty() || path.contains('\0') || Path::new(path).is_absolute() {
             return Err("Use a relative project path".into());
         }
@@ -167,7 +196,7 @@ impl Runtime {
             .split('/')
             .filter(|p| !p.is_empty() && *p != ".")
             .collect();
-        if !directory && parts.is_empty() {
+        if parts.is_empty() || matches!(path.rsplit('/').next(), Some("" | ".")) {
             return Err("Expected a file path".into());
         }
         Ok(parts)
@@ -179,202 +208,52 @@ impl Runtime {
         }
         Ok(fd)
     }
-    fn read(parent: &File, name: &str) -> Result<(Vec<u8>, Metadata), String> {
+    fn read(parent: &File, name: &str) -> Result<PatchSource, String> {
         let file = openat(parent, name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
         let info = file.metadata().map_err(err)?;
         if !info.is_file() || info.nlink() != 1 {
             return Err("Only regular files with one hard link are supported".into());
         }
-        if info.len() > 65536 {
+        if info.len() > schema::PATCH_FILE_BYTES as u64 {
             return Err("File exceeds 64 KiB".into());
         }
         let mut raw = Vec::new();
-        file.take(65537).read_to_end(&mut raw).map_err(err)?;
-        if raw.len() > 65536 {
+        (&file)
+            .take(schema::PATCH_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut raw)
+            .map_err(err)?;
+        if raw.len() > schema::PATCH_FILE_BYTES {
             return Err("File exceeds 64 KiB".into());
         }
-        Ok((raw, info))
+        if patch::Fingerprint::new(&file.metadata().map_err(err)?) != patch::Fingerprint::new(&info)
+        {
+            return Err("File changed while reading".into());
+        }
+        Ok(PatchSource {
+            file,
+            bytes: raw,
+            info,
+        })
     }
-    fn list(&self, path: &str) -> Result<Value, String> {
-        let directory = self.directory(&Self::parts(path, true)?)?;
-        // fdopendir takes ownership. Duplicate rather than sharing a directory offset
-        // with the anchored root descriptor (dup alone shares offsets).
-        let listing = openat(&directory, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-        use std::os::fd::IntoRawFd;
-        let raw = listing.into_raw_fd();
-        let dir = unsafe { libc::fdopendir(raw) };
-        if dir.is_null() {
-            unsafe {
-                libc::close(raw);
-            }
-            return Err(err(std::io::Error::last_os_error()));
-        }
-        struct Dir(*mut libc::DIR);
-        impl Drop for Dir {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::closedir(self.0);
-                }
-            }
-        }
-        let guard = Dir(dir);
-        let mut entries = Vec::new();
-        let mut bytes = 0;
-        loop {
-            if self.cancel.is_canceled() {
-                return Ok(unexecuted("canceled"));
-            }
-            let entry = unsafe { libc::readdir(guard.0) };
-            if entry.is_null() {
-                break;
-            }
-            let raw_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-            let name = raw_name
-                .to_str()
-                .map_err(|_| "Non-UTF8 file name is unsupported")?;
-            if matches!(name, "." | "..") || name.eq_ignore_ascii_case(".git") {
-                continue;
-            }
-            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-            if unsafe {
-                libc::fstatat(
-                    directory.as_raw_fd(),
-                    raw_name.as_ptr(),
-                    st.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } < 0
-            {
-                return Err(err(std::io::Error::last_os_error()));
-            }
-            let st = unsafe { st.assume_init() };
-            if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
-                continue;
-            }
-            let display = format!(
-                "{name}{}",
-                if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
-                    "/"
-                } else {
-                    ""
-                }
-            );
-            bytes += display.len();
-            entries.push(display);
-            if entries.len() > 500 || bytes > self.output_limit {
-                return Err("Directory listing exceeds limit; choose a narrower directory".into());
-            }
-        }
-        entries.sort();
-        Ok(json!({"entries":entries}))
-    }
-    fn read_file(&mut self, path: &str) -> Result<Value, String> {
-        let parts = Self::parts(path, false)?;
-        let parent = self.directory(&parts[..parts.len() - 1])?;
-        let (raw, info) = Self::read(&parent, parts[parts.len() - 1])?;
-        let text = std::str::from_utf8(&raw).map_err(err)?;
+    #[cfg(test)]
+    fn observe_patch_source(&mut self, path: &str) -> Result<String, String> {
+        let parts = Self::parts(path)?;
+        let (name, parent_parts) = parts.split_last().unwrap();
+        let parent = self.directory(parent_parts)?;
+        let source = Self::read(&parent, name)?;
+        let text = std::str::from_utf8(&source.bytes).map_err(err)?;
         if text.contains('\0') {
             return Err("Binary files are unsupported".into());
         }
-        let digest = hash(&raw);
+        let digest = hash(&source.bytes);
         self.patch_reads.insert(
             parts.join("/"),
-            patch::ReadEvidence::new(&parent, parts[parts.len() - 1], &info, &digest),
+            patch::ReadEvidence::new(&parent, name, &source.info, &digest),
         );
         self.seen.insert(parts.join("/"), digest.clone());
-        Ok(json!({"content":text,"sha256":digest}))
+        Ok(digest)
     }
-    fn patch(&mut self, a: &Value) -> Result<Value, String> {
-        let parts = Self::parts(a["path"].as_str().unwrap(), false)?;
-        let normalized = parts.join("/");
-        let digest = a["sha256"].as_str().unwrap();
-        if self.seen.get(&normalized).map(String::as_str) != Some(digest) {
-            return Err("Read the file first and use its current sha256".into());
-        }
-        let old = a["old_text"].as_str().unwrap();
-        let new = a["new_text"].as_str().unwrap();
-        if old.is_empty() || old == new || old.contains('\0') || new.contains('\0') {
-            return Err("Patch needs a nonempty changed span without NULs".into());
-        }
-        let parent = self.directory(&parts[..parts.len() - 1])?;
-        let name = parts[parts.len() - 1];
-        let (raw, info) = Self::read(&parent, name)?;
-        if hash(&raw) != digest {
-            return Err("File changed since read; read again".into());
-        }
-        let before = std::str::from_utf8(&raw).map_err(err)?;
-        if before.matches(old).count() != 1 {
-            return Err("old_text must match exactly once".into());
-        }
-        let after = before.replacen(old, new, 1);
-        if after.len() > 65536 {
-            return Err("Patched file exceeds 64 KiB".into());
-        }
-        if let Err(result) = ActionPlan::patch(&normalized, before, &after, old, new)
-            .approve(&mut self.approve, &self.cancel)
-        {
-            return Ok(result);
-        }
-        let fresh = self.directory(&parts[..parts.len() - 1])?;
-        if !identity(
-            &fresh.metadata().map_err(err)?,
-            &parent.metadata().map_err(err)?,
-        ) {
-            return Err("Parent directory changed during approval".into());
-        }
-        let (current, current_info) = Self::read(&parent, name)?;
-        if current != raw || !identity(&current_info, &info) {
-            return Err("File changed during approval; patch not applied".into());
-        }
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let temp_name = format!(
-            ".cognix-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let mut file = openat(
-            &parent,
-            &temp_name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-            info.mode() & 0o777,
-        )?;
-        let temporary = Temporary {
-            parent: &parent,
-            name: cstring(&temp_name)?,
-        };
-        file.set_permissions(std::fs::Permissions::from_mode(info.mode() & 0o777))
-            .map_err(err)?;
-        file.write_all(after.as_bytes()).map_err(err)?;
-        file.sync_all().map_err(err)?;
-        #[cfg(test)]
-        if let Some(h) = &mut self.hook {
-            h("before_commit");
-        }
-        if self.cancel.is_canceled() {
-            return Ok(unexecuted("canceled"));
-        }
-        let target = cstring(name)?;
-        if unsafe {
-            libc::renameat(
-                parent.as_raw_fd(),
-                temporary.name.as_ptr(),
-                parent.as_raw_fd(),
-                target.as_ptr(),
-            )
-        } < 0
-        {
-            return Err(err(std::io::Error::last_os_error()));
-        }
-        // No fallible/canceling operation between commit and ownership of evidence.
-        let digest = self.record_file_commit(&normalized, after.as_bytes());
-        self.seen.insert(normalized.clone(), digest.clone());
-        #[cfg(test)]
-        if let Some(h) = &mut self.hook {
-            h("after_commit");
-        }
-        Ok(json!({"path":normalized,"sha256":digest,"executed":true}))
-    }
-    fn creation_parent_unchanged(&self, parts: &[&str], parent: &File) -> Result<(), String> {
+    fn patch_parent_unchanged(&self, parts: &[&str], parent: &File) -> Result<(), String> {
         let root = self.root.symlink_metadata().map_err(err)?;
         if !root.is_dir() || !identity(&root, &self.root_fd.metadata().map_err(err)?) {
             return Err("Project root changed during session".into());
@@ -384,7 +263,7 @@ impl Runtime {
             &fresh.metadata().map_err(err)?,
             &parent.metadata().map_err(err)?,
         ) {
-            return Err("Parent directory changed during creation".into());
+            return Err("Parent directory changed during patch".into());
         }
         Ok(())
     }
@@ -407,49 +286,152 @@ impl Runtime {
         }
         Ok(())
     }
-    fn create_file(&mut self, args: &Value) -> Result<Value, String> {
-        let path = args["path"].as_str().unwrap();
-        let parts = Self::parts(path, false)?;
-        if matches!(path.rsplit('/').next(), Some("" | ".")) {
-            return Err("Expected a destination file name".into());
-        }
-        let normalized = parts.join("/");
-        let content = args["content"].as_str().unwrap();
-        if content.contains('\0') {
-            return Err("New file content must be UTF-8 text without NULs".into());
-        }
-        let parent_parts = &parts[..parts.len() - 1];
-        let parent = self.directory(parent_parts)?;
-        let target = cstring(parts[parts.len() - 1])?;
-        self.creation_parent_unchanged(parent_parts, &parent)?;
-        Self::destination_absent(&parent, &target)?;
-
-        if let Err(result) =
-            ActionPlan::creation(&normalized, content).approve(&mut self.approve, &self.cancel)
+    fn check_patch_target(
+        parent: &File,
+        name: &str,
+        target: &CString,
+        before: Option<&PatchSource>,
+    ) -> Result<(), String> {
+        let Some(before) = before else {
+            return Self::destination_absent(parent, target);
+        };
+        let current = Self::read(parent, name).map_err(|_| STALE_PATCH)?;
+        if current.bytes != before.bytes
+            || patch::Fingerprint::new(&current.info) != patch::Fingerprint::new(&before.info)
         {
+            return Err(STALE_PATCH.into());
+        }
+        Ok(())
+    }
+    fn publish_update(
+        &mut self,
+        temporary: &mut PatchTemporary<'_>,
+        staging: &str,
+        target: &CString,
+        before: &PatchSource,
+    ) -> Result<PatchPublication, String> {
+        let staged_info = temporary.file.metadata().map_err(err)?;
+        // Keep the entry found at the target by the syscall until it has been verified.
+        temporary.exchange(target).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                STALE_PATCH.into()
+            } else {
+                err(error)
+            }
+        })?;
+        #[cfg(test)]
+        if let Some(h) = &mut self.hook {
+            h("after_exchange");
+        }
+        let staged_fingerprint = patch::Fingerprint::new(&staged_info);
+        let staged_unchanged = |temporary: &PatchTemporary<'_>| {
+            temporary.file.metadata().is_ok_and(|info| {
+                patch::Fingerprint::new(&info).matches_after_rename(&staged_fingerprint)
+            })
+        };
+        let displaced = Self::read(temporary.parent, staging).ok().filter(|source| {
+            source.bytes == before.bytes
+                && patch::Fingerprint::new(&source.info)
+                    .matches_after_rename(&patch::Fingerprint::new(&before.info))
+                && temporary.file_at(target)
+                && staged_unchanged(temporary)
+        });
+        if let Some(displaced) = displaced {
+            // The preview keeps the original inode open, so it cannot be recycled.
+            // Cleanup now owns the verified original instead of the published file.
+            temporary.file = displaced.file;
+            return Ok(PatchPublication::Applied);
+        }
+
+        // Restore only while the target still looks like our output. Even if a
+        // second save races the swap back, exchange retains it at the staging name.
+        if temporary.file_at(target)
+            && staged_unchanged(temporary)
+            && temporary.exchange(target).is_ok()
+            && temporary.owns_name()
+            && staged_unchanged(temporary)
+        {
+            return Err(STALE_PATCH.into());
+        }
+        temporary.preserve = true;
+        Ok(PatchPublication::RecoveryRequired)
+    }
+    fn record_patch_effect(&mut self, path: &str) {
+        self.modified.insert(path.to_owned());
+        self.seen.remove(path);
+        self.patch_reads.remove(path);
+    }
+    fn patch(&mut self, args: &Value) -> Result<Value, String> {
+        let parts = Self::parts(args["path"].as_str().unwrap())?;
+        let normalized = parts.join("/");
+        let (name, parent_parts) = parts.split_last().unwrap();
+        let parent = self.directory(parent_parts)?;
+        let target = cstring(name)?;
+        let new = args["new_text"].as_str().unwrap();
+        self.patch_parent_unchanged(parent_parts, &parent)?;
+
+        let (before, after, plan) = if let Some(old) = args["old_text"].as_str() {
+            if old == new {
+                return Err("Patch must change the file content".into());
+            }
+            let snapshot = Self::read(&parent, name)?;
+            let text = std::str::from_utf8(&snapshot.bytes).map_err(err)?;
+            if text.contains('\0') {
+                return Err("Binary files are unsupported".into());
+            }
+            let mut after = text.to_owned();
+            if old.is_empty() && text.is_empty() {
+                after.push_str(new);
+            } else {
+                let mismatch =
+                    "old_text must match exactly once (use empty text only for an empty file)";
+                let first = old.chars().next().ok_or(mismatch)?;
+                let start = text.find(old).ok_or(mismatch)?;
+                if text[start + first.len_utf8()..].contains(old) {
+                    return Err(mismatch.into());
+                }
+                after.replace_range(start..start + old.len(), new);
+            }
+            if after.len() > schema::PATCH_FILE_BYTES {
+                return Err("Patched file exceeds 64 KiB".into());
+            }
+            let plan = ActionPlan::patch(&normalized, text, &after, old, new);
+            (Some(snapshot), after, plan)
+        } else {
+            Self::destination_absent(&parent, &target)?;
+            (None, new.to_owned(), ActionPlan::creation(&normalized, new))
+        };
+        if let Err(result) = plan.approve(&mut self.approve, &self.cancel) {
             return Ok(result);
         }
-        self.creation_parent_unchanged(parent_parts, &parent)?;
-        Self::destination_absent(&parent, &target)?;
+        self.patch_parent_unchanged(parent_parts, &parent)?;
+        Self::check_patch_target(&parent, name, &target, before.as_ref())?;
 
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let name = format!(
-            ".cognix-create-{}-{}",
+        let staging = format!(
+            ".cognix-patch-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let file = openat(
             &parent,
-            &name,
+            &staging,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             0o600,
         )?;
-        let mut temporary = CreationTemporary {
+        let mut temporary = PatchTemporary {
             parent: &parent,
-            name: cstring(&name)?,
+            name: cstring(&staging)?,
             file,
+            preserve: false,
         };
-        temporary.file.write_all(content.as_bytes()).map_err(err)?;
+        temporary.file.write_all(after.as_bytes()).map_err(err)?;
+        if let Some(source) = &before {
+            temporary
+                .file
+                .set_permissions(std::fs::Permissions::from_mode(source.info.mode() & 0o777))
+                .map_err(err)?;
+        }
         temporary.file.sync_all().map_err(err)?;
         #[cfg(test)]
         if let Some(h) = &mut self.hook {
@@ -458,36 +440,51 @@ impl Runtime {
         if self.cancel.is_canceled() {
             return Ok(json!({"status":"canceled","path":normalized,"executed":false}));
         }
-        self.creation_parent_unchanged(parent_parts, &parent)?;
+        self.patch_parent_unchanged(parent_parts, &parent)?;
         if !temporary.owns_name() || temporary.file.metadata().map_err(err)?.nlink() != 1 {
-            return Err("Creation staging file changed before commit".into());
+            return Err("Patch staging file changed before commit".into());
         }
-        // linkat publishes the fully written inode atomically and fails with
-        // EEXIST for *every* existing destination, including dangling symlinks.
-        // The earlier absence checks are only for feedback, never exclusivity.
-        if unsafe {
-            libc::linkat(
-                parent.as_raw_fd(),
-                temporary.name.as_ptr(),
-                parent.as_raw_fd(),
-                target.as_ptr(),
-                0,
-            )
-        } < 0
-        {
-            return Err(err(std::io::Error::last_os_error()));
+        Self::check_patch_target(&parent, name, &target, before.as_ref())?;
+        if self.cancel.is_canceled() {
+            return Ok(json!({"status":"canceled","path":normalized,"executed":false}));
         }
-        // No fallible/canceling operation between publish and evidence ownership.
-        let digest = self.record_file_commit(&normalized, content.as_bytes());
-        // Keep apply_patch's read-first contract, including stale observations
-        // of a previous file that an external editor removed at this path.
-        self.seen.remove(&normalized);
+        #[cfg(test)]
+        if let Some(h) = &mut self.hook {
+            h("before_publish");
+        }
+
+        let publication = if let Some(before) = &before {
+            self.publish_update(&mut temporary, &staging, &target, before)?
+        } else {
+            let fd = parent.as_raw_fd();
+            // linkat enforces destination absence, including dangling links.
+            if unsafe { libc::linkat(fd, temporary.name.as_ptr(), fd, target.as_ptr(), 0) } < 0 {
+                return Err(err(std::io::Error::last_os_error()));
+            }
+            PatchPublication::Applied
+        };
+        // Own the evidence before cleanup or reporting cancellation.
+        self.record_patch_effect(&normalized);
+        if let PatchPublication::RecoveryRequired = publication {
+            // Both names were affected by the exchange and require inspection.
+            let recovery_path = Path::new(&normalized).with_file_name(&staging);
+            let recovery_path = recovery_path.to_str().unwrap();
+            self.record_patch_effect(recovery_path);
+            return Ok(json!({
+                "status": "partial",
+                "executed": true,
+                "path": normalized,
+                "recovery_path": recovery_path,
+                "error": "File changed after preview and the patch could not be fully rolled back. Inspect the target and recovery paths before retrying."
+            }));
+        }
+        let digest = hash(after.as_bytes());
         drop(temporary);
         #[cfg(test)]
         if let Some(h) = &mut self.hook {
             h("after_commit");
         }
-        Ok(json!({"path":normalized,"sha256":digest,"bytes":content.len(),"executed":true}))
+        Ok(json!({"path":normalized,"sha256":digest,"bytes":after.len(),"executed":true}))
     }
     fn run_command(&mut self, args: &Value) -> Result<Value, String> {
         let argv = schema::argv(&args["argv"])?;
@@ -497,13 +494,14 @@ impl Runtime {
             );
         }
         let prepared = commands::PreparedCommand::new(&argv)?;
-        if let Err(result) = ActionPlan::command(&argv, prepared.executable())
-            .approve(&mut self.approve, &self.cancel)
+        if let Err(result) =
+            ActionPlan::command(&argv, prepared.invocation(), prepared.executable())
+                .approve(&mut self.approve, &self.cancel)
         {
             return Ok(result);
         }
         if !identity(
-            &self.root.metadata().map_err(err)?,
+            &self.root.symlink_metadata().map_err(err)?,
             &self.root_fd.metadata().map_err(err)?,
         ) {
             return Err("Project root changed during session".into());
@@ -515,13 +513,6 @@ impl Runtime {
             self.timeout,
             self.output_limit,
         )
-    }
-    // Called immediately after publication, before cleanup/hooks/cancellation.
-    // Read-first bookkeeping stays with each operation: patches update seen,
-    // while creation invalidates even a stale observation of a removed file.
-    fn record_file_commit(&mut self, path: &str, content: &[u8]) -> String {
-        self.modified.insert(path.to_owned());
-        hash(content)
     }
     pub(crate) fn record_result(
         &mut self,
@@ -539,10 +530,7 @@ impl Runtime {
             Ok(unexecuted("canceled"))
         } else {
             schema::validate(name, &args).and_then(|()| match name {
-                "list_files" => self.list(args["path"].as_str().unwrap()),
-                "read_file" => self.read_file(args["path"].as_str().unwrap()),
                 "apply_patch" => self.patch(&args),
-                "create_file" => self.create_file(&args),
                 "run_command" => self.run_command(&args),
                 _ => Err("Unknown tool".into()),
             })

@@ -10,6 +10,12 @@ implemented. V2 remains unavailable to models and has no executor or CLI mode;
 the validation record in that guide includes native planning with source metadata
 observations and execution constraints. Later milestones remain future work.
 
+[Issue #28](https://github.com/takahirox/cognix/issues/28) introduced the current
+`run_command` and `apply_patch` contracts, retiring the standalone listing,
+reading, and creation tools. See the [implementation guide](implementation.md)
+for the shipped interface. The five-tool baseline and proposed v2 roadmap below
+record the design before that change.
+
 ## Decision and boundaries
 
 Prioritize a small set of composable tools: general `apply_patch` for reviewed
@@ -35,7 +41,7 @@ Desktop UI, MCP, multiple agents, Linux sandbox implementation, automatic Git
 commits and cloud inference are outside this work. Normal inference remains
 local Ollama, without automatic model/provider fallback or downloads.
 
-## Current implementation and its limits
+## Five-tool baseline and its limits
 
 This analysis began with the source inherited from `ff984a9` and reflects the
 runtime command approval policy from Issue #26. The
@@ -43,7 +49,7 @@ runtime command approval policy from Issue #26. The
 [MVP specification](mvp.md#f4--minimal-tools) preserves the original four-tool
 scope and the later creation extension.
 
-| Tool in [schema.rs](../src/schema.rs) | Actual capability | Constraint and evidence |
+| Tool before Issue #28 | Capability | Constraint and evidence |
 | --- | --- | --- |
 | `list_files(path)` | Sorted, single-directory listing; `.` selects root. | Omits symlinks and case-insensitive `.git`; at most 500 entries and the output byte limit. No recursive search. |
 | `read_file(path)` | Reads a regular, single-hard-link UTF-8 file without NULs, at most 64 KiB. | Returns content and SHA-256; records the normalized path/hash in the runtime's seen map. No binary or large-file editing. |
