@@ -214,3 +214,82 @@ fn patch_rechecks_bytes_and_identity_at_publication() {
         );
     }
 }
+
+#[test]
+fn patch_preserves_editor_save_after_final_check() {
+    let t = tempfile::tempdir().unwrap();
+    let file = t.path().join("file");
+    let save = t.path().join("editor-save");
+    std::fs::write(&file, "before").unwrap();
+    std::fs::write(&save, "concurrent editor content").unwrap();
+    let saved_inode = std::fs::metadata(&save).unwrap().ino();
+    let mut runtime =
+        Runtime::new(t.path(), Box::new(|_, _| true), Cancellation::default()).unwrap();
+    let target = file.clone();
+    runtime.hook = Some(Box::new(move |phase| {
+        if phase == "before_publish" {
+            std::fs::rename(&save, &target).unwrap();
+        }
+    }));
+
+    let result = runtime.execute(
+        "apply_patch",
+        json!({"path":"file","old_text":"before","new_text":"after"}),
+    );
+    assert_eq!(result["status"], "failed", "{result}");
+    assert_eq!(result["executed"], false);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("changed after preview")
+    );
+    assert!(runtime.modified.is_empty());
+    assert_eq!(runtime.events.last().unwrap()["result"], result);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "concurrent editor content"
+    );
+    assert_eq!(std::fs::metadata(&file).unwrap().ino(), saved_inode);
+    assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn patch_preserves_both_saves_when_a_later_save_prevents_restoration() {
+    let t = tempfile::tempdir().unwrap();
+    let target = t.path().join("file");
+    let first = t.path().join("first-save");
+    let second = t.path().join("second-save");
+    std::fs::write(&target, "before").unwrap();
+    std::fs::write(&first, "first save").unwrap();
+    std::fs::write(&second, "second save").unwrap();
+    let mut runtime =
+        Runtime::new(t.path(), Box::new(|_, _| true), Cancellation::default()).unwrap();
+    let file = target.clone();
+    runtime.hook = Some(Box::new(move |phase| match phase {
+        "before_publish" => std::fs::rename(&first, &file).unwrap(),
+        "after_exchange" => std::fs::rename(&second, &file).unwrap(),
+        _ => (),
+    }));
+
+    let result = runtime.execute(
+        "apply_patch",
+        json!({"path":"file","old_text":"before","new_text":"after"}),
+    );
+    assert_eq!(result["status"], "failed", "{result}");
+    assert_eq!(result["executed"], false);
+    assert!(runtime.modified.is_empty());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "second save");
+    let preserved = std::fs::read_dir(t.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path != &target)
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&preserved).unwrap(), "first save");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains(preserved.file_name().unwrap().to_str().unwrap())
+    );
+}

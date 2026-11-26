@@ -358,6 +358,12 @@ impl Fingerprint {
             changed: (m.ctime(), m.ctime_nsec()),
         }
     }
+
+    pub(super) fn matches_after_rename(mut self, before: &Self) -> bool {
+        // The exchange itself can update inode change time.
+        self.changed = before.changed;
+        self == *before
+    }
 }
 #[derive(Debug, Clone)]
 pub(super) struct ReadEvidence {

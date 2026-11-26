@@ -80,13 +80,16 @@ After approval and immediately before publication, Cognix rechecks the root
 and parent identities, the update's original bytes and file fingerprint, or
 the creation's expected absence. Staging uses descriptor-relative
 `openat(O_CREAT | O_EXCL | O_NOFOLLOW)`. Content is written and synced before
-publication. Updates use `renameat` and creations use exclusive `linkat`, which
-refuses a concurrently created destination. A new file has mode 0600, subject to
-umask. Staging cleanup checks the name still belongs to its original inode.
+publication. Updates atomically exchange the staged and destination files,
+then verify the displaced file before committing. A concurrent save causes a
+conflict and is restored when possible. If a further change prevents safe
+restoration, Cognix reports where to find the preserved entry. Creations use
+exclusive `linkat`, which refuses a concurrently created destination. A new
+file has mode 0600, subject to umask. Staging cleanup checks inode ownership.
 
 Success returns `status: "ok"`, `executed: true`, normalized `path`, `sha256`,
 and `bytes`. The hash is result evidence. Denial, failure, or cancellation before
-publication returns `executed: false`. If interrupted after publication, the
+commit returns `executed: false`. If interrupted after commit, the
 modified path and hash remain recorded with `executed: true` and
 `status: "canceled"`.
 
@@ -190,8 +193,8 @@ Terminal control and invisible Unicode formatting characters are escaped in
 tool output, paths and diffs.
 
 A process-wide Ctrl-C handler only sets an atomic cancellation flag. Rust
-control flow is never unwound by SIGINT, including command spawn/cleanup and
-the patch's atomic rename/bookkeeping and creation's atomic publish/bookkeeping.
+control flow is never unwound by SIGINT, including command spawn/cleanup,
+patch exchange and verification, and creation's atomic publish/bookkeeping.
 Cancellation checks stop new actions
 while ownership and evidence updates complete. A launched command is killed
 and reaped and remains recorded as executed. An

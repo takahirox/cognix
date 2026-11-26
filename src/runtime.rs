@@ -74,14 +74,28 @@ fn openat(parent: &File, name: &str, flags: i32, mode: u32) -> Result<File, Stri
 fn identity(a: &Metadata, b: &Metadata) -> bool {
     a.ino() == b.ino() && a.dev() == b.dev()
 }
+const STALE_PATCH: &str =
+    "File changed after preview. Prepare a new patch against the current file";
+
+struct PatchSource {
+    file: File,
+    bytes: Vec<u8>,
+    info: Metadata,
+}
+
 // Own both the inode and its staging name so cleanup can check identity.
 struct PatchTemporary<'a> {
     parent: &'a File,
     name: CString,
     file: File,
+    preserve: bool,
 }
 impl PatchTemporary<'_> {
     fn owns_name(&self) -> bool {
+        self.file_at(&self.name)
+    }
+
+    fn file_at(&self, name: &CString) -> bool {
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
         let Ok(info) = self.file.metadata() else {
             return false;
@@ -90,7 +104,7 @@ impl PatchTemporary<'_> {
         if unsafe {
             libc::fstatat(
                 self.parent.as_raw_fd(),
-                self.name.as_ptr(),
+                name.as_ptr(),
                 st.as_mut_ptr(),
                 libc::AT_SYMLINK_NOFOLLOW,
             )
@@ -104,10 +118,33 @@ impl PatchTemporary<'_> {
         let device = st.st_dev as u64;
         device == info.dev() && st.st_ino == info.ino()
     }
+
+    fn exchange(&self, target: &CString) -> std::io::Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let fd = self.parent.as_raw_fd();
+            #[cfg(target_os = "macos")]
+            let (rename, flag) = (libc::renameatx_np, libc::RENAME_SWAP);
+            #[cfg(target_os = "linux")]
+            let (rename, flag) = (libc::renameat2, libc::RENAME_EXCHANGE);
+            // SAFETY: both names are NUL-terminated and relative to a live directory fd.
+            let result = unsafe { rename(fd, self.name.as_ptr(), fd, target.as_ptr(), flag) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("Atomic patch update is unavailable for {target:?}"),
+        ))
+    }
 }
 impl Drop for PatchTemporary<'_> {
     fn drop(&mut self) {
-        if self.owns_name() {
+        if !self.preserve && self.owns_name() {
             unsafe {
                 libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0);
             }
@@ -166,7 +203,7 @@ impl Runtime {
         }
         Ok(fd)
     }
-    fn read(parent: &File, name: &str) -> Result<(Vec<u8>, Metadata), String> {
+    fn read(parent: &File, name: &str) -> Result<PatchSource, String> {
         let file = openat(parent, name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
         let info = file.metadata().map_err(err)?;
         if !info.is_file() || info.nlink() != 1 {
@@ -187,22 +224,26 @@ impl Runtime {
         {
             return Err("File changed while reading".into());
         }
-        Ok((raw, info))
+        Ok(PatchSource {
+            file,
+            bytes: raw,
+            info,
+        })
     }
     #[cfg(test)]
     fn observe_patch_source(&mut self, path: &str) -> Result<String, String> {
         let parts = Self::parts(path)?;
         let (name, parent_parts) = parts.split_last().unwrap();
         let parent = self.directory(parent_parts)?;
-        let (raw, info) = Self::read(&parent, name)?;
-        let text = std::str::from_utf8(&raw).map_err(err)?;
+        let source = Self::read(&parent, name)?;
+        let text = std::str::from_utf8(&source.bytes).map_err(err)?;
         if text.contains('\0') {
             return Err("Binary files are unsupported".into());
         }
-        let digest = hash(&raw);
+        let digest = hash(&source.bytes);
         self.patch_reads.insert(
             parts.join("/"),
-            patch::ReadEvidence::new(&parent, name, &info, &digest),
+            patch::ReadEvidence::new(&parent, name, &source.info, &digest),
         );
         self.seen.insert(parts.join("/"), digest.clone());
         Ok(digest)
@@ -244,19 +285,73 @@ impl Runtime {
         parent: &File,
         name: &str,
         target: &CString,
-        before: Option<&(Vec<u8>, Metadata)>,
+        before: Option<&PatchSource>,
     ) -> Result<(), String> {
-        let Some((raw, info)) = before else {
+        let Some(before) = before else {
             return Self::destination_absent(parent, target);
         };
-        let changed = "File changed after preview. Prepare a new patch against the current file";
-        let (current, current_info) = Self::read(parent, name).map_err(|_| changed)?;
-        if current != *raw
-            || patch::Fingerprint::new(&current_info) != patch::Fingerprint::new(info)
+        let current = Self::read(parent, name).map_err(|_| STALE_PATCH)?;
+        if current.bytes != before.bytes
+            || patch::Fingerprint::new(&current.info) != patch::Fingerprint::new(&before.info)
         {
-            return Err(changed.into());
+            return Err(STALE_PATCH.into());
         }
         Ok(())
+    }
+    fn publish_update(
+        &mut self,
+        temporary: &mut PatchTemporary<'_>,
+        staging: &str,
+        target: &CString,
+        before: &PatchSource,
+    ) -> Result<(), String> {
+        let staged_info = temporary.file.metadata().map_err(err)?;
+        // Keep the entry found at the target by the syscall until it has been verified.
+        temporary.exchange(target).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                STALE_PATCH.into()
+            } else {
+                err(error)
+            }
+        })?;
+        #[cfg(test)]
+        if let Some(h) = &mut self.hook {
+            h("after_exchange");
+        }
+        let staged_fingerprint = patch::Fingerprint::new(&staged_info);
+        let staged_unchanged = |temporary: &PatchTemporary<'_>| {
+            temporary.file.metadata().is_ok_and(|info| {
+                patch::Fingerprint::new(&info).matches_after_rename(&staged_fingerprint)
+            })
+        };
+        let displaced = Self::read(temporary.parent, staging).ok().filter(|source| {
+            source.bytes == before.bytes
+                && patch::Fingerprint::new(&source.info)
+                    .matches_after_rename(&patch::Fingerprint::new(&before.info))
+                && temporary.file_at(target)
+                && staged_unchanged(temporary)
+        });
+        if let Some(displaced) = displaced {
+            // The preview keeps the original inode open, so it cannot be recycled.
+            // Cleanup now owns the verified original instead of the published file.
+            temporary.file = displaced.file;
+            return Ok(());
+        }
+
+        // Restore only while the target still looks like our output. Even if a
+        // second save races the swap back, exchange retains it at the staging name.
+        if temporary.file_at(target)
+            && staged_unchanged(temporary)
+            && temporary.exchange(target).is_ok()
+            && temporary.owns_name()
+            && staged_unchanged(temporary)
+        {
+            return Err(STALE_PATCH.into());
+        }
+        temporary.preserve = true;
+        Err(format!(
+            "{STALE_PATCH}. Inspect the preserved entry {staging:?} beside the patch target"
+        ))
     }
     fn patch(&mut self, args: &Value) -> Result<Value, String> {
         let parts = Self::parts(args["path"].as_str().unwrap())?;
@@ -272,7 +367,7 @@ impl Runtime {
                 return Err("Patch must change the file content".into());
             }
             let snapshot = Self::read(&parent, name)?;
-            let text = std::str::from_utf8(&snapshot.0).map_err(err)?;
+            let text = std::str::from_utf8(&snapshot.bytes).map_err(err)?;
             if text.contains('\0') {
                 return Err("Binary files are unsupported".into());
             }
@@ -320,12 +415,13 @@ impl Runtime {
             parent: &parent,
             name: cstring(&staging)?,
             file,
+            preserve: false,
         };
         temporary.file.write_all(after.as_bytes()).map_err(err)?;
-        if let Some((_, info)) = &before {
+        if let Some(source) = &before {
             temporary
                 .file
-                .set_permissions(std::fs::Permissions::from_mode(info.mode() & 0o777))
+                .set_permissions(std::fs::Permissions::from_mode(source.info.mode() & 0o777))
                 .map_err(err)?;
         }
         temporary.file.sync_all().map_err(err)?;
@@ -344,19 +440,19 @@ impl Runtime {
         if self.cancel.is_canceled() {
             return Ok(json!({"status":"canceled","path":normalized,"executed":false}));
         }
+        #[cfg(test)]
+        if let Some(h) = &mut self.hook {
+            h("before_publish");
+        }
 
-        let fd = parent.as_raw_fd();
-        // Both operations publish complete contents at once. linkat also
-        // enforces destination absence at the syscall, including dangling links.
-        let result = unsafe {
-            if before.is_some() {
-                libc::renameat(fd, temporary.name.as_ptr(), fd, target.as_ptr())
-            } else {
-                libc::linkat(fd, temporary.name.as_ptr(), fd, target.as_ptr(), 0)
+        if let Some(before) = &before {
+            self.publish_update(&mut temporary, &staging, &target, before)?;
+        } else {
+            let fd = parent.as_raw_fd();
+            // linkat enforces destination absence, including dangling links.
+            if unsafe { libc::linkat(fd, temporary.name.as_ptr(), fd, target.as_ptr(), 0) } < 0 {
+                return Err(err(std::io::Error::last_os_error()));
             }
-        };
-        if result < 0 {
-            return Err(err(std::io::Error::last_os_error()));
         }
         // Own the evidence before cleanup or reporting cancellation.
         self.modified.insert(normalized.clone());
