@@ -14,7 +14,7 @@ async fn readiness_and_native_roundtrip() {
     let server = Server::new(|p, b| {
         if p == "/api/chat" && b["messages"][0]["content"] == "inspect" {
             Reply::json(
-                json!({"done":true,"message":{"role":"assistant","content":"","thinking":"thought","tool_calls":[{"id":"native","function":{"name":"read_file","arguments":{"path":"file"}}}]}}),
+                json!({"done":true,"message":{"role":"assistant","content":"","thinking":"thought","tool_calls":[{"id":"native","function":{"name":"run_command","arguments":{"argv":["cat","file"]}}}]}}),
             )
         } else {
             ready(p, b)
@@ -39,14 +39,13 @@ async fn readiness_and_native_roundtrip() {
     assert_eq!(body["model"], "deepseek-local:test");
     assert_eq!(body["options"]["num_ctx"], 16384);
     assert_eq!(body["stream"], false);
-    assert_eq!(body["tools"].as_array().unwrap().len(), 5);
-    assert!(
-        body["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool["function"]["name"] == "create_file")
-    );
+    let names: Vec<_> = body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["apply_patch", "run_command"]);
 }
 #[tokio::test]
 async fn unsupported_cloud_missing_and_behavior_failures() {

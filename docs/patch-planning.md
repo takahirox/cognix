@@ -26,14 +26,11 @@ case/canonical-equivalent targets and file/directory prefix dependencies.
 
 `Runtime::prepare_v2(&PatchIntent) -> Result<PatchPlan, PatchError>` performs
 read-only filesystem inspection and exact original-byte edit matching. It takes
-`&self`, records no events and changes neither the legacy read map nor the modified
-file ledger. `read_file` now also records private source identity/metadata evidence
-alongside its existing hash, without changing its result or acceptance policy.
-An externally populated legacy `seen` map cannot manufacture v2 read evidence.
-A best-effort descriptor capture adds metadata observations to the read evidence;
-if its identity changes or reopening fails, v2 requires another read while the
-legacy result remains unchanged. Re-read after legacy mutations before attempting
-v2 preparation.
+`&self` and records no events or changes to source observations or modified files.
+Planner tests capture source bytes, hash, identity, and metadata through an
+internal observation helper. Failed or raced observations cannot authorize a
+plan. Issue #28 retired the model-facing `read_file` tool. The model-facing
+`apply_patch` uses its own snapshots and approval flow.
 
 Errors expose a `reason`, `location` (field/index or affected path) and sanitized
 `detail`. Reasons distinguish JSON syntax, closed shape/type, version, limit,

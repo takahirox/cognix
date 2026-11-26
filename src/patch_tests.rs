@@ -26,9 +26,7 @@ fn add(path: &str, content: &str) -> Value {
     json!({"op":"add","path":path,"content":content})
 }
 fn read(r: &mut Runtime, path: &str) -> String {
-    let result = r.execute("read_file", json!({"path":path}));
-    assert_eq!(result["status"], "ok", "{result}");
-    result["sha256"].as_str().unwrap().into()
+    r.observe_patch_source(path).unwrap()
 }
 fn update(path: &str, digest: &str, edits: Value) -> Value {
     json!({"op":"update","path":path,"sha256":digest,"edits":edits})
@@ -693,7 +691,7 @@ fn real_filesystem_refusals_have_no_effects() {
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
     let digest = hash(b"x");
     for path in ["source", "hard", "fifo", "dir", "dangling"] {
-        assert_ne!(r.execute("read_file", json!({"path":path}))["status"], "ok");
+        assert!(r.observe_patch_source(path).is_err());
     }
     for path in [
         "source",
@@ -943,8 +941,7 @@ fn source_special_mode_is_observed_and_invalid_text_fails_closed() {
         ("oversize", vec![b'x'; FILE_BYTES + 1]),
     ] {
         fs::write(t.path().join(path), &bytes).unwrap();
-        let result = r.execute("read_file", json!({"path":path}));
-        assert_eq!(result["status"], "failed");
+        assert!(r.observe_patch_source(path).is_err());
         assert!(
             r.prepare_v2(&intent(
                 json!([{"op":"delete","path":path,"sha256":hash(&bytes)}])

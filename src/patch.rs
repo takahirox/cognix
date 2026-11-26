@@ -335,7 +335,7 @@ impl Identity {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct Fingerprint {
+pub(super) struct Fingerprint {
     identity: Identity,
     mode: u32,
     uid: u32,
@@ -346,7 +346,7 @@ struct Fingerprint {
     changed: (i64, i64),
 }
 impl Fingerprint {
-    fn new(m: &Metadata) -> Self {
+    pub(super) fn new(m: &Metadata) -> Self {
         Self {
             identity: Identity::new(m),
             mode: m.mode(),
@@ -367,7 +367,7 @@ pub(super) struct ReadEvidence {
 }
 impl ReadEvidence {
     pub(super) fn new(parent: &File, name: &str, m: &Metadata, sha256: &str) -> Self {
-        // Additional v2 evidence must never change legacy read_file acceptance.
+        // An internal observation needs both file identity and metadata.
         // A raced or failed descriptor capture leaves v2 evidence unavailable.
         let state = Fingerprint::new(m);
         let metadata = (|| {

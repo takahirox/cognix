@@ -1,3 +1,5 @@
+#[cfg(not(target_os = "macos"))]
+use cognix::commands::sandbox_argv;
 use cognix::{
     Cancellation,
     commands::{parse_command, run},
@@ -30,7 +32,8 @@ fn invalid_command_policy() {
         "[]",
         "{}",
         "[2]",
-        "[\"python\"]",
+        "[\"cognix-test-missing-command\"]",
+        "[\"./cat\"]",
         "[\"/missing\"]",
         "[\"/bin/sh\",\"\"]",
     ] {
@@ -39,6 +42,10 @@ fn invalid_command_policy() {
     assert_eq!(
         parse_command("[\"/bin/sh\",\"-c\",\"echo x\"]").unwrap(),
         vec!["/bin/sh", "-c", "echo x"]
+    );
+    assert_eq!(
+        parse_command("[\"cat\",\"main.py\"]").unwrap(),
+        ["cat", "main.py"]
     );
 }
 #[cfg(not(target_os = "macos"))]

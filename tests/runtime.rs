@@ -1,7 +1,4 @@
-use cognix::{
-    Cancellation,
-    runtime::{Runtime, hash},
-};
+use cognix::{Cancellation, runtime::Runtime};
 use serde_json::{Value, json};
 use std::{cell::RefCell, fs, os::unix::fs::symlink, rc::Rc};
 
@@ -17,8 +14,7 @@ fn setup() -> (tempfile::TempDir, Runtime) {
     (temp, runtime)
 }
 fn edit(r: &mut Runtime, overrides: Value) -> Value {
-    let read = r.execute("read_file", json!({"path":"main.py"}));
-    let mut a = json!({"path":"main.py","sha256":read["sha256"],"old_text":"return a / b","new_text":"return a / b if b else None"});
+    let mut a = json!({"path":"main.py","old_text":"return a / b","new_text":"return a / b if b else None"});
     for (k, v) in overrides.as_object().unwrap() {
         a[k] = v.clone();
     }
@@ -28,19 +24,6 @@ fn edit(r: &mut Runtime, overrides: Value) -> Value {
 fn preview_and_unrelated_changes() {
     let (t, mut r) = setup();
     fs::write(t.path().join("unrelated"), "uncommitted").unwrap();
-    assert!(
-        r.execute("list_files", json!({"path":"."}))["entries"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("main.py"))
-    );
-    // Repeated root listing must not share a consumed directory offset.
-    assert!(
-        r.execute("list_files", json!({"path":"."}))["entries"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("main.py"))
-    );
     let path = t.path().join("main.py");
     r.approve = Box::new(move |kind, preview| {
         assert_eq!(kind, "patch");
@@ -90,14 +73,19 @@ fn concurrent_edit_and_parent_swap_are_preserved() {
     );
     fs::create_dir(t.path().join("dir")).unwrap();
     fs::write(t.path().join("dir/file"), "before").unwrap();
-    let read = r.execute("read_file", json!({"path":"dir/file"}));
     let root = t.path().to_owned();
     r.approve = Box::new(move |_, _| {
         fs::rename(root.join("dir"), root.join("old")).unwrap();
         symlink(root.join("old"), root.join("dir")).unwrap();
         true
     });
-    assert_eq!(r.execute("apply_patch",json!({"path":"dir/file","sha256":read["sha256"],"old_text":"before","new_text":"after"}))["status"],"failed");
+    assert_eq!(
+        r.execute(
+            "apply_patch",
+            json!({"path":"dir/file","old_text":"before","new_text":"after"})
+        )["status"],
+        "failed"
+    );
     assert_eq!(
         fs::read_to_string(t.path().join("old/file")).unwrap(),
         "before"
@@ -113,12 +101,17 @@ fn root_symlink_hardlink_and_git_boundaries() {
     symlink(outside.path(), t.path().join("linkdir")).unwrap();
     fs::hard_link(&target, t.path().join("hardlink")).unwrap();
     fs::create_dir(t.path().join(".git")).unwrap();
-    fs::write(t.path().join(".git/config"), "git config").unwrap();
+    fs::write(t.path().join(".git/config"), "outside").unwrap();
     fs::create_dir(t.path().join("nested")).unwrap();
-    fs::write(t.path().join("nested/.GiT"), "gitdir: elsewhere").unwrap();
+    fs::write(t.path().join("nested/.GiT"), "outside").unwrap();
+    let traversal = format!(
+        "../{}/secret",
+        outside.path().file_name().unwrap().to_str().unwrap()
+    );
+    r.approve = Box::new(|_, _| panic!("Unsafe path must not reach approval"));
     for p in [
         target.to_str().unwrap(),
-        "../secret",
+        &traversal,
         "a/../../secret",
         "escape",
         "linkdir/secret",
@@ -127,28 +120,12 @@ fn root_symlink_hardlink_and_git_boundaries() {
         ".GIT/config",
         "nested/.GiT",
     ] {
-        assert_eq!(
-            r.execute("read_file", json!({"path":p}))["status"],
-            "failed",
-            "{p}"
+        let result = r.execute(
+            "apply_patch",
+            json!({"path":p,"old_text":"outside","new_text":"bad"}),
         );
+        assert_eq!(result["status"], "failed", "{p}: {result}");
     }
-    for p in [".git/config", ".GIT/config", "nested/.GiT"] {
-        r.seen.insert(p.into(), hash(b"git config"));
-        assert_eq!(r.execute("apply_patch",json!({"path":p,"sha256":hash(b"git config"),"old_text":"git config","new_text":"bad"}))["status"],"failed");
-        assert_eq!(
-            r.execute("list_files", json!({"path":p}))["status"],
-            "failed"
-        );
-    }
-    assert_eq!(
-        r.execute("list_files", json!({"path":"linkdir"}))["status"],
-        "failed"
-    );
-    let list = r.execute("list_files", json!({"path":"."}));
-    let entries = list["entries"].as_array().unwrap();
-    assert!(!entries.contains(&json!("escape")));
-    assert!(!entries.contains(&json!(".git/")));
     assert_eq!(fs::read_to_string(target).unwrap(), "outside");
 }
 #[test]
@@ -156,9 +133,13 @@ fn invalid_schema_and_file_types() {
     let (t, mut r) = setup();
     for (n, a) in [
         ("unknown", json!({})),
-        ("read_file", json!({})),
-        ("read_file", json!({"path":2})),
-        ("list_files", json!({"path":".","extra":true})),
+        ("list_files", json!({"path":"."})),
+        ("read_file", json!({"path":"main.py"})),
+        ("create_file", json!({"path":"new","content":"text"})),
+        (
+            "apply_patch",
+            json!({"path":2,"old_text":null,"new_text":"text"}),
+        ),
         ("run_command", json!({"argv":"sh"})),
         ("run_command", json!({"argv":[]})),
         ("run_command", json!({"argv":["x\0y"]})),
@@ -166,27 +147,33 @@ fn invalid_schema_and_file_types() {
     ] {
         assert_ne!(r.execute(n, a)["status"], "ok");
     }
-    for (name, data) in [
-        ("large", vec![b'x'; 65537]),
-        ("binary", vec![0]),
-        ("bad_utf8", vec![255]),
+    for (name, data, detail) in [
+        ("large", vec![b'x'; 65537], "exceeds 64 KiB"),
+        ("binary", vec![0], "Binary files"),
+        ("bad_utf8", vec![255], "invalid utf-8"),
     ] {
         fs::write(t.path().join(name), data).unwrap();
-        assert_eq!(
-            r.execute("read_file", json!({"path":name}))["status"],
-            "failed"
+        let result = edit(&mut r, json!({"path":name}));
+        assert_eq!(result["status"], "failed");
+        assert!(
+            result["error"].as_str().unwrap().contains(detail),
+            "{result}"
         );
     }
     let fifo = std::ffi::CString::new(t.path().join("fifo").to_str().unwrap()).unwrap();
     unsafe {
         assert_eq!(libc::mkfifo(fifo.as_ptr(), 0o600), 0);
     }
-    assert_eq!(
-        r.execute("read_file", json!({"path":"fifo"}))["status"],
-        "failed"
+    let result = edit(&mut r, json!({"path":"fifo"}));
+    assert_eq!(result["status"], "failed");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("Only regular files")
     );
     assert!(
-        r.execute("read_file", json!({"path":"missing"}))["error"]
+        edit(&mut r, json!({"path":"missing"}))["error"]
             .as_str()
             .unwrap()
             .contains("No such file")
@@ -210,38 +197,29 @@ fn patch_preconditions_staleness_and_bounds() {
     ] {
         assert_eq!(edit(&mut r, a)["status"], "failed");
     }
-    fs::write(t.path().join("main.py"), "repeat repeat").unwrap();
-    assert_eq!(
-        edit(&mut r, json!({"old_text":"repeat"}))["status"],
-        "failed"
-    );
+    fs::write(t.path().join("main.py"), "あああ").unwrap();
+    assert_eq!(edit(&mut r, json!({"old_text":"ああ"}))["status"], "failed");
     assert_eq!(*previews.borrow(), 0);
-    let read = r.execute("read_file", json!({"path":"main.py"}));
-    fs::write(t.path().join("main.py"), "user edit").unwrap();
-    assert_eq!(r.execute("apply_patch",json!({"path":"main.py","sha256":read["sha256"],"old_text":"user edit","new_text":"lost"}))["status"],"failed");
-}
-#[test]
-fn directory_limits() {
-    let (t, mut r) = setup();
-    for i in 0..501 {
-        fs::write(t.path().join(i.to_string()), "").unwrap();
-    }
+    fs::write(t.path().join("main.py"), "").unwrap();
+    let result = edit(&mut r, json!({"old_text":"","new_text":"first line\n"}));
+    assert_eq!(result["status"], "ok", "{result}");
     assert_eq!(
-        r.execute("list_files", json!({"path":"."}))["status"],
-        "failed"
+        fs::read_to_string(t.path().join("main.py")).unwrap(),
+        "first line\n"
     );
 }
 #[test]
 fn exact_command_policy_and_denial() {
     let (_t, mut r) = setup();
-    r.allowed_commands = vec![vec!["/usr/bin/true".into()]];
+    r.allowed_commands = vec![vec!["true".into()]];
     r.approve = Box::new(|_, _| panic!("Commands outside policy must not reach approval"));
-    assert_eq!(
-        r.execute("run_command", json!({"argv":["/usr/bin/true","different"]}))["status"],
-        "not_run"
-    );
+    for argv in [json!(["true", "different"]), json!(["/usr/bin/true"])] {
+        let result = r.execute("run_command", json!({"argv":argv}));
+        assert_eq!(result["status"], "not_run");
+        assert!(result["error"].as_str().unwrap().contains("allow-command"));
+    }
     r.approve = Box::new(|_, _| false);
-    let denied = r.execute("run_command", json!({"argv":["/usr/bin/true"]}));
+    let denied = r.execute("run_command", json!({"argv":["true"]}));
     assert_eq!(denied["executed"], false);
     assert_eq!(
         denied["status"],
@@ -255,26 +233,35 @@ fn exact_command_policy_and_denial() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn unrestricted_proposals_still_require_an_installed_absolute_executable() {
+fn unrestricted_proposals_reject_project_programs_and_unknown_names() {
     use std::os::unix::fs::PermissionsExt;
 
     let (t, mut r) = setup();
-    let program = t.path().join("project-program");
+    let program = t.path().join("cognix-test-project-program");
     fs::copy("/usr/bin/true", &program).unwrap();
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
     r.approve = Box::new(|_, _| panic!("Invalid executable must not reach approval"));
-    for executable in ["true", "/usr/bin", program.to_str().unwrap()] {
+    for executable in [
+        "cognix-test-project-program",
+        "./cognix-test-project-program",
+        "/usr/bin",
+        program.to_str().unwrap(),
+    ] {
         let result = r.execute("run_command", json!({"argv":[executable]}));
         assert_eq!(result["status"], "not_run");
         assert_eq!(result["executed"], false);
-        assert!(
-            result["error"]
-                .as_str()
-                .unwrap()
-                .contains("absolute executable"),
-            "{result}"
-        );
+        assert!(result["error"].is_string(), "{result}");
     }
+
+    // Even an executable that shadows a valid bare name must be ignored.
+    fs::copy("/usr/bin/false", t.path().join("true")).unwrap();
+    fs::set_permissions(t.path().join("true"), fs::Permissions::from_mode(0o755)).unwrap();
+    r.approve = Box::new(|_, preview| {
+        assert!(preview.contains("Resolved executable = \"/usr/bin/true\""));
+        true
+    });
+    let result = r.execute("run_command", json!({"argv":["true"]}));
+    assert_eq!(result["status"], "passed", "{result}");
 }
 
 #[cfg(target_os = "macos")]
@@ -347,7 +334,7 @@ fn approval_is_bound_to_the_resolved_executable() {
 
 #[test]
 fn shared_approval_preserves_previews_and_stopped_result_shapes() {
-    let mut tools = vec!["apply_patch", "create_file"];
+    let mut tools = vec!["update", "create"];
     if cfg!(target_os = "macos") {
         tools.push("run_command");
     }
@@ -358,17 +345,16 @@ fn shared_approval_preserves_previews_and_stopped_result_shapes() {
             fs::write(t.path().join("file"), "before\n").unwrap();
             let cancel = Cancellation::default();
             let mut r = Runtime::new(t.path(), Box::new(|_, _| true), cancel.clone()).unwrap();
-            let read = r.execute("read_file", json!({"path":"file"}));
             r.allowed_commands = vec![vec!["/usr/bin/true".into()]];
             let (args, expected_kind, expected_preview) = match tool {
-                "apply_patch" => (
-                    json!({"path":"./file","sha256":read["sha256"],"old_text":"before","new_text":"after"}),
+                "update" => (
+                    json!({"path":"./file","old_text":"before","new_text":"after"}),
                     "patch",
                     "--- file\n+++ file\n@@ -1 +1 @@\n-before\n+after\n\nExact replacement: \"before\" -> \"after\"",
                 ),
-                "create_file" => (
-                    json!({"path":"./new","content":"after\n"}),
-                    "create_file",
+                "create" => (
+                    json!({"path":"./new","old_text":null,"new_text":"after\n"}),
+                    "patch",
                     "Create \"new\" (6 UTF-8 bytes)\n--- /dev/null\n+++ \"new\"\n+after\n",
                 ),
                 _ => (
@@ -392,21 +378,25 @@ fn shared_approval_preserves_previews_and_stopped_result_shapes() {
                 }
                 answer
             });
-            let result = r.execute(tool, args.clone());
+            let name = if tool == "run_command" {
+                tool
+            } else {
+                "apply_patch"
+            };
+            let result = r.execute(name, args.clone());
             let mut expected =
                 json!({"status":if interrupt {"canceled"} else {"denied"},"executed":false});
-            if tool == "create_file" || (tool == "apply_patch" && !interrupt) {
-                expected["path"] = json!(if tool == "create_file" { "new" } else { "file" });
+            if tool != "run_command" {
+                expected["path"] = json!(if tool == "create" { "new" } else { "file" });
             }
             assert_eq!(result, expected, "{tool}");
             assert_eq!(*count.borrow(), 1);
             assert!(r.modified.is_empty());
-            assert_eq!(r.seen["file"], hash(b"before\n"));
             assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
-            assert_eq!(r.events.len(), 2);
+            assert_eq!(r.events.len(), 1);
             assert_eq!(
-                r.events[1],
-                json!({"tool":tool,"arguments":args,"result":expected})
+                r.events[0],
+                json!({"tool":name,"arguments":args,"result":expected})
             );
         }
     }

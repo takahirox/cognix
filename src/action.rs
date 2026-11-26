@@ -5,7 +5,7 @@ use std::path::Path;
 
 pub type Approval = Box<dyn FnMut(&str, &str) -> bool>;
 
-/// Pure diff construction shared by legacy approval and internal v2 preparation.
+/// Pure diff construction shared by patch approval and internal v2 preparation.
 pub(crate) fn patch_diff(from: &str, to: &str, before: &str, after: &str) -> String {
     similar::TextDiff::from_lines(before, after)
         .unified_diff()
@@ -19,18 +19,17 @@ pub(crate) fn patch_diff(from: &str, to: &str, before: &str, after: &str) -> Str
 pub(crate) struct ActionPlan<'a> {
     kind: &'static str,
     preview: String,
-    denied_path: Option<&'a str>,
-    canceled_path: Option<&'a str>,
+    path: Option<&'a str>,
 }
 
 impl<'a> ActionPlan<'a> {
     pub fn patch(path: &'a str, before: &str, after: &str, old: &str, new: &str) -> Self {
-        let diff = patch_diff(path, path, before, after);
+        let header = path.escape_debug().to_string();
+        let diff = patch_diff(&header, &header, before, after);
         Self {
             kind: "patch",
             preview: format!("{diff}\nExact replacement: {old:?} -> {new:?}"),
-            denied_path: Some(path),
-            canceled_path: None,
+            path: Some(path),
         }
     }
 
@@ -57,14 +56,19 @@ impl<'a> ActionPlan<'a> {
             preview.push_str("[Empty file: 0 additions]\n");
         }
         Self {
-            kind: "create_file",
+            kind: "patch",
             preview,
-            denied_path: Some(path),
-            canceled_path: Some(path),
+            path: Some(path),
         }
     }
 
-    pub fn command(argv: &[String], executable: &Path) -> Self {
+    pub fn command(argv: &[String], invocation: &Path, executable: &Path) -> Self {
+        let invocation =
+            if invocation != executable && invocation.to_str() != Some(argv[0].as_str()) {
+                format!("Invocation path = {invocation:?}\n")
+            } else {
+                String::new()
+            };
         let resolved = if executable.to_str() == Some(argv[0].as_str()) {
             String::new()
         } else {
@@ -73,11 +77,10 @@ impl<'a> ActionPlan<'a> {
         Self {
             kind: "command",
             preview: format!(
-                "argv = {}\n{resolved}Read-only project; no network; scratch writes only.",
+                "argv = {}\n{invocation}{resolved}Read-only project; no network; scratch writes only.",
                 json!(argv)
             ),
-            denied_path: None,
-            canceled_path: None,
+            path: None,
         }
     }
 
@@ -85,15 +88,15 @@ impl<'a> ActionPlan<'a> {
     /// the caller must still revalidate and execute in its dedicated backend.
     pub fn approve(self, approve: &mut Approval, cancel: &Cancellation) -> Result<(), Value> {
         let approved = approve(self.kind, &self.preview);
-        let (status, path) = if cancel.is_canceled() {
-            ("canceled", self.canceled_path)
+        let status = if cancel.is_canceled() {
+            "canceled"
         } else if !approved {
-            ("denied", self.denied_path)
+            "denied"
         } else {
             return Ok(());
         };
         let mut result = unexecuted(status);
-        if let Some(path) = path {
+        if let Some(path) = self.path {
             result["path"] = json!(path);
         }
         Err(result)
