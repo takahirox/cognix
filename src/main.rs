@@ -1,4 +1,3 @@
-use clap::Parser;
 use cognix::cli::Args;
 use cognix::{
     Cancellation,
@@ -12,7 +11,8 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
-    std::process::exit(run(Args::parse()).await);
+    let args = Args::try_parse_configured(std::env::args_os()).unwrap_or_else(|e| e.exit());
+    std::process::exit(run(args).await);
 }
 async fn run(args: Args) -> i32 {
     let cancel = Cancellation::default();
@@ -34,9 +34,6 @@ async fn run(args: Args) -> i32 {
 async fn session(args: Args, cancel: &Cancellation) -> Result<i32, String> {
     if args.task.as_ref().is_some_and(|s| s.trim().is_empty()) {
         return Err("--task must contain a request".into());
-    }
-    if args.num_ctx < 8192 {
-        return Err("--num-ctx must be at least 8192".into());
     }
     let allowed = args
         .allow_command
@@ -75,11 +72,6 @@ async fn session(args: Args, cancel: &Cancellation) -> Result<i32, String> {
         "Ollama {}; model {}. Ctrl-C cancels. /exit quits.",
         provider.version, args.model
     ));
-    if runtime.allowed_commands.is_empty() {
-        show(
-            "No verification commands allowed. Restart with --allow-command JSON_ARGV to enable checks.",
-        );
-    }
     let mut agent = Agent::new(provider, runtime);
     agent.max_steps = args.max_steps;
     agent.context_budget = args.num_ctx;

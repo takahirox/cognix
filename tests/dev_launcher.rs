@@ -55,6 +55,7 @@ impl Fixture {
             "bin",
             "logs",
             "cwd",
+            "home",
         ] {
             fs::create_dir_all(root.join(path)).unwrap();
         }
@@ -78,6 +79,9 @@ exit "${BUILD_EXIT:-0}"
         executable(
             &root.join("repo with spaces/target/debug/cognix-dev-model"),
             r#"#!/bin/bash
+if [[ ${1:-} == --launcher-endpoint ]]; then
+    exec "$NATIVE_MODEL_HELPER" "$@"
+fi
 if [[ ${PROVISION_WAIT:-0} == 1 ]]; then
     export LAUNCHER_CHILD=provision
     exec "$HELPER_EXE" --exact launcher_child --nocapture
@@ -144,6 +148,11 @@ exec "$HELPER_EXE" --exact launcher_child --nocapture
             )
             .env("FIXTURE", self.dir.path())
             .env("HELPER_EXE", std::env::current_exe().unwrap())
+            .env(
+                "NATIVE_MODEL_HELPER",
+                env!("CARGO_BIN_EXE_cognix-dev-model"),
+            )
+            .env("HOME", self.path("home"))
             .env("TMPDIR", self.path("logs"))
             .env("COGNIX_DEV_STARTUP_TIMEOUT", "2")
             .env_remove("COGNIX_OLLAMA_URL")
@@ -386,7 +395,7 @@ fn refused_custom_endpoint_missing_ollama_and_invalid_listeners_fail_before_laun
         );
         status(&out, 1);
         assert!(String::from_utf8_lossy(&out.stderr).contains(message));
-        assert!(!f.path("cargo-argv").exists());
+        assert!(!f.path("argv").exists());
         assert!(!f.path("ollama-argv").exists());
     }
 }
@@ -416,7 +425,7 @@ fn real_http_wrong_service_and_redirect_are_not_reused() {
         status(&out, 1);
         assert!(String::from_utf8_lossy(&out.stderr).contains("No valid Ollama"));
         assert!(!f.path("ollama-argv").exists());
-        assert!(!f.path("cargo-argv").exists());
+        assert!(!f.path("argv").exists());
     }
 }
 
@@ -425,7 +434,7 @@ fn startup_failure_timeout_and_build_failure_report_and_clean_up() {
     for (mode, fail, build_exit, provision_exit, message) in [
         ("managed", "1", "0", "0", "exited before becoming ready"),
         ("absent", "0", "0", "0", "did not become ready within"),
-        ("managed", "0", "17", "0", "startup log:"),
+        ("managed", "0", "17", "0", ""),
         ("managed", "0", "0", "19", "startup log:"),
     ] {
         let f = Fixture::new();
@@ -446,6 +455,11 @@ fn startup_failure_timeout_and_build_failure_report_and_clean_up() {
                 _ => 1,
             },
         );
+        assert!(!f.path("argv").exists());
+        if build_exit != "0" {
+            assert!(!f.path("ollama-argv").exists());
+            continue;
+        }
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains(message), "{err}");
         let log = err
@@ -453,7 +467,6 @@ fn startup_failure_timeout_and_build_failure_report_and_clean_up() {
             .find_map(|line| line.split_once("startup log: ").map(|(_, path)| path))
             .unwrap();
         assert!(Path::new(log).is_file());
-        assert!(!f.path("argv").exists());
         if fail == "0" {
             f.assert_stopped("ollama.pid");
             f.assert_stopped("worker.pid");
@@ -485,17 +498,17 @@ fn signals_cancel_cognix_build_and_startup_without_leaking_owned_processes() {
             .spawn()
             .unwrap();
         f.wait_for(stage);
-        if mode == "managed" {
+        if mode == "managed" && stage != "build.pid" {
             f.wait_for("worker.pid");
         }
         unsafe { libc::kill(child.id() as i32, signal) };
         status(&finished(child), 128 + signal);
         f.assert_stopped(stage);
-        if mode == "managed" {
+        if mode == "managed" && stage != "build.pid" {
             f.assert_stopped("ollama.pid");
             f.assert_stopped("worker.pid");
         }
-        if mode == "existing" {
+        if mode == "existing" || stage == "build.pid" {
             assert!(!f.path("ollama-argv").exists());
         }
     }
@@ -631,6 +644,109 @@ fn effective_models_are_checked_exactly_without_prompt_or_changed_arguments() {
         assert_eq!(requests.len(), 2); // version and exact show; never pull
         assert_eq!(requests[1]["body"]["model"], expected);
     }
+}
+
+#[test]
+fn launcher_reuses_the_normalized_endpoint_and_model_from_user_configuration() {
+    let server = Server::new(ready);
+    let f = provisioning_fixture();
+    fs::create_dir(f.path("home/.cognix")).unwrap();
+    fs::write(
+        f.path("home/.cognix/config.toml"),
+        format!(
+            "model = 'saved:local'\nollama_url = '{} '\n",
+            server.url.replace("127.0.0.1", "LOCALHOST")
+        ),
+    )
+    .unwrap();
+    let out = finished(f.command().stdin(Stdio::null()).spawn().unwrap());
+    status(&out, 0);
+    let endpoint = server.url.replace("127.0.0.1", "localhost");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!("Reusing Ollama at {endpoint}"))
+    );
+    assert!(!f.path("ollama-argv").exists());
+    assert!(f.argv("argv").is_empty());
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["path"], "/api/version");
+    assert_eq!(requests[1]["body"]["model"], "saved:local");
+}
+
+#[test]
+fn launcher_rejects_settings_changes_during_probe_or_download() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+    let other_server = Server::new(ready);
+    for edit_at in ["/api/version", "/api/pull"] {
+        let f = provisioning_fixture();
+        f.native_cognix();
+        fs::create_dir(f.path("home/.cognix")).unwrap();
+        let config = f.path("home/.cognix/config.toml");
+        let edited_config = config.clone();
+        let other_url = other_server.url.clone();
+        let installed = AtomicBool::new(false);
+        let server = Server::new(move |path, body| {
+            if path == edit_at {
+                let edited = if path == "/api/version" {
+                    format!("model = 'original:local'\nollama_url = '{other_url}'\n")
+                } else {
+                    fs::read_to_string(&edited_config)
+                        .unwrap()
+                        .replace("original:local", "edited:local")
+                };
+                fs::write(&edited_config, edited).unwrap();
+            }
+            match path {
+                "/api/show" if !installed.load(Relaxed) => missing(body["model"].as_str().unwrap()),
+                "/api/pull" => {
+                    installed.store(true, Relaxed);
+                    Reply {
+                        status: 200,
+                        body: "{\"status\":\"success\"}\n".into(),
+                        delay: Duration::ZERO,
+                    }
+                }
+                _ => ready(path, body),
+            }
+        });
+        fs::write(
+            &config,
+            format!("model = 'original:local'\nollama_url = '{}'\n", server.url),
+        )
+        .unwrap();
+        let mut command = f.command();
+        let mut terminal = terminal_input(&mut command);
+        let child = command.spawn().unwrap();
+        terminal.write_all(b"y\n\x04").unwrap();
+        let out = finished(child);
+        status(&out, 2);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("settings changed during development launcher startup"),
+            "{stderr}"
+        );
+
+        let requests = server.requests.lock().unwrap();
+        let paths: Vec<_> = requests
+            .iter()
+            .map(|r| r["path"].as_str().unwrap())
+            .collect();
+        if edit_at == "/api/version" {
+            assert_eq!(paths, ["/api/version"]);
+        } else {
+            assert_eq!(
+                paths,
+                ["/api/version", "/api/show", "/api/pull", "/api/show"]
+            );
+            assert!(
+                requests[1..]
+                    .iter()
+                    .all(|r| r["body"]["model"] == "original:local")
+            );
+        }
+    }
+    assert!(other_server.requests.lock().unwrap().is_empty());
 }
 
 #[test]

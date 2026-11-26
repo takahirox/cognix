@@ -237,7 +237,7 @@ fn exact_command_policy_and_denial() {
     r.allowed_commands = vec![vec!["/usr/bin/true".into()]];
     r.approve = Box::new(|_, _| panic!("Commands outside policy must not reach approval"));
     assert_eq!(
-        r.execute("run_command", json!({"argv":["/bin/sh","-c","true"]}))["status"],
+        r.execute("run_command", json!({"argv":["/usr/bin/true","different"]}))["status"],
         "not_run"
     );
     r.approve = Box::new(|_, _| false);
@@ -250,6 +250,98 @@ fn exact_command_policy_and_denial() {
         } else {
             "not_run"
         }
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unrestricted_proposals_still_require_an_installed_absolute_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (t, mut r) = setup();
+    let program = t.path().join("project-program");
+    fs::copy("/usr/bin/true", &program).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    r.approve = Box::new(|_, _| panic!("Invalid executable must not reach approval"));
+    for executable in ["true", "/usr/bin", program.to_str().unwrap()] {
+        let result = r.execute("run_command", json!({"argv":[executable]}));
+        assert_eq!(result["status"], "not_run");
+        assert_eq!(result["executed"], false);
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("absolute executable"),
+            "{result}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn approved_python_alias_uses_the_project_virtual_environment() {
+    let (t, mut r) = setup();
+    let venv = t.path().canonicalize().unwrap().join(".venv");
+    fs::create_dir_all(venv.join("bin")).unwrap();
+    fs::write(
+        venv.join("pyvenv.cfg"),
+        "home = /opt/homebrew/bin\ninclude-system-site-packages = false\n",
+    )
+    .unwrap();
+    let python = venv.join("bin/python3");
+    symlink("/opt/homebrew/bin/python3", &python).unwrap();
+    let argv = vec![
+        python.to_str().unwrap().into(),
+        "-c".into(),
+        "import sys; print(sys.prefix)".into(),
+    ];
+    r.allowed_commands = vec![argv.clone()];
+
+    let result = r.execute("run_command", json!({"argv":argv}));
+    assert_eq!(result["status"], "passed", "{result}");
+    assert_eq!(result["output"], format!("{}\n", venv.display()));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn approval_is_bound_to_the_resolved_executable() {
+    use std::os::unix::fs::symlink;
+
+    let (t, mut r) = setup();
+    let alias = t.path().join("command");
+    symlink("/usr/bin/true", &alias).unwrap();
+    let args = json!({"argv":[alias]});
+    r.allowed_commands = vec![vec![alias.to_str().unwrap().into()]];
+    r.approve = Box::new(|_, _| panic!("The resolved argv is outside the submitted allowlist"));
+    let result = r.execute("run_command", json!({"argv":["/usr/bin/true"]}));
+    assert_eq!(result["status"], "not_run");
+    assert!(result["error"].as_str().unwrap().contains("allow-command"));
+
+    let approve = |preview: &str| {
+        assert!(
+            preview.contains("Resolved executable = \"/usr/bin/true\""),
+            "{preview}"
+        );
+        true
+    };
+    r.approve = Box::new(move |_, preview| approve(preview));
+    let result = r.execute("run_command", args.clone());
+    assert_eq!(result["status"], "passed", "{result}");
+
+    r.approve = Box::new(move |_, preview| {
+        assert!(approve(preview));
+        fs::remove_file(&alias).unwrap();
+        symlink("/usr/bin/false", &alias).unwrap();
+        true
+    });
+    let result = r.execute("run_command", args);
+    assert_eq!(result["status"], "not_run", "{result}");
+    assert_eq!(result["executed"], false);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("executable changed")
     );
 }
 

@@ -47,34 +47,80 @@ pub fn parse_command(text: &str) -> Result<Vec<String>, String> {
     let v: Value =
         serde_json::from_str(text).map_err(|e| format!("--allow-command needs JSON argv: {e}"))?;
     let argv = schema::argv(&v)?;
-    let p = Path::new(&argv[0]);
-    let canonical = p
-        .canonicalize()
-        .map_err(|_| "Allowed commands need an existing absolute executable")?;
-    if !p.is_absolute()
-        || !canonical.is_file()
-        || fs::metadata(&canonical)
-            .map_err(|e| e.to_string())?
-            .permissions()
-            .mode()
-            & 0o111
-            == 0
+    resolve_executable(&argv[0]).map_err(|e| format!("--allow-command: {e}"))?;
+    Ok(argv)
+}
+
+fn resolve_executable(program: &str) -> Result<(PathBuf, fs::Metadata), &'static str> {
+    let path = Path::new(program);
+    let error = "Command needs an existing absolute executable installed in a documented system runtime directory";
+    if !path.is_absolute() {
+        return Err(error);
+    }
+    let canonical = path.canonicalize().map_err(|_| error)?;
+    let metadata = canonical.symlink_metadata().map_err(|_| error)?;
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o111 == 0
         || !RUNTIME_DIRS
             .iter()
             .filter_map(|s| Path::new(s).canonicalize().ok())
             .any(|dir| canonical.starts_with(dir))
     {
-        return Err("Allowed commands need an absolute executable installed in a documented system runtime directory".into());
+        return Err(error);
     }
-    Ok(argv)
+    Ok((canonical, metadata))
 }
-pub fn sandbox_argv(root: &Path, scratch: &Path, argv: &[String]) -> Result<Vec<String>, String> {
+
+pub(crate) struct PreparedCommand<'a> {
+    submitted_argv: &'a [String],
+    executable: PathBuf,
+    metadata: fs::Metadata,
+}
+
+impl<'a> PreparedCommand<'a> {
+    pub(crate) fn new(argv: &'a [String]) -> Result<Self, String> {
+        sandbox_available()?;
+        let program = argv.first().ok_or("Command needs an executable")?;
+        let (executable, metadata) = resolve_executable(program)?;
+        Ok(Self {
+            submitted_argv: argv,
+            executable,
+            metadata,
+        })
+    }
+
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    fn check_executable(&self) -> Result<(), String> {
+        let changed = "Command executable changed after preview; command not run";
+        let (resolved, current) =
+            resolve_executable(&self.submitted_argv[0]).map_err(|_| changed)?;
+        if resolved != self.executable
+            || current.dev() != self.metadata.dev()
+            || current.ino() != self.metadata.ino()
+            || current.ctime() != self.metadata.ctime()
+            || current.ctime_nsec() != self.metadata.ctime_nsec()
+        {
+            return Err(changed.into());
+        }
+        Ok(())
+    }
+}
+
+fn sandbox_available() -> Result<(), String> {
     if !cfg!(target_os = "macos") || !Path::new("/usr/bin/sandbox-exec").is_file() {
         return Err(
             "Command sandbox unavailable: only macOS sandbox-exec is supported; command not run"
                 .into(),
         );
     }
+    Ok(())
+}
+
+pub fn sandbox_argv(root: &Path, scratch: &Path, argv: &[String]) -> Result<Vec<String>, String> {
+    sandbox_available()?;
     let quote = |p: &Path| serde_json::to_string(&p.to_string_lossy()).unwrap();
     let readable: Vec<PathBuf> = std::iter::once(root.to_owned())
         .chain(std::iter::once(scratch.to_owned()))
@@ -223,6 +269,19 @@ pub fn run(
     timeout: Duration,
     limit: usize,
 ) -> Result<Value, String> {
+    if cancel.is_canceled() {
+        return Ok(unexecuted("canceled"));
+    }
+    run_prepared(root, PreparedCommand::new(argv)?, cancel, timeout, limit)
+}
+
+pub(crate) fn run_prepared(
+    root: &Path,
+    prepared: PreparedCommand<'_>,
+    cancel: &Cancellation,
+    timeout: Duration,
+    limit: usize,
+) -> Result<Value, String> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or("Command timeout is too large")?;
@@ -242,7 +301,8 @@ pub fn run(
         .tempdir()
         .map_err(|e| e.to_string())?;
     let scratch = temporary.path().canonicalize().map_err(|e| e.to_string())?;
-    let wrapped = sandbox_argv(root, &scratch, argv)?;
+    // Some runtimes, including Python virtual environments, use the invocation path.
+    let wrapped = sandbox_argv(root, &scratch, prepared.submitted_argv)?;
     let mut command = Command::new(&wrapped[0]);
     command
         .args(&wrapped[1..])
@@ -281,9 +341,15 @@ pub fn run(
             Ok(())
         });
     }
+    // Refuse to launch if the submitted path no longer resolves to the approved executable.
+    let executable_check = prepared.check_executable();
     if cancel.is_canceled() {
         return Ok(unexecuted("canceled"));
     }
+    if Instant::now() >= deadline {
+        return Ok(unexecuted("limit_reached"));
+    }
+    executable_check?;
     let mut child = command
         .spawn()
         .map_err(|e| format!("Sandbox launch failed; no unsandboxed retry: {e}"))?;

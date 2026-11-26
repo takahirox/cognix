@@ -1,6 +1,7 @@
 //! Shared approval plans and result conventions, not filesystem/sandbox policy.
 use crate::Cancellation;
 use serde_json::{Value, json};
+use std::path::Path;
 
 pub type Approval = Box<dyn FnMut(&str, &str) -> bool>;
 
@@ -63,11 +64,16 @@ impl<'a> ActionPlan<'a> {
         }
     }
 
-    pub fn command(argv: &[String]) -> Self {
+    pub fn command(argv: &[String], executable: &Path) -> Self {
+        let resolved = if executable.to_str() == Some(argv[0].as_str()) {
+            String::new()
+        } else {
+            format!("Resolved executable = {executable:?}\n")
+        };
         Self {
             kind: "command",
             preview: format!(
-                "argv = {}\nRead-only project; no network; scratch writes only.",
+                "argv = {}\n{resolved}Read-only project; no network; scratch writes only.",
                 json!(argv)
             ),
             denied_path: None,
