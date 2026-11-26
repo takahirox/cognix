@@ -301,12 +301,11 @@ pub(crate) fn run_prepared(
         .tempdir()
         .map_err(|e| e.to_string())?;
     let scratch = temporary.path().canonicalize().map_err(|e| e.to_string())?;
-    let wrapped = sandbox_argv(root, &scratch, &[])?;
+    // Some runtimes, including Python virtual environments, use the invocation path.
+    let wrapped = sandbox_argv(root, &scratch, prepared.submitted_argv)?;
     let mut command = Command::new(&wrapped[0]);
     command
         .args(&wrapped[1..])
-        .arg(prepared.executable())
-        .args(&prepared.submitted_argv[1..])
         .current_dir(root)
         .env_clear()
         .envs([
@@ -342,8 +341,7 @@ pub(crate) fn run_prepared(
             Ok(())
         });
     }
-    // Re-resolve the submitted path to detect a retargeted alias, but execute
-    // only the canonical path shown for approval.
+    // Refuse to launch if the submitted path no longer resolves to the approved executable.
     let executable_check = prepared.check_executable();
     if cancel.is_canceled() {
         return Ok(unexecuted("canceled"));

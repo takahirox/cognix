@@ -279,6 +279,31 @@ fn unrestricted_proposals_still_require_an_installed_absolute_executable() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn approved_python_alias_uses_the_project_virtual_environment() {
+    let (t, mut r) = setup();
+    let venv = t.path().canonicalize().unwrap().join(".venv");
+    fs::create_dir_all(venv.join("bin")).unwrap();
+    fs::write(
+        venv.join("pyvenv.cfg"),
+        "home = /opt/homebrew/bin\ninclude-system-site-packages = false\n",
+    )
+    .unwrap();
+    let python = venv.join("bin/python3");
+    symlink("/opt/homebrew/bin/python3", &python).unwrap();
+    let argv = vec![
+        python.to_str().unwrap().into(),
+        "-c".into(),
+        "import sys; print(sys.prefix)".into(),
+    ];
+    r.allowed_commands = vec![argv.clone()];
+
+    let result = r.execute("run_command", json!({"argv":argv}));
+    assert_eq!(result["status"], "passed", "{result}");
+    assert_eq!(result["output"], format!("{}\n", venv.display()));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn approval_is_bound_to_the_resolved_executable() {
     use std::os::unix::fs::symlink;
 
