@@ -181,6 +181,7 @@ fn finished(child: &mut Child) -> std::process::ExitStatus {
         }
         if Instant::now() > end {
             child.kill().unwrap();
+            child.wait().unwrap();
             panic!("CLI did not terminate");
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -539,6 +540,61 @@ num_ctx = 12288
         assert_eq!(body["options"]["num_ctx"], ctx);
         assert_eq!(body["messages"][1]["content"], "inspect");
     }
+}
+
+#[test]
+fn relative_home_does_not_load_project_configuration() {
+    let server = Server::new(ready);
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join(".cognix")).unwrap();
+    fs::write(
+        project.path().join(".cognix/config.toml"),
+        "model = 'project:local'",
+    )
+    .unwrap();
+
+    let out = run(
+        cli(Path::new("."))
+            .current_dir(project.path())
+            .args(["--ollama-url", &server.url]),
+        "/exit\n",
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.last().unwrap()["body"]["model"], "qwen3-coder:30b");
+}
+
+#[test]
+fn configuration_fifo_is_rejected_without_a_writer() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join(".cognix");
+    fs::create_dir(&dir).unwrap();
+    let config = dir.join("config.toml");
+    let fifo = std::ffi::CString::new(config.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    let mut child = cli(home.path())
+        .args(["--ollama-url", "http://127.0.0.1:1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(!finished(&mut child).success());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.stdout.is_empty(),
+        "invalid config must fail before startup"
+    );
+    assert!(
+        stderr.contains(config.to_str().unwrap()) && stderr.contains("expected a regular file"),
+        "{stderr}"
+    );
 }
 
 #[test]

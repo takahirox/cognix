@@ -2,7 +2,13 @@
 use crate::provider::{normalize_ollama_url, validate_model};
 use clap::{CommandFactory, FromArgMatches, Parser, error::ErrorKind, parser::ValueSource};
 use serde::Deserialize;
-use std::{ffi::OsString, fs, io, path::PathBuf};
+use std::{
+    ffi::OsString,
+    fs::OpenOptions,
+    io::{self, Read},
+    os::unix::fs::OpenOptionsExt,
+    path::PathBuf,
+};
 
 fn parse_number(s: &str) -> Result<usize, String> {
     s.parse().map_err(|_| "must be a positive integer".into())
@@ -38,7 +44,7 @@ struct Config {
 
 impl Config {
     fn load() -> Result<Self, clap::Error> {
-        let Some(home) = std::env::home_dir() else {
+        let Some(home) = std::env::home_dir().filter(|home| home.is_absolute()) else {
             return Ok(Self::default());
         };
         let path = home.join(".cognix/config.toml");
@@ -51,11 +57,26 @@ impl Config {
                 ),
             )
         };
-        let contents = match fs::read_to_string(&path) {
-            Ok(contents) => contents,
+        // A FIFO must open without waiting for a writer so we can check its type.
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(error(&e.to_string())),
         };
+        if !file
+            .metadata()
+            .map_err(|e| error(&e.to_string()))?
+            .is_file()
+        {
+            return Err(error("expected a regular file"));
+        }
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .map_err(|e| error(&e.to_string()))?;
         let config: Self =
             toml::from_str(&contents).map_err(|e| error(&crate::terminal::text(&e.to_string())))?;
         if let Some(model) = &config.model {
