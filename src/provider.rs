@@ -48,7 +48,8 @@ pub struct Ollama {
     client: reqwest::Client,
     timeout: Duration,
 }
-pub(crate) fn validate_ollama_url(url: &str) -> Result<(), &'static str> {
+/// Validate an Ollama endpoint and return its canonical loopback HTTP origin.
+pub fn normalize_ollama_url(url: &str) -> Result<String, &'static str> {
     let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid Ollama URL")?;
     if parsed.scheme() != "http"
         || !matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
@@ -60,10 +61,10 @@ pub(crate) fn validate_ollama_url(url: &str) -> Result<(), &'static str> {
     {
         return Err("Ollama URL must be a local HTTP origin (localhost/loopback)");
     }
-    Ok(())
+    Ok(parsed.origin().ascii_serialization())
 }
 
-pub(crate) fn validate_model(model: &str) -> Result<(), &'static str> {
+pub fn validate_model(model: &str) -> Result<(), &'static str> {
     if model.is_empty()
         || model.chars().any(char::is_whitespace)
         || model.to_lowercase().contains("cloud")
@@ -75,7 +76,7 @@ pub(crate) fn validate_model(model: &str) -> Result<(), &'static str> {
 
 impl Ollama {
     pub fn new(model: &str, url: &str, timeout: Duration, num_ctx: usize) -> Result<Self, Error> {
-        validate_ollama_url(url).map_err(|e| Error::Provider(e.into()))?;
+        let url = normalize_ollama_url(url).map_err(|e| Error::Provider(e.into()))?;
         validate_model(model).map_err(|e| Error::Provider(e.into()))?;
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -87,7 +88,7 @@ impl Ollama {
             model: model.into(),
             version: "unknown".into(),
             num_ctx,
-            url: url.trim_end_matches('/').into(),
+            url,
             client,
             timeout,
         })

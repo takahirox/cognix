@@ -1,5 +1,5 @@
 //! Shared argument contract for Cognix and the development launcher helper.
-use crate::provider::{validate_model, validate_ollama_url};
+use crate::provider::{normalize_ollama_url, validate_model};
 use clap::{CommandFactory, FromArgMatches, Parser, error::ErrorKind, parser::ValueSource};
 use serde::Deserialize;
 use std::{ffi::OsString, fs, io, path::PathBuf};
@@ -62,7 +62,7 @@ impl Config {
             validate_model(model).map_err(|e| error(&format!("model: {e}")))?;
         }
         if let Some(url) = &config.ollama_url {
-            validate_ollama_url(url).map_err(|e| error(&format!("ollama_url: {e}")))?;
+            normalize_ollama_url(url).map_err(|e| error(&format!("ollama_url: {e}")))?;
         }
         for (key, value, validate) in [
             ("max_steps", config.max_steps, positive as fn(usize) -> _),

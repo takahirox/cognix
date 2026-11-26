@@ -647,17 +647,24 @@ fn effective_models_are_checked_exactly_without_prompt_or_changed_arguments() {
 }
 
 #[test]
-fn launcher_reuses_the_endpoint_and_model_from_user_configuration() {
+fn launcher_reuses_the_normalized_endpoint_and_model_from_user_configuration() {
     let server = Server::new(ready);
     let f = provisioning_fixture();
     fs::create_dir(f.path("home/.cognix")).unwrap();
     fs::write(
         f.path("home/.cognix/config.toml"),
-        format!("model = 'saved:local'\nollama_url = '{}'\n", server.url),
+        format!(
+            "model = 'saved:local'\nollama_url = '{} '\n",
+            server.url.replace("127.0.0.1", "LOCALHOST")
+        ),
     )
     .unwrap();
     let out = finished(f.command().stdin(Stdio::null()).spawn().unwrap());
     status(&out, 0);
+    let endpoint = server.url.replace("127.0.0.1", "localhost");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!("Reusing Ollama at {endpoint}"))
+    );
     assert!(!f.path("ollama-argv").exists());
     assert!(f.argv("argv").is_empty());
     let requests = server.requests.lock().unwrap();
