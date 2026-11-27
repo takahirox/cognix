@@ -24,6 +24,14 @@ fn serve_fixture() {
         eprintln!("fixture failed to start");
         std::process::exit(9);
     }
+    if mode == "bind-race" {
+        while !directory.join("winner-bound").exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let error = TcpListener::bind(std::env::var("OLLAMA_HOST").unwrap()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        std::process::exit(9);
+    }
     let _server = if matches!(mode.as_str(), "ready" | "slow") {
         if mode == "ready" {
             // Leave the port refused until a readiness retry is necessary.
@@ -95,6 +103,7 @@ async fn starts_on_refusal_waits_for_readiness_and_stops_only_owned_group() {
     let (version, owner) = ensure_ready_with(
         &endpoint,
         &endpoint,
+        PROBE_TIMEOUT,
         Duration::from_secs(3),
         &cancel,
         fixture.command("ready"),
@@ -107,6 +116,7 @@ async fn starts_on_refusal_waits_for_readiness_and_stops_only_owned_group() {
     let (version, reused) = ensure_ready_with(
         &endpoint,
         &endpoint,
+        PROBE_TIMEOUT,
         Duration::from_secs(3),
         &cancel,
         Command::new("/missing-ollama"),
@@ -117,11 +127,17 @@ async fn starts_on_refusal_waits_for_readiness_and_stops_only_owned_group() {
     assert!(reused.is_none());
     drop(reused);
     let client = Client::new();
-    assert!(matches!(probe(&client, &endpoint).await, Probe::Ready(_)));
+    assert!(matches!(
+        probe(&client, &endpoint, PROBE_TIMEOUT).await,
+        Probe::Ready(_)
+    ));
 
     drop(owner);
     fixture.assert_stopped();
-    assert!(matches!(probe(&client, &endpoint).await, Probe::Refused));
+    assert!(matches!(
+        probe(&client, &endpoint, PROBE_TIMEOUT).await,
+        Probe::Refused
+    ));
 }
 
 #[tokio::test]
@@ -131,6 +147,7 @@ async fn retries_a_timed_out_probe_until_owned_server_responds() {
     let (version, owner) = ensure_ready_with(
         &endpoint,
         &endpoint,
+        PROBE_TIMEOUT,
         Duration::from_secs(4),
         &Cancellation::default(),
         fixture.command("slow"),
@@ -142,6 +159,60 @@ async fn retries_a_timed_out_probe_until_owned_server_responds() {
 
     drop(owner);
     fixture.assert_stopped();
+}
+
+#[tokio::test]
+async fn reuses_bind_race_winner_after_stopping_failed_owned_group() {
+    let fixture = Fixture::new();
+    let endpoint = unused_endpoint();
+    let cancel = Cancellation::default();
+    let startup = ensure_ready_with(
+        &endpoint,
+        &endpoint,
+        PROBE_TIMEOUT,
+        Duration::from_secs(3),
+        &cancel,
+        fixture.command("bind-race"),
+    );
+    let start_winner = async {
+        let worker_path = fixture.0.path().join("worker.pid");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !worker_path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture did not start");
+        let server_pid: libc::pid_t = fs::read_to_string(fixture.0.path().join("server.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let listener = TcpListener::bind(endpoint.strip_prefix("http://").unwrap()).unwrap();
+        fs::write(fixture.0.path().join("winner-bound"), "").unwrap();
+        Server::listen(listener, move |path, body| {
+            // The winner answers only after the losing child exits.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    server_pid as _,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            assert!(result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD));
+            ready(path, body)
+        })
+    };
+    let (outcome, winner) = tokio::join!(startup, start_winner);
+    let (version, owner) = outcome.unwrap();
+    assert_eq!(version, "fixture-1");
+    assert!(owner.is_none());
+    fixture.assert_stopped();
+    assert!(matches!(
+        probe(&Client::new(), &winner.url, PROBE_TIMEOUT).await,
+        Probe::Ready(_)
+    ));
 }
 
 #[tokio::test]
@@ -163,6 +234,7 @@ async fn startup_exit_timeout_and_cancellation_stop_owned_group() {
         let startup = ensure_ready_with(
             &endpoint,
             &endpoint,
+            PROBE_TIMEOUT,
             timeout,
             &cancel,
             fixture.command(mode),
@@ -200,6 +272,7 @@ async fn distinguishes_missing_binary_custom_refusal_and_incompatible_listener()
         let error = ensure_ready_with(
             &endpoint,
             managed,
+            PROBE_TIMEOUT,
             timeout,
             &cancel,
             Command::new("/missing-ollama"),
@@ -235,6 +308,7 @@ async fn distinguishes_missing_binary_custom_refusal_and_incompatible_listener()
         let error = ensure_ready_with(
             &server.url,
             &server.url,
+            PROBE_TIMEOUT,
             timeout,
             &cancel,
             Command::new("/missing-ollama"),

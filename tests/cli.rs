@@ -44,6 +44,29 @@ fn run(c: &mut Command, input: &str) -> std::process::Output {
         .unwrap();
     child.wait_with_output().unwrap()
 }
+
+#[test]
+fn startup_uses_the_configured_model_timeout_for_an_existing_server() {
+    let project = tempfile::tempdir().unwrap();
+    let server = Server::new(|path, body| {
+        let mut reply = ready(path, body);
+        if path == "/api/version" {
+            reply.delay = Duration::from_millis(1300);
+        }
+        reply
+    });
+    let out = run(
+        command(project.path(), &server.url).args(["--model-timeout", "5"]),
+        "/exit\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("Ollama fixture-1"), "{stdout}");
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests[0]["path"], "/api/version");
+    assert_eq!(requests[1]["path"], "/api/show");
+}
+
 fn tool(name: &str, args: Value) -> Reply {
     Reply::json(
         json!({"done":true,"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":name,"arguments":args}}]}}),

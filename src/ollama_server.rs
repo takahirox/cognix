@@ -77,14 +77,9 @@ impl OwnedServer {
         Err(error)
     }
 
-    fn check_running(&self) -> Result<(), Error> {
-        match self.exited() {
-            Ok(false) => Ok(()),
-            Ok(true) => Err(Error::Provider(
-                "'ollama serve' exited before becoming ready. Inspect the startup log and check whether the port is already in use".into(),
-            )),
-            Err(e) => Err(Error::Provider(format!("Cannot check 'ollama serve': {e}"))),
-        }
+    fn has_exited(&self) -> Result<bool, Error> {
+        self.exited()
+            .map_err(|e| Error::Provider(format!("Cannot check 'ollama serve': {e}")))
     }
 }
 
@@ -115,8 +110,13 @@ enum Probe {
     Invalid,
 }
 
-async fn probe(client: &Client, endpoint: &str) -> Probe {
-    let mut response = match client.get(format!("{endpoint}/api/version")).send().await {
+async fn probe(client: &Client, endpoint: &str, timeout: Duration) -> Probe {
+    let mut response = match client
+        .get(format!("{endpoint}/api/version"))
+        .timeout(timeout)
+        .send()
+        .await
+    {
         Ok(response) => response,
         Err(error) if error.is_timeout() => return Probe::TimedOut,
         Err(error) => {
@@ -163,12 +163,14 @@ async fn probe(client: &Client, endpoint: &str) -> Probe {
 
 pub(super) async fn ensure_ready(
     endpoint: &str,
+    initial_timeout: Duration,
     startup_timeout: Duration,
     cancel: &Cancellation,
 ) -> Result<(String, Option<OwnedServer>), Error> {
     ensure_ready_with(
         endpoint,
         DEFAULT_OLLAMA_URL,
+        initial_timeout,
         startup_timeout,
         cancel,
         Command::new("ollama"),
@@ -179,6 +181,7 @@ pub(super) async fn ensure_ready(
 async fn ensure_ready_with(
     endpoint: &str,
     default_endpoint: &str,
+    initial_timeout: Duration,
     startup_timeout: Duration,
     cancel: &Cancellation,
     command: Command,
@@ -186,7 +189,6 @@ async fn ensure_ready_with(
     let client = Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(PROBE_TIMEOUT)
         .build()
         .map_err(|e| Error::Provider(format!("Cannot prepare the Ollama readiness check: {e}")))?;
     let invalid = || {
@@ -196,7 +198,7 @@ async fn ensure_ready_with(
     };
     tokio::select! { biased;
         _ = cancel.wait() => return Err(Error::Canceled),
-        result = probe(&client, endpoint) => match result {
+        result = probe(&client, endpoint, initial_timeout) => match result {
             Probe::Ready(version) => return Ok((version, None)),
             Probe::Invalid | Probe::TimedOut => return Err(invalid()),
             Probe::Refused if endpoint != default_endpoint => return Err(Error::Provider(format!(
@@ -212,25 +214,34 @@ async fn ensure_ready_with(
     let server = OwnedServer::spawn(command, endpoint)?;
     let deadline = Instant::now() + startup_timeout;
     let readiness = async {
-        loop {
-            server.check_running()?;
-            match probe(&client, endpoint).await {
-                Probe::Ready(version) => {
-                    server.check_running()?;
-                    return Ok(version);
-                }
+        while !server.has_exited()? {
+            let result = probe(&client, endpoint, PROBE_TIMEOUT).await;
+            if server.has_exited()? {
+                break;
+            }
+            match result {
+                Probe::Ready(version) => return Ok((version, Some(server))),
                 Probe::Invalid => return Err(invalid()),
                 Probe::Refused | Probe::TimedOut => sleep(POLL_INTERVAL).await,
             }
         }
+
+        // If another server won the bind race, only the failed group is ours.
+        drop(server);
+        match probe(&client, endpoint, startup_timeout).await {
+            Probe::Ready(version) => Ok((version, None)),
+            Probe::Invalid | Probe::TimedOut => Err(invalid()),
+            Probe::Refused => Err(Error::Provider(
+                "'ollama serve' exited before becoming ready. Inspect the startup log and check whether the port is already in use".into(),
+            )),
+        }
     };
-    let version = tokio::select! { biased;
-        _ = cancel.wait() => return Err(Error::Canceled),
+    tokio::select! { biased;
+        _ = cancel.wait() => Err(Error::Canceled),
         result = timeout_at(deadline, readiness) => result.map_err(|_| Error::Provider(format!(
             "Ollama did not become ready within {startup_timeout:?} at {endpoint}. Inspect the startup log"
-        )))??,
-    };
-    Ok((version, Some(server)))
+        )))?,
+    }
 }
 
 #[cfg(test)]

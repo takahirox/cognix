@@ -107,15 +107,17 @@ async fn session(args: Args, cancel: &Cancellation) -> Result<i32, String> {
     }
     runtime.timeout = Duration::from_secs(args.command_timeout as u64);
     runtime.output_limit = args.output_limit;
-    let mut provider = Ollama::new(
-        &args.model,
-        &args.ollama_url,
-        Duration::from_secs(args.model_timeout as u64),
-        args.num_ctx,
-    )
-    .map_err(|e| e.to_string())?;
+    let model_timeout = Duration::from_secs(args.model_timeout as u64);
+    let initial_version_timeout = if args.dev_provision_model {
+        Duration::from_secs(1)
+    } else {
+        model_timeout
+    };
+    let mut provider = Ollama::new(&args.model, &args.ollama_url, model_timeout, args.num_ctx)
+        .map_err(|e| e.to_string())?;
     let (version, owned_server) = ollama_server::ensure_ready(
         provider.endpoint(),
+        initial_version_timeout,
         startup_timeout(args.dev_provision_model)?,
         cancel,
     )
@@ -153,7 +155,7 @@ async fn session(args: Args, cancel: &Cancellation) -> Result<i32, String> {
         let review_provider = Ollama::new(
             model,
             &args.ollama_url,
-            Duration::from_secs(args.model_timeout as u64),
+            model_timeout,
             args.num_ctx.min(32768),
         );
         let review_provider = match review_provider {
