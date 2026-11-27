@@ -219,12 +219,12 @@ the approval mode and sandbox policy.
 In the default `workspace-write` profile, commands and their children can
 write directly to the live project and private scratch space. The sandbox
 blocks external file data apart from installed runtimes, protects `.git`, and
-blocks direct network access. Workspace-write supports children created with
-fork and exec. A shell build script or a system Ruby build and test task such as
-`ruby -S rake` can run within the contained group. The profile blocks
-`posix_spawn` and process group changes so descendants stay within cancellation
-scope. Tools that require `posix_spawn`, including Homebrew Cargo, Apple's Make
-and Homebrew's Python launcher, are incompatible with this profile.
+blocks direct network access. Workspace-write supports tools such as Homebrew
+Cargo, Apple Make and system Ruby. It uses a temporary macOS launchd job and
+tracks the job's resource coalition so process group and session changes stay
+within cleanup scope. Apple developer tool shims use the standalone Command
+Line Tools when installed. Workspace commands stop before launch if the macOS
+job or identity-based process signaling is unavailable.
 `read-only` permits command writes only to scratch and prevents child
 processes. Approved `apply_patch` calls can write
 in either profile. Check
@@ -261,7 +261,8 @@ and command exit codes and output. Commands with write access may also change
 files directly, outside the patch ledger. In single-task mode, any failed or
 denied action makes the exit code 1, even if a later action succeeds. This
 includes brokered GET failures and denials, even when the parent command
-handles them and exits with code 0.
+handles them and exits with code 0. HTTP 4xx and 5xx responses are reported as
+failed GETs with their HTTP status.
 
 ### Verify a fix
 
@@ -304,7 +305,8 @@ cargo build --locked --release
 
 Deterministic tests use scripted providers and loopback HTTP fixtures; no model
 is needed. macOS integration tests execute real sandboxed subprocesses using
-Homebrew Python and system executables. They cover
+Homebrew Python, Homebrew Cargo, Apple Command Line Tools and system
+executables. They cover
 SIGINT in the CLI, model waits, committed patches, and running commands. Tests
 for macOS execution are compiled only on macOS; their absence on another host is
 not evidence of isolation. See the validation record for coverage and timings.

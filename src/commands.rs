@@ -10,16 +10,19 @@ use std::{
     fs,
     io::Read,
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, OwnedFd},
         unix::{
             fs::{MetadataExt, PermissionsExt},
             process::{CommandExt, ExitStatusExt},
         },
     },
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+
+#[cfg(target_os = "macos")]
+mod workspace;
 
 #[cfg(test)]
 thread_local! {
@@ -43,7 +46,7 @@ pub const RUNTIME_DIRS: &[&str] = &[
     "/System",
     "/Library/Apple",
     "/Library/Frameworks",
-    "/Library/Developer/CommandLineTools",
+    COMMAND_LINE_TOOLS,
     "/Applications/Xcode.app/Contents/Developer",
     "/opt/homebrew/Cellar",
     "/opt/homebrew/opt",
@@ -51,6 +54,7 @@ pub const RUNTIME_DIRS: &[&str] = &[
     "/opt/homebrew/bin",
 ];
 const COMMAND_PATH: &str = "/usr/bin:/bin:/opt/homebrew/bin";
+const COMMAND_LINE_TOOLS: &str = "/Library/Developer/CommandLineTools";
 // macOS system Ruby loads Rake, Minitest and other runtime gems from here.
 const SYSTEM_RUBY_GEMS: &str = "/Library/Ruby/Gems/2.6.0";
 
@@ -112,6 +116,7 @@ pub(crate) struct PreparedCommand {
     metadata: fs::Metadata,
     root: PathBuf,
     policy: ExecutionPolicy,
+    developer_dir: Option<&'static str>,
     pub fetch: Option<Fetch>,
     pub broker: bool,
 }
@@ -132,6 +137,14 @@ impl PreparedCommand {
         };
         let (invocation, executable, metadata) =
             Self::resolve(root, policy, program, fetch.is_some())?;
+        // Apple's tool shims can use the standalone toolchain without consulting
+        // full Xcode's GUI services and preferences, which Seatbelt bars.
+        let developer_dir = (policy == ExecutionPolicy::Sandbox(SandboxMode::WorkspaceWrite)
+            && fetch.is_none()
+            && Path::new(COMMAND_LINE_TOOLS)
+                .join("usr/bin/clang")
+                .is_file())
+        .then_some(COMMAND_LINE_TOOLS);
         for path in [root, &invocation, &executable] {
             path.to_str().ok_or("Command paths must be UTF-8")?;
         }
@@ -142,6 +155,7 @@ impl PreparedCommand {
             metadata,
             root: root.to_owned(),
             policy,
+            developer_dir,
             fetch,
             broker: false,
         })
@@ -204,7 +218,7 @@ impl PreparedCommand {
                 "Read-only project; no network; scratch writes only."
             }
             ExecutionPolicy::Sandbox(SandboxMode::WorkspaceWrite) => {
-                "Writes to the live project and private scratch; no direct network or .git access. Fork/exec children inherit the sandbox and cannot detach. posix_spawn is blocked."
+                "Writes to the live project and private scratch; no direct network or .git access. Child processes inherit the sandbox and are stopped with the command."
             }
             ExecutionPolicy::FullAccess => {
                 "Full access to files, network and inherited environment."
@@ -227,7 +241,7 @@ impl PreparedCommand {
             evidence: json!({"executable":self.executable,"invocation":self.invocation,
                 "project_root":self.root, "working_directory":if self.fetch.is_some() { json!("private scratch") } else { json!(self.root) },
                 "restrictions":restrictions,"requested_network":permissions,"http_get_broker":self.broker,
-                "effective_argv":self.fetch.as_ref().map(Fetch::args),
+                "effective_argv":self.fetch.as_ref().map(Fetch::args),"developer_dir":self.developer_dir,
                 "executable_identity":[self.metadata.dev(),self.metadata.ino(),self.metadata.ctime() as u64,self.metadata.ctime_nsec() as u64]}),
         }
     }
@@ -306,10 +320,8 @@ fn wrap_sandbox(
         .join(" ");
     let workspace = match mode {
         SandboxMode::ReadOnly => String::new(),
-        // posix_spawn can set a new group or session inside the kernel without
-        // calling setpgid/setsid. Seatbelt cannot filter those spawn attributes.
         SandboxMode::WorkspaceWrite => format!(
-            "(allow process-fork) (deny syscall-unix (syscall-number SYS_setsid SYS_setpgid SYS_posix_spawn) (with errno EPERM)) (allow file-write* (subpath {})) (deny file-write* (literal {})) (deny file-link)",
+            "(allow process-fork) (deny syscall-unix (syscall-number SYS_setsid SYS_setpgid) (with errno EPERM)) (allow file-write* (subpath {})) (deny file-write* (literal {})) (deny file-link)",
             quote(root),
             quote(root)
         ),
@@ -477,37 +489,59 @@ fn command_exited(pid: i32) -> std::io::Result<bool> {
     Ok(unsafe { info.si_pid() } != 0)
 }
 
-#[cfg(target_os = "macos")]
-fn stop_workspace_group(pid: i32) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        // Darwin signals a snapshot of the group. Repeat so a concurrent fork
-        // cannot outlive the signal to its parent.
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
-        if command_exited(pid).map_err(|error| error.to_string())? {
-            // PROC_PGRP_ONLY is a kernel snapshot including zombies. Two slots
-            // suffice to distinguish a lone unreaped leader from any other member.
-            const PROC_PGRP_ONLY: u32 = 2;
-            let mut pids = [0i32; 2];
-            let bytes = unsafe {
-                libc::proc_listpids(
-                    PROC_PGRP_ONLY,
-                    pid as u32,
-                    pids.as_mut_ptr().cast(),
-                    size_of_val(&pids) as i32,
-                )
-            };
-            if bytes == size_of::<i32>() as i32 && pids[0] == pid {
-                return Ok(());
-            }
+enum RunningCommand {
+    Local(Child),
+    #[cfg(target_os = "macos")]
+    Workspace(workspace::Job),
+}
+
+impl RunningCommand {
+    fn id(&self) -> i32 {
+        match self {
+            Self::Local(child) => child.id() as i32,
+            #[cfg(target_os = "macos")]
+            Self::Workspace(job) => job.id(),
         }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "Could not verify that every process in command group {pid} stopped"
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(5));
     }
+
+    fn exited(&mut self) -> std::io::Result<bool> {
+        match self {
+            Self::Local(child) => {
+                #[cfg(target_os = "macos")]
+                return command_exited(child.id() as i32);
+                #[cfg(not(target_os = "macos"))]
+                return child.try_wait().map(|status| status.is_some());
+            }
+            #[cfg(target_os = "macos")]
+            Self::Workspace(job) => job.exit_status().map(|status| status.is_some()),
+        }
+    }
+}
+
+fn spawn_local(mut command: Command) -> Result<(fs::File, RunningCommand), String> {
+    // One pipe keeps stdout/stderr ordering and permits a single combined byte cap.
+    let (reader, writer) = std::io::pipe().map_err(|e| e.to_string())?;
+    command
+        .stdout(writer.try_clone().map_err(|e| e.to_string())?)
+        .stderr(writer);
+    #[cfg(target_os = "macos")]
+    let mut descriptors = descriptor_buffer()
+        .map_err(|e| format!("Cannot prepare descriptor isolation; command not run: {e}"))?;
+    // SAFETY: only syscall wrappers and preallocated memory are used after fork.
+    unsafe {
+        command.pre_exec(move || {
+            #[cfg(target_os = "macos")]
+            sanitize_descriptors(&mut descriptors)?;
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command
+        .spawn()
+        .map_err(|e| format!("Command launch failed: {e}"))?;
+    Ok((OwnedFd::from(reader).into(), RunningCommand::Local(child)))
 }
 
 pub fn run(
@@ -603,6 +637,8 @@ fn capture(
         return Ok((unexecuted("canceled"), Vec::new()));
     }
     let mut temporary = None;
+    #[cfg(target_os = "macos")]
+    let mut workspace_scratch_parent = None;
     let mut command = Command::new(&prepared.invocation);
     command.current_dir(root).stdin(Stdio::null());
     if let ExecutionPolicy::Sandbox(mode) = prepared.policy {
@@ -614,7 +650,7 @@ fn capture(
         }
         let temp = tempfile::Builder::new()
             .prefix("cognix-check-")
-            .tempdir_in(scratch_parent)
+            .tempdir_in(&scratch_parent)
             .map_err(|e| e.to_string())?;
         let scratch = temp.path().canonicalize().map_err(|e| e.to_string())?;
         let scratch_str = scratch.to_str().ok_or("Non-UTF8 scratch")?;
@@ -628,6 +664,10 @@ fn capture(
                 fetch.args()
             });
         } else {
+            #[cfg(target_os = "macos")]
+            if mode == SandboxMode::WorkspaceWrite {
+                workspace_scratch_parent = Some(scratch_parent);
+            }
             let validation = validate_project_reads(root, cancel, deadline);
             if cancel.is_canceled() {
                 return Ok((unexecuted("canceled"), Vec::new()));
@@ -671,29 +711,33 @@ fn capture(
         if let Some((path, _)) = broker {
             command.env("COGNIX_HTTP_SOCKET", path);
         }
+        if let Some(developer_dir) = prepared.developer_dir {
+            command.env("DEVELOPER_DIR", developer_dir);
+        }
         temporary = Some(temp);
     } else {
         command.args(&prepared.argv[1..]);
     }
-    // One pipe keeps stdout/stderr ordering and permits a single combined byte cap.
-    let (mut reader, writer) = std::io::pipe().map_err(|e| e.to_string())?;
-    command
-        .stdout(writer.try_clone().map_err(|e| e.to_string())?)
-        .stderr(writer);
     #[cfg(target_os = "macos")]
-    let mut descriptors = descriptor_buffer()
-        .map_err(|e| format!("Cannot prepare descriptor isolation; command not run: {e}"))?;
-    // SAFETY: only syscall wrappers and preallocated memory are used after fork.
-    unsafe {
-        command.pre_exec(move || {
-            #[cfg(target_os = "macos")]
-            sanitize_descriptors(&mut descriptors)?;
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
+    let job = if let Some(scratch_parent) = workspace_scratch_parent {
+        match workspace::Job::prepare(&command, &scratch_parent, cancel, deadline).map_err(|e| {
+            format!("Cannot prepare workspace command containment; command not run: {e}")
+        })? {
+            Some(job) => Some(job),
+            None => {
+                return Ok((
+                    unexecuted(if cancel.is_canceled() {
+                        "canceled"
+                    } else {
+                        "limit_reached"
+                    }),
+                    Vec::new(),
+                ));
             }
-            Ok(())
-        });
-    }
+        }
+    } else {
+        None
+    };
     // Refuse to launch if the submitted path no longer resolves to the approved executable.
     let executable_check = prepared.check_executable();
     if cancel.is_canceled() {
@@ -703,15 +747,21 @@ fn capture(
         return Ok((unexecuted("limit_reached"), Vec::new()));
     }
     executable_check?;
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("Command launch failed: {e}"))?;
+    #[cfg(target_os = "macos")]
+    let (mut reader, mut child) = if let Some((reader, mut job)) = job {
+        job.start()
+            .map_err(|e| format!("Command launch failed: {e}"))?;
+        (reader, RunningCommand::Workspace(job))
+    } else {
+        spawn_local(command)?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (mut reader, mut child) = spawn_local(command)?;
     #[cfg(test)]
     boundary("spawned");
-    drop(command);
     // A signal handler only sets an atomic flag: spawn ownership, commit and ledger
     // updates cannot be unwound by SIGINT, even at the return from spawn/rename.
-    let pid = child.id() as i32;
+    let pid = child.id();
     let fd = reader.as_raw_fd();
     // SAFETY: fd belongs to reader and remains open throughout the loop.
     let nonblocking = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
@@ -752,11 +802,7 @@ fn capture(
                 break;
             }
         }
-        #[cfg(target_os = "macos")]
-        let exited = command_exited(pid);
-        #[cfg(not(target_os = "macos"))]
-        let exited = child.try_wait().map(|status| status.is_some());
-        match exited {
+        match child.exited() {
             Ok(true) => {
                 // A descendant can hold the output pipe after the leader exits.
                 if let Some((_, network_lifetime)) = broker {
@@ -792,24 +838,19 @@ fn capture(
     }
     #[cfg(test)]
     boundary("cleanup");
-    #[cfg(target_os = "macos")]
-    let workspace = prepared.policy == ExecutionPolicy::Sandbox(SandboxMode::WorkspaceWrite)
-        && prepared.fetch.is_none();
-    #[cfg(not(target_os = "macos"))]
-    let workspace = false;
-    if !workspace {
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
-    }
-    #[cfg(target_os = "macos")]
-    let cleanup_error = if workspace {
-        stop_workspace_group(pid).err()
-    } else {
-        None
+    let (exit, cleanup_error) = match &mut child {
+        RunningCommand::Local(child) => {
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            (child.wait().map(Some), None)
+        }
+        #[cfg(target_os = "macos")]
+        RunningCommand::Workspace(job) => {
+            let cleanup = job.stop().err();
+            (job.exit_status(), cleanup)
+        }
     };
-    #[cfg(not(target_os = "macos"))]
-    let cleanup_error: Option<String> = None;
-    let exit = match child.wait() {
-        Ok(exit) => Some(exit),
+    let exit = match exit {
+        Ok(exit) => exit,
         Err(e) => {
             io_error = Some(format!(
                 "Launched command process {pid} could not be reaped: {e}"
@@ -824,7 +865,7 @@ fn capture(
     }
     if let Some(error) = cleanup_error {
         state = Some("cleanup_failed");
-        io_error = Some(error);
+        io_error = Some(error.to_string());
         cancel.cancel();
     }
     let code = exit.map(|e| e.code().unwrap_or_else(|| -e.signal().unwrap_or(1)));

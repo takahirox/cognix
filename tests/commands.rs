@@ -204,6 +204,12 @@ fn workspace_write_runs_build_children_and_enforces_file_and_network_boundaries(
 
     let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     endpoint.set_nonblocking(true).unwrap();
+    let probe = r#"
+import os, sys
+pid = os.posix_spawn(sys.executable, [sys.executable, '-c', sys.argv[1]], os.environ)
+_, status = os.waitpid(pid, 0)
+assert os.waitstatus_to_exitcode(status) == 1
+"#;
     for code in [
         format!("open({}).read()", json!(secret)),
         format!("open({},'w').write('bad')", json!(secret)),
@@ -219,9 +225,16 @@ fn workspace_write_runs_build_children_and_enforces_file_and_network_boundaries(
     ] {
         let result = runtime.execute(
             "run_command",
-            json!({"argv":[common::FRAMEWORK_PYTHON,"-c",code]}),
+            json!({"argv":[common::FRAMEWORK_PYTHON,"-c",probe,code]}),
         );
-        assert_eq!(result["status"], "failed", "{code} {result}");
+        assert_eq!(result["status"], "passed", "{code} {result}");
+        assert!(
+            result["output"]
+                .as_str()
+                .unwrap()
+                .contains("PermissionError:"),
+            "{code} {result}"
+        );
     }
     assert!(endpoint.accept().is_err());
     assert_eq!(fs::read_to_string(secret).unwrap(), "private");
@@ -296,67 +309,84 @@ fn full_access_requires_opt_in_and_uses_the_project_executable() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn cancellation_stops_workspace_writes_after_descendants_attempt_to_detach() {
+fn workspace_cleanup_stops_detached_writers_after_exit_and_cancellation() {
     use cognix::runtime::Runtime;
 
-    let project = tempfile::tempdir().unwrap();
-    let cancel = Cancellation::default();
-    let mut runtime = Runtime::new(project.path(), Box::new(|_, _| true), cancel.clone()).unwrap();
-    let marker = project.path().join("started");
-    let timer = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !marker.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        cancel.cancel();
-        assert!(marker.exists(), "child did not start before cancellation");
-    });
     let code = r#"
-import errno, os, sys, time
+import os, sys, time
 from pathlib import Path
 
-if os.fork() != 0:
-    os.wait()
-    time.sleep(3)
-    sys.exit()
+writer = '''
+import os, sys, time
+from pathlib import Path
+
+# Reparent before signaling readiness, and leave no inherited output pipe.
 if os.fork() != 0:
     os._exit(0)
-
-errors = []
-for attempt in (
-    os.setsid,
-    lambda: os.setpgid(0, 0),
-    lambda: os.posix_spawn('/bin/true', ['true'], {}, setsid=True),
-    lambda: os.posix_spawn('/bin/true', ['true'], {}, setpgroup=0),
-):
-    try:
-        attempt()
-        errors.append('allowed')
-    except OSError as error:
-        errors.append(str(error.errno))
-Path('attempts').write_text(' '.join(errors))
+name = sys.argv[1]
+while os.getppid() != 1:
+    time.sleep(0.005)
+assert os.getpgrp() != int(sys.argv[2])
 os.close(1)
 os.close(2)
-with open('writes', 'wb', buffering=0) as output:
+with open(name + '.writes', 'wb', buffering=0) as output:
     output.write(b'x')
-    Path('started').touch()
+    Path(name).touch()
     for _ in range(150):
         time.sleep(0.01)
         output.write(b'x')
+'''
+for name, flags in [('session', {'setsid': True}), ('group', {'setpgroup': 0})]:
+    pid = os.posix_spawn(sys.executable, [sys.executable, '-c', writer, name, str(os.getpgrp())], os.environ, **flags)
+    assert os.waitpid(pid, 0)[1] == 0
+deadline = time.monotonic() + 3
+while not all(Path(name).is_file() for name in ('session', 'group')):
+    assert time.monotonic() < deadline
+    time.sleep(0.005)
+if sys.argv[1] == 'wait':
+    time.sleep(5)
 "#;
-    let result = runtime.execute(
-        "run_command",
-        json!({"argv":[common::FRAMEWORK_PYTHON,"-c",code]}),
-    );
-    timer.join().unwrap();
-    assert_eq!(result["status"], "canceled", "{result}");
-    assert_eq!(result["executed"], true);
-    assert_eq!(
-        fs::read_to_string(project.path().join("attempts")).unwrap(),
-        format!("{0} {0} {0} {0}", libc::EPERM)
-    );
-    let writes = project.path().join("writes");
-    let at_return = fs::metadata(&writes).unwrap().len();
-    std::thread::sleep(Duration::from_millis(150));
-    assert_eq!(fs::metadata(writes).unwrap().len(), at_return);
+    for (action, status, exit_code) in [("exit", "passed", 0), ("wait", "canceled", -libc::SIGKILL)]
+    {
+        let project = tempfile::tempdir().unwrap();
+        let cancel = Cancellation::default();
+        let mut runtime =
+            Runtime::new(project.path(), Box::new(|_, _| true), cancel.clone()).unwrap();
+        let root = project.path().to_owned();
+        let timer = (action == "wait").then(|| {
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let started = || {
+                    ["session", "group"]
+                        .iter()
+                        .all(|name| root.join(name).is_file())
+                };
+                while !started() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                cancel.cancel();
+                assert!(
+                    started(),
+                    "detached children did not start before cancellation"
+                );
+            })
+        });
+        let result = runtime.execute(
+            "run_command",
+            json!({"argv":[common::FRAMEWORK_PYTHON,"-c",code,action]}),
+        );
+        if let Some(timer) = timer {
+            timer.join().unwrap();
+        }
+        assert_eq!(result["status"], status, "{result}");
+        assert_eq!(result["executed"], true);
+        assert_eq!(result["exit_code"], exit_code);
+        let lengths = || {
+            ["session.writes", "group.writes"]
+                .map(|name| fs::metadata(project.path().join(name)).unwrap().len())
+        };
+        let at_return = lengths();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(lengths(), at_return);
+    }
 }

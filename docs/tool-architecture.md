@@ -309,7 +309,7 @@ session-wide choice.
 | Profile | Command permissions |
 | --- | --- |
 | `read-only` | Runtime and project reads, scratch writes, and no child processes. |
-| `workspace-write` | Project and runtime reads, including macOS system Ruby gems, with live project writes and fork/exec children confined to the command's process group. |
+| `workspace-write` | Project and runtime reads, including macOS system Ruby gems, with live project writes and subprocess cleanup scoped to a dedicated macOS resource coalition. |
 | Full access approval mode | Commands use ordinary OS access and the inherited environment without a Cognix sandbox or approval. |
 
 In the sandboxed profiles, the selected command starts from the project root,
@@ -322,11 +322,12 @@ at execution even when a reviewer approves the command. Command results
 preserve exit/signal and bounded output. A project command can write directly
 without generating a patch-ledger entry.
 
-In workspace-write, Seatbelt blocks group and session changes and
-`posix_spawn`, which can set them internally. Cognix keeps the group leader's
-PID reserved until it verifies group cleanup. Build tools that depend on
-`posix_spawn` require a different execution environment. Full-access commands
-can detach. Process-group cleanup provides no resource quotas.
+Workspace-write uses a temporary launchd job with a dedicated resource coalition.
+Cognix verifies the coalition before the sandboxed program starts. Children
+created by `posix_spawn` inherit both Seatbelt and coalition membership. Cleanup
+signals coalition members by process identity and checks the kernel task count
+until it reaches zero. Full-access commands use process-group cleanup and can
+detach. Cleanup provides no resource quotas.
 
 ### Destination-scoped network requests
 
