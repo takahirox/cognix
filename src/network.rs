@@ -205,6 +205,7 @@ pub(crate) fn deny_origin(origin: &str) -> Result<String, String> {
 
 const MAX_REQUEST_BYTES: usize = 8192;
 const MAX_REQUESTS: usize = 16;
+const REQUEST_LIMIT_REJECTION: (u16, &str) = (429, "Too many requests for this action");
 
 /// Private per-command HTTP GET endpoint. HTTP headers and bodies supplied by
 /// the project are never forwarded. No CONNECT, redirect following or tunneling.
@@ -214,6 +215,7 @@ pub(crate) struct Broker {
     _directory: tempfile::TempDir,
     pending: Option<(Request, Vec<u8>, Instant)>,
     remaining: usize,
+    rejected_over_budget: bool,
 }
 
 pub(crate) struct Request(UnixStream);
@@ -256,11 +258,16 @@ impl Broker {
             _directory: directory,
             pending: None,
             remaining: MAX_REQUESTS,
+            rejected_over_budget: false,
         })
     }
 
     pub(crate) fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    pub(crate) fn request_limit_rejection(&self) -> Option<(u16, &'static str)> {
+        self.rejected_over_budget.then_some(REQUEST_LIMIT_REJECTION)
     }
 
     pub(crate) fn next(&mut self) -> Option<(Request, Fetch)> {
@@ -269,7 +276,9 @@ impl Broker {
             stream.set_nonblocking(true).ok()?;
             let request = Request(stream);
             if self.remaining == 0 {
-                request.respond(429, b"Too many requests for this action", None);
+                self.rejected_over_budget = true;
+                let (status, error) = REQUEST_LIMIT_REJECTION;
+                request.respond(status, error.as_bytes(), None);
                 return None;
             }
             self.remaining -= 1;

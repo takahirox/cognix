@@ -290,6 +290,51 @@ fn upstream_http_error_fails_task_even_when_the_parent_handles_it() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn broker_request_limit_fails_task_even_when_the_parent_handles_it() {
+    let project = tempfile::tempdir().unwrap();
+    let destination = Server::new(|_, _| Reply::json(json!("artifact")));
+    let script = format!(
+        r#"
+        get() {{ {BROKER_CURL} --output /dev/null --write-out '%{{http_code}}'; }}
+        for ((i=0; i<16; i++)); do
+            [ "$(get "$1/artifact")" = 200 ] || exit 2
+        done
+        [ "$(get "$1/over-budget-first")" = 429 ] && [ "$(get "$1/over-budget-second")" = 429 ]
+        "#
+    );
+    let server = command_task_server(
+        json!(["/bin/bash", "-c", script, "get", destination.url]),
+        true,
+    );
+    let out = run(
+        command(project.path(), &server.url).args(["--task", "Get the artifacts"]),
+        &"y\n".repeat(17),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"passed\"; executed=true; exit=0"),
+        "{stdout}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("Network GET \"failed\" (HTTP 429): Too many requests for this action")
+            .count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("Approve this action?").count(), 17);
+    let requests = destination.requests.lock().unwrap();
+    assert_eq!(requests.len(), 16);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["path"] == "/artifact")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn broker_prompt_stops_when_command_exits_or_times_out() {
     let project = tempfile::tempdir().unwrap();
     let destination = Server::new(|_, _| Reply::json(json!("must stay blocked")));
