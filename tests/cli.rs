@@ -55,6 +55,164 @@ fn final_answer() -> Reply {
     )
 }
 
+#[cfg(target_os = "macos")]
+fn command_task_server(argv: Value, http_get: bool) -> Server {
+    Server::new(move |p, b| {
+        if p != "/api/chat" || b["messages"].as_array().unwrap().len() == 1 {
+            ready(p, b)
+        } else if b["messages"].as_array().unwrap().len() == 2 {
+            tool("run_command", json!({"argv":argv,"http_get":http_get}))
+        } else {
+            final_answer()
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn default_workspace_profile_builds_and_tests_a_ruby_gem() {
+    let project = tempfile::tempdir().unwrap();
+    for (path, content) in [
+        (
+            "Rakefile",
+            r#"require 'openssl'
+require 'rake/testtask'
+
+task :build do
+  sh '/usr/bin/ruby', '-S', 'gem', 'build', 'sample.gemspec'
+end
+Rake::TestTask.new { |t| t.pattern = 'test_sample.rb' }
+task default: [:build, :test]
+"#,
+        ),
+        (
+            "sample.gemspec",
+            r#"Gem::Specification.new do |s|
+  s.name = 'sample'
+  s.version = '0.1.0'
+  s.summary = 'Sandbox test fixture'
+  s.authors = ['Cognix']
+  s.license = 'MIT'
+  s.files = ['sample.rb']
+end
+"#,
+        ),
+        ("sample.rb", "def add(a, b)\n  a + b\nend\n"),
+        (
+            "test_sample.rb",
+            r#"require 'minitest/autorun'
+require_relative 'sample'
+
+class TestSample < Minitest::Test
+  def test_add
+    assert_equal 5, add(2, 3)
+  end
+end
+"#,
+        ),
+    ] {
+        fs::write(project.path().join(path), content).unwrap();
+    }
+    let server = command_task_server(json!(["/usr/bin/ruby", "-S", "rake"]), false);
+    let out = run(
+        command(project.path(), &server.url).args(["--task", "Build and test the gem"]),
+        "y\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("\"passed\"; executed=true; exit=0"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("1 runs, 1 assertions, 0 failures"),
+        "{stdout}"
+    );
+    assert!(project.path().join("sample-0.1.0.gem").is_file());
+}
+
+#[cfg(target_os = "macos")]
+const BROKER_CURL: &str = r#"/usr/bin/curl --disable --silent --fail --unix-socket "$COGNIX_HTTP_SOCKET" --request-target "$1" http://localhost/"#;
+
+#[cfg(target_os = "macos")]
+#[test]
+fn denied_broker_request_fails_task_and_preserves_parent_exit_code() {
+    let project = tempfile::tempdir().unwrap();
+    let destination = Server::new(|_, _| Reply::json(json!("must stay blocked")));
+    let url = format!("{}/artifact", destination.url);
+    let script = format!("if {BROKER_CURL}; then exit 2; fi; exit 0");
+    let server = command_task_server(json!(["/bin/bash", "-c", script, "get", url]), true);
+    let out = run(
+        command(project.path(), &server.url).args(["--task", "Get the artifact"]),
+        "y\nn\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"passed\"; executed=true; exit=0"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("Network GET \"{url}\" \"denied\"")),
+        "{stdout}"
+    );
+    assert!(destination.requests.lock().unwrap().is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn broker_prompt_stops_when_command_exits_or_times_out() {
+    let project = tempfile::tempdir().unwrap();
+    let destination = Server::new(|_, _| Reply::json(json!("must stay blocked")));
+    let url = format!("{}/artifact", destination.url);
+    for (script, timeout, expected_code, expected_result) in [
+        (
+            BROKER_CURL.to_owned(),
+            "1",
+            1,
+            "\"limit_reached\"; executed=true; exit=-9",
+        ),
+        (
+            // Keep the output pipe open while the leader exits. The broker
+            // must stop the prompt even before the command output reaches EOF.
+            format!("{BROKER_CURL} & /bin/sleep 1; exit 0"),
+            "10",
+            0,
+            "\"passed\"; executed=true; exit=0",
+        ),
+    ] {
+        let server = command_task_server(json!(["/bin/bash", "-c", script, "get", url]), true);
+        let mut child = command(project.path(), &server.url)
+            .args(["--task", "Get the artifact", "--command-timeout", timeout])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Leave stdin open without answering the destination prompt.
+        child.stdin.as_mut().unwrap().write_all(b"y\n").unwrap();
+        let status = finished(&mut child);
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert_eq!(status.code(), Some(expected_code), "{stdout}");
+        assert_eq!(
+            stdout.matches("Approve this action?").count(),
+            2,
+            "{stdout}"
+        );
+        assert!(stdout.contains(expected_result), "{stdout}");
+        assert!(
+            stdout.contains(&format!("Network GET \"{url}\" \"stopped\"")),
+            "{stdout}"
+        );
+    }
+    assert!(destination.requests.lock().unwrap().is_empty());
+}
+
 #[test]
 fn create_file_preview_approval_defaults_and_eof() {
     for input in ["y\n", "n\n", "\n", "", "y"] {

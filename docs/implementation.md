@@ -131,6 +131,9 @@ private scratch for HOME and temporary files. The environment is rebuilt and
 inherited descriptors above stderr are marked close-on-exec. Both profiles
 protect Git metadata and outside files. `workspace-write` additionally permits
 live workspace writes and fork/exec subprocesses under the same Seatbelt policy.
+It also allows reads from macOS's system Ruby gem directory for local build and
+test tasks. LibreSSL sees its optional system configuration as absent in this
+profile and in sandboxed broker clients.
 `read-only` keeps the workspace read-only to commands and disallows descendants.
 Approved patch publication uses its own descriptor-relative boundary in both
 profiles.
@@ -144,8 +147,10 @@ Origin denials apply before any approval. A command proposed with `http_get:
 true` receives a single private Unix socket path. Its direct network access
 remains blocked. The broker accepts absolute HTTP(S) URLs in GET requests and
 returns the HTTP status and bounded body. Each GET needs its own approval and
-must complete within the original command's deadline. Cognix drops client
-headers and returns no redirect location. Each command can submit up to 16
+must complete while the parent command is active. Cognix releases any pending
+confirmation when that command exits or times out. A denied GET makes `--task`
+exit 1 while the report preserves the parent command's exit code. Cognix drops
+client headers and returns no redirect location. Each command can submit up to 16
 requests and receive up to 4 MiB per response.
 
 When approval mode is `auto`, the approval boundary prepares an independent

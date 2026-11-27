@@ -309,7 +309,7 @@ session-wide choice.
 | Profile | Command permissions |
 | --- | --- |
 | `read-only` | Runtime and project reads, scratch writes, and no child processes. |
-| `workspace-write` | The same read boundary, with live project writes and fork/exec children confined to the command's process group. |
+| `workspace-write` | Project and runtime reads, including macOS system Ruby gems, with live project writes and fork/exec children confined to the command's process group. |
 | Full access approval mode | Commands use ordinary OS access and the inherited environment without a Cognix sandbox or approval. |
 
 In the sandboxed profiles, the selected command starts from the project root,
