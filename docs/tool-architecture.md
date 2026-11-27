@@ -298,7 +298,7 @@ have zero committed substeps; failure after effects must never say nothing ran.
 
 ### Shipped command and approval contract
 
-`run_command(argv)` continues to accept literal argv with no per-call sandbox
+`run_command` continues to accept literal argv with no per-call sandbox
 switch. The host selects `read-only` or `workspace-write` independently of
 whether per-action approval is manual or automatic. Workspace-write uses the
 live project tree for build output, formatters and generators. Changes are
@@ -309,7 +309,7 @@ session-wide choice.
 | Profile | Command permissions |
 | --- | --- |
 | `read-only` | Runtime and project reads, scratch writes, and no child processes. |
-| `workspace-write` | The same read boundary, with live project writes and child processes that inherit Seatbelt. |
+| `workspace-write` | The same read boundary, with live project writes and fork/exec children confined to the command's process group. |
 | Full access approval mode | Commands use ordinary OS access and the inherited environment without a Cognix sandbox or approval. |
 
 In the sandboxed profiles, the selected command starts from the project root,
@@ -322,22 +322,25 @@ at execution even when a reviewer approves the command. Command results
 preserve exit/signal and bounded output. A project command can write directly
 without generating a patch-ledger entry.
 
-The existing command process group handles normal build/test cancellation.
-Seatbelt restrictions continue to apply to children that deliberately detach.
-Process-group cleanup does not cover detached groups or impose resource quotas.
-The read-only profile is available when no subprocesses should be created.
+In workspace-write, Seatbelt blocks group and session changes and
+`posix_spawn`, which can set them internally. Cognix keeps the group leader's
+PID reserved until it verifies group cleanup. Build tools that depend on
+`posix_spawn` require a different execution environment. Full-access commands
+can detach. Process-group cleanup provides no resource quotas.
 
 ### Destination-scoped network requests
 
-Sandboxed project processes keep network blocked, including loopback. A literal
+Sandboxed project processes keep direct network blocked, including loopback. A literal
 `curl` or `/usr/bin/curl` plus one HTTP(S) URL asks the host for a fixed GET
 transport. The hosted action uses the exact validated URL, the system HTTP
 client and private scratch. The scope shows the protocol, host, port, URL and
-method. Ordinary subprocesses receive no broker connection, socket or added
-network rights. The transport runs without user flags, proxy settings or
-redirect following. A new destination from a redirect or a subsequent proposal
-gets its own policy and approval check. Other command network capabilities have
-no destination-enforced path.
+method. A sandboxed command with `http_get: true` can submit an exact URL over a
+private per-command Unix socket. Cognix includes the parent command and the
+fresh network scope in review evidence, then uses the same system transport
+for the approved request. The transport receives no project headers, bodies,
+flags, proxy settings or redirect permissions. A new destination or a
+subsequent request gets its own policy and approval check. Other transports
+remain unavailable to sandboxed commands.
 
 Manual mode asks the user to approve the exact request. Auto mode can approve
 an unlisted destination when justified by user intent. `deny_network` entries

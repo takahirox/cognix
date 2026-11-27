@@ -219,11 +219,14 @@ the approval mode and sandbox policy.
 In the default `workspace-write` profile, commands and their children can
 write directly to the live project and private scratch space. The sandbox
 blocks external file data apart from installed runtimes, protects `.git`, and
-blocks network access. `read-only` permits command writes only to scratch
-and prevents child processes. Approved `apply_patch` calls can write in either
-profile. Some tools need additional system services or user-owned toolchains.
-Use supported installed runtimes and provision dependencies separately for
-offline build and test workflows. Check
+blocks direct network access. Workspace-write supports children created with
+fork and exec. It blocks `posix_spawn` and process group changes so descendants
+stay within cancellation scope. Tools that require `posix_spawn`, including
+Apple's Make and Homebrew's Python launcher, are incompatible with this
+profile. A shell build script or direct interpreter executable can run
+within the contained group. `read-only` permits command writes only to
+scratch and prevents child processes. Approved `apply_patch` calls can write
+in either profile. Check
 [the sandbox details](docs/implementation.md#verification-policy-and-isolation)
 for the readable runtime paths and process limits.
 
@@ -233,9 +236,20 @@ reviews the URL, host, port and protocol, including any query data sent by the
 request. A configured `deny_network` entry blocks the corresponding origin
 before review. Each additional URL is a new proposal. The broker returns
 redirect responses for inspection and leaves the redirected URL unrequested.
-Shells, build tools, other clients, and curl invocations with extra options
-keep their ordinary sandbox with network blocked. Network access for those
-commands requires a transport that can enforce the destination scope.
+
+Build and test scripts that fetch files can opt in to the private broker with
+`"http_get": true` alongside the command's `argv`. A running script can request
+an exact URL through the Unix socket identified by `COGNIX_HTTP_SOCKET`.
+
+```sh
+/usr/bin/curl --disable --fail --unix-socket "$COGNIX_HTTP_SOCKET" \
+  --request-target "$artifact_url" http://localhost/ -o artifact
+```
+
+Each GET has its own confirmation in manual mode or review in auto mode.
+The configured origin denials apply in both modes. The private connection
+returns the upstream status and body (up to 4 MiB per request). Outbound
+headers, uploads, tunnels, redirects and direct network access remain blocked.
 
 Ctrl-C cancels work and exits with code 130. Use `/exit` or EOF at the task prompt
 to end the session, or `--task 'request'` for one task. Reports record patch paths
@@ -252,7 +266,7 @@ and launch Cognix there.
 project=$(mktemp -d)
 cp tests/fixtures/division/*.py "$project/"
 cd "$project"
-cognix
+cognix --sandbox-mode read-only
 ```
 
 Paste the following as a single task at the prompt.
@@ -284,7 +298,7 @@ cargo build --locked --release
 
 Deterministic tests use scripted providers and loopback HTTP fixtures; no model
 is needed. macOS integration tests execute real sandboxed subprocesses using
-`/opt/homebrew/bin/python3` and fail if that boundary is unavailable. They cover
+Homebrew Python and system executables. They cover
 SIGINT in the CLI, model waits, committed patches, and running commands. Tests
 for macOS execution are compiled only on macOS; their absence on another host is
 not evidence of isolation. See the validation record for coverage and timings.

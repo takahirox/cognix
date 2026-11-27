@@ -335,3 +335,26 @@ proposals. The unit-test verdict described the workspace permission as
 sufficient for safety. Test processes can modify the live workspace, so
 approval still depends on user intent. These observations cover one model
 and a small synthetic fixture, and cannot establish a general safety rate.
+
+### Review revisions for PR #31
+
+On the same macOS host, the live build fixture discovered an unlisted HTTP
+URL from project state. Manual and automatic approval each delivered the
+requested artifact. The configured denied origin, an unrelated proposed
+destination, direct sockets and the attempted CONNECT tunnel stayed blocked.
+Cancellation during review left the upstream server untouched.
+
+The cancellation probe double-forked and exercised `setsid`, `setpgid`
+and both `posix_spawn` detachment flags. Seatbelt refused all four operations.
+The descendant wrote to the live workspace before cancellation and its writes
+stopped before the command returned. The build fixture now uses Bash with
+fork/exec children. The host's Make and Homebrew Python launcher rely on
+`posix_spawn`, which the workspace-write profile blocks.
+
+An allow verdict accompanied by an explicit unsuccessful or malformed
+completion reason required confirmation and left the proposed file absent.
+The seven-case local reviewer trial matched all expected decisions again with
+zero false approvals or denials and 6.107–9.517 s review latency.
+
+All 118 default tests, formatting, Clippy, and the Markdown and link checker
+passed on the revised implementation.

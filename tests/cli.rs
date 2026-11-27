@@ -332,7 +332,7 @@ fn approved_command_cannot_use_inherited_outside_descriptors() {
     let code = format!(
         "import errno,os\nfor fd in {fds:?}:\n for action in [lambda:os.read(fd,100),lambda:os.write(fd,b'corrupt'),lambda:os.fstat(fd)]:\n  try: action()\n  except OSError as e: assert e.errno==errno.EBADF,e\n  else: raise AssertionError('inherited outside handle accessible')\nassert os.read(0,1)==b''\nos.write(1,b'stdout preserved\\n')\nos.write(2,b'stderr preserved\\n')"
     );
-    let argv = json!(["/opt/homebrew/bin/python3", "-c", code]);
+    let argv = json!([common::FRAMEWORK_PYTHON, "-c", code]);
     let request = argv.clone();
     let server = Server::new(move |p, b| {
         if p != "/api/chat" || b["messages"].as_array().unwrap().len() == 1 {
@@ -720,7 +720,7 @@ fn sigint_after_patch_and_during_command_preserves_evidence() {
         let t = tempfile::tempdir().unwrap();
         fs::write(t.path().join("file"), "before").unwrap();
         let argv = json!([
-            "/opt/homebrew/bin/python3",
+            common::FRAMEWORK_PYTHON,
             "-c",
             "import time;print('launched',flush=True);time.sleep(20)"
         ]);

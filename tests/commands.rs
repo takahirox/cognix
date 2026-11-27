@@ -1,5 +1,7 @@
 #[cfg(not(target_os = "macos"))]
 use cognix::commands::sandbox_argv;
+#[cfg(target_os = "macos")]
+mod common;
 use cognix::{
     Cancellation,
     commands::{parse_command, run},
@@ -181,21 +183,18 @@ fn workspace_write_runs_build_children_and_enforces_file_and_network_boundaries(
     fs::write(&secret, "private").unwrap();
     fs::create_dir(project.path().join(".git")).unwrap();
     std::os::unix::fs::symlink(&secret, project.path().join("outside-link")).unwrap();
-    fs::write(project.path().join("Makefile"), "verify:\n\t/bin/mkdir -p build\n\t/bin/echo built > build/result\n\t/bin/cat build/result\n").unwrap();
+    fs::write(
+        project.path().join("verify.sh"),
+        "set -e\n/bin/mkdir -p build\n/bin/echo built > build/result\n/bin/cat build/result\n",
+    )
+    .unwrap();
     let mut runtime = Runtime::new(
         project.path(),
         Box::new(|_, _| true),
         Cancellation::default(),
     )
     .unwrap();
-    let make = [
-        "/Library/Developer/CommandLineTools/usr/bin/make",
-        "/Applications/Xcode.app/Contents/Developer/usr/bin/make",
-    ]
-    .into_iter()
-    .find(|path| Path::new(path).is_file())
-    .expect("installed macOS development tools");
-    let build = json!({"argv":[make,"verify"]});
+    let build = json!({"argv":["/bin/bash","verify.sh"]});
     let result = runtime.execute("run_command", build);
     assert_eq!(result["status"], "passed", "{result}");
     assert_eq!(
@@ -220,7 +219,7 @@ fn workspace_write_runs_build_children_and_enforces_file_and_network_boundaries(
     ] {
         let result = runtime.execute(
             "run_command",
-            json!({"argv":["/opt/homebrew/bin/python3","-c",code]}),
+            json!({"argv":[common::FRAMEWORK_PYTHON,"-c",code]}),
         );
         assert_eq!(result["status"], "failed", "{code} {result}");
     }
@@ -297,7 +296,7 @@ fn full_access_requires_opt_in_and_uses_the_project_executable() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn cancellation_stops_an_ordinary_workspace_process_group() {
+fn cancellation_stops_workspace_writes_after_descendants_attempt_to_detach() {
     use cognix::runtime::Runtime;
 
     let project = tempfile::tempdir().unwrap();
@@ -312,18 +311,52 @@ fn cancellation_stops_an_ordinary_workspace_process_group() {
         cancel.cancel();
         assert!(marker.exists(), "child did not start before cancellation");
     });
-    let child = "from pathlib import Path; import time; Path('started').touch(); time.sleep(0.3); Path('survived').touch()";
-    let parent = format!(
-        "import subprocess, sys; subprocess.run([sys.executable, '-c', {}], check=True)",
-        json!(child)
-    );
+    let code = r#"
+import errno, os, sys, time
+from pathlib import Path
+
+if os.fork() != 0:
+    os.wait()
+    time.sleep(3)
+    sys.exit()
+if os.fork() != 0:
+    os._exit(0)
+
+errors = []
+for attempt in (
+    os.setsid,
+    lambda: os.setpgid(0, 0),
+    lambda: os.posix_spawn('/bin/true', ['true'], {}, setsid=True),
+    lambda: os.posix_spawn('/bin/true', ['true'], {}, setpgroup=0),
+):
+    try:
+        attempt()
+        errors.append('allowed')
+    except OSError as error:
+        errors.append(str(error.errno))
+Path('attempts').write_text(' '.join(errors))
+os.close(1)
+os.close(2)
+with open('writes', 'wb', buffering=0) as output:
+    output.write(b'x')
+    Path('started').touch()
+    for _ in range(150):
+        time.sleep(0.01)
+        output.write(b'x')
+"#;
     let result = runtime.execute(
         "run_command",
-        json!({"argv":["/opt/homebrew/bin/python3","-c",parent]}),
+        json!({"argv":[common::FRAMEWORK_PYTHON,"-c",code]}),
     );
     timer.join().unwrap();
     assert_eq!(result["status"], "canceled", "{result}");
     assert_eq!(result["executed"], true);
-    std::thread::sleep(Duration::from_millis(350));
-    assert!(!project.path().join("survived").exists());
+    assert_eq!(
+        fs::read_to_string(project.path().join("attempts")).unwrap(),
+        format!("{0} {0} {0} {0}", libc::EPERM)
+    );
+    let writes = project.path().join("writes");
+    let at_return = fs::metadata(&writes).unwrap().len();
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(fs::metadata(writes).unwrap().len(), at_return);
 }

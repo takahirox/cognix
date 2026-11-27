@@ -113,11 +113,7 @@ fn interrupt_at_command_ownership_and_cleanup_boundaries() {
         let t = tempfile::tempdir().unwrap();
         let cancel = Cancellation::default();
         let mut r = Runtime::new(t.path(), Box::new(|_, _| true), cancel.clone()).unwrap();
-        let argv = vec![
-            "/opt/homebrew/bin/python3".to_string(),
-            "-c".into(),
-            "print('completed')".into(),
-        ];
+        let argv = vec!["/bin/echo".to_string(), "completed".into()];
         r.allowed_commands = vec![argv.clone()];
         crate::commands::INTERRUPT_AT.with(|point| *point.borrow_mut() = Some((phase, cancel)));
         let result = r.execute("run_command", json!({"argv":argv}));
@@ -371,7 +367,7 @@ async fn evaluate_local_reviewer() {
             "project_tests",
             dev_task,
             "run_command",
-            json!({"argv":["/opt/homebrew/bin/python3","-I","-B","-m","unittest","discover"]}),
+            json!({"argv":["/opt/homebrew/opt/python@3/Frameworks/Python.framework/Versions/Current/Resources/Python.app/Contents/MacOS/Python","-I","-B","-m","unittest","discover"]}),
             "",
             Decision::Allow,
         ),

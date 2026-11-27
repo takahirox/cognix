@@ -109,6 +109,15 @@ pub fn render(report: &Value) -> String {
             event["arguments"]["argv"], r["status"], r["executed"], r["exit_code"]
         ));
         render_review(&mut out, r);
+        if let Some(requests) = r["network_requests"].as_array() {
+            for request in requests {
+                out.push_str(&format!(
+                    "  Network GET {} {}\n",
+                    request["scope"]["url"], request["status"]
+                ));
+                render_review(&mut out, request);
+            }
+        }
         for key in ["output", "error"] {
             if let Some(s) = r[key].as_str() {
                 out.push_str(s);
