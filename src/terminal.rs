@@ -93,6 +93,12 @@ pub fn render(report: &Value) -> String {
         report["modified_files"]
     ));
     let checks = report["checks"].as_array().unwrap();
+    if checks
+        .iter()
+        .any(|event| event["result"]["workspace_mutations_possible"] == true)
+    {
+        out.push_str("Commands may have changed project files directly. The listed paths come from patches.\n");
+    }
     if checks.is_empty() {
         out.push_str("Verification: not run (no command executed)\n");
     }
@@ -102,6 +108,7 @@ pub fn render(report: &Value) -> String {
             "Command argv: {}\n  {}; executed={}; exit={}\n",
             event["arguments"]["argv"], r["status"], r["executed"], r["exit_code"]
         ));
+        render_review(&mut out, r);
         for key in ["output", "error"] {
             if let Some(s) = r[key].as_str() {
                 out.push_str(s);
@@ -110,10 +117,25 @@ pub fn render(report: &Value) -> String {
         }
     }
     for e in report["events"].as_array().unwrap() {
-        if e["tool"] != "run_command" && e["result"]["status"] != "ok" {
-            out.push_str(&format!("{}: {}\n", e["tool"], e["result"]));
+        if e["tool"] == "run_command" {
+            continue;
+        }
+        let result = &e["result"];
+        if result["status"] != "ok" {
+            out.push_str(&format!("{}: {}\n", e["tool"], result));
+        } else if result["automatic_review"].is_object() {
+            out.push_str(&format!("Patch {}\n", result["path"]));
+            render_review(&mut out, result);
         }
     }
     out.push_str("Recorded 'passed' means exit code 0.\n");
     text(&out)
+}
+
+fn render_review(out: &mut String, result: &Value) {
+    let review = &result["automatic_review"];
+    if let (Some(decision), Some(reason)) = (review["decision"].as_str(), review["reason"].as_str())
+    {
+        out.push_str(&format!("  Automatic review {decision}: {reason}\n"));
+    }
 }

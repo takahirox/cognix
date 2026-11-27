@@ -4,20 +4,16 @@ Cognix is a local Ollama coding agent with a terminal interface, bounded tool
 loops, approved edits, and sandboxed project commands. The
 [MVP specification](docs/mvp.md) defines the original scope; [validation evidence](docs/validation.md)
 records the Rust migration and subsequent tool and security checks.
-The [tool architecture decision](docs/tool-architecture.md) defines the future
-general patch/command direction and incremental migration; it does not change
-the currently supported tools or sandbox permissions. V2 remains a future
-experimental contract with unchanged-content moves and read-only metadata-aware
-previews; the read-only command wrapper can advance independently of patch model
-trials. V1 remains available during experimental rollout.
+The [tool architecture decision](docs/tool-architecture.md) covers supported command permissions and the roadmap for the experimental v2
+patch contract.
 
 ## Setup
 
 The supported application is a native Rust executable on Apple Silicon macOS.
 Use Rust/Cargo 1.87 or newer (validated with Homebrew Rust 1.94.0) and a local
-[Ollama](https://ollama.com/) installation. Verification commands require
-`/usr/bin/sandbox-exec`. Linux and other platforms are unsupported for command
-execution and fail closed; no Linux isolation is claimed.
+[Ollama](https://ollama.com/) installation. Sandboxed commands require
+`/usr/bin/sandbox-exec` on macOS. Sandboxed command proposals fail closed on
+other platforms.
 
 Install Cognix from this checkout. Make sure Cargo's bin directory
 (`~/.cargo/bin` by default) is on your `PATH`.
@@ -61,6 +57,8 @@ num_ctx = 16384
 max_steps = 16
 model_timeout = 120
 command_timeout = 30
+approval_mode = "manual"
+sandbox_mode = "workspace-write"
 output_limit = 16384
 ```
 
@@ -68,6 +66,24 @@ Explicit CLI flags take priority over `COGNIX_MODEL` and `COGNIX_OLLAMA_URL`,
 then the config file, then the built-in defaults. For example, run
 `cognix --model qwen3.8:27b` to override a saved model for one session.
 Configuration errors identify the file and the problem.
+
+To enable automatic review, add these settings. `review_model` is optional.
+When omitted it inherits the effective working model, including a `--model`
+override. A separate reviewer needs local completion support. The launcher
+continues to provision only the working model, with its existing consent flow.
+
+```toml
+model = "qwen3.8:27b"
+approval_mode = "auto"
+review_model = "qwen3.8:27b"
+sandbox_mode = "workspace-write"
+deny_network = ["https://example.com:8443"]
+```
+
+Use `--approval-mode`, `--sandbox-mode`, or `--review-model` to override
+the corresponding saved setting for one session. `deny_network` defaults to
+an empty list. Each entry is an HTTP(S) origin including the port when it differs
+from the protocol default.
 
 **Qwen3.8 27B is an evaluated target, not a dependency.** Both `qwen3.8:27b`
 and `qwen3-coder:30b` passed the tool-call probe and three fixture trials each on
@@ -157,9 +173,7 @@ and runs checks from the project root. For example, it can submit
 Use `rg` if installed in an eligible runtime directory. Bare command names are
 resolved in `/usr/bin`, `/bin`, and `/opt/homebrew/bin`, in that order. Use an
 eligible absolute path to select a different installed executable. Arguments
-are literal. The macOS sandbox allows project reads and scratch writes, and
-blocks network access and project writes. Checks that need subprocesses, builds
-that write into the project, or tools outside the permitted runtime may fail.
+are literal.
 
 `apply_patch` creates or updates one UTF-8 file at a time using a project-relative
 `path`. For an update, supply an exact, unique `old_text` span and its
@@ -178,20 +192,56 @@ overwrite any destination. Files are limited to 64 KiB of UTF-8 without NULs.
 Absolute patch paths, traversal, `.git`, and symlinks are refused. File deletion,
 moves, directory creation, and multi-file patches are unsupported.
 
-Commands show the submitted argv and any distinct executable path. Type `y`
-at `Approve this action? [y/N]` to approve an individual command or patch.
-Other responses, including EOF, deny it. Use repeatable
-`--allow-command JSON_ARGV` flags to restrict commands to exact submitted arrays.
-For example, `--allow-command '["cat","src/main.rs"]'` permits that exact proposal
-to reach approval. Ctrl-C cancels work and exits with code 130. Use `/exit` or EOF
-at the task prompt to end the session, or `--task 'request'` for one task with
-interactive approvals.
+### Approval and permissions
 
-Results record modified files and commands with their exit codes and output.
-They distinguish `passed`, `failed`, `not_run`, `denied`, `canceled`, and
-`limit_reached`. A `passed` command exited with code 0. Use the recorded test
-command and its output to identify which tests ran. In single-task mode, any
-failed or denied action makes the exit code 1, even if a later action succeeds.
+- **Manual (default).** Cognix shows the command and its scope or the patch
+  preview. Type `y` at `Approve this action? [y/N]` to approve that action.
+  Other responses and EOF leave the action unexecuted.
+- **Auto.** A separate local Ollama request reviews the exact prepared action.
+  It receives the user instructions, recorded human approvals, and labeled
+  excerpts of untrusted conversation and tool output. An allow applies only
+  to that action within its enforced scope. A denial stops further tool actions
+  for the current task. Uncertain, invalid, unavailable, oversized, or timed-out
+  reviews ask for manual confirmation. The model can misjudge intent or risk.
+  [Reviewer evaluation](docs/validation.md#issue-30-approval-and-sandbox-validation)
+- **Full access.** `--approval-mode full-access` or the corresponding saved
+  setting explicitly selects this mode and prints a startup warning. Commands
+  run with your environment and ordinary OS access to files and network.
+  The patch tool retains its project-relative contract. Full access is never
+  selected by a reviewer or a fallback.
+
+In manual and auto modes, fixed no-argument system `ls` and `pwd` can run
+without a prompt. Other commands, including tests and builds, require approval.
+Repeat `--allow-command JSON_ARGV` to restrict commands to exact submitted
+arrays, including the executable spelling. An allowlist entry still follows
+the approval mode and sandbox policy.
+
+In the default `workspace-write` profile, commands and their children can
+write directly to the live project and private scratch space. The sandbox
+blocks external file data apart from installed runtimes, protects `.git`, and
+blocks network access. `read-only` permits command writes only to scratch
+and prevents child processes. Approved `apply_patch` calls can write in either
+profile. Some tools need additional system services or user-owned toolchains.
+Use supported installed runtimes and provision dependencies separately for
+offline build and test workflows. Check
+[the sandbox details](docs/implementation.md#verification-policy-and-isolation)
+for the readable runtime paths and process limits.
+
+In either profile, exactly `["curl","https://host/path"]` (or the equivalent
+`/usr/bin/curl` invocation) requests one brokered HTTP(S) GET. Cognix shows or
+reviews the URL, host, port and protocol, including any query data sent by the
+request. A configured `deny_network` entry blocks the corresponding origin
+before review. Each additional URL is a new proposal. The broker returns
+redirect responses for inspection and leaves the redirected URL unrequested.
+Shells, build tools, other clients, and curl invocations with extra options
+keep their ordinary sandbox with network blocked. Network access for those
+commands requires a transport that can enforce the destination scope.
+
+Ctrl-C cancels work and exits with code 130. Use `/exit` or EOF at the task prompt
+to end the session, or `--task 'request'` for one task. Reports record patch paths
+and command exit codes and output. Commands with write access may also change
+files directly, outside the patch ledger. In single-task mode, any failed or
+denied action makes the exit code 1, even if a later action succeeds.
 
 ### Verify a fix
 
@@ -251,7 +301,12 @@ cargo run --locked --example evaluate_ollama -- --model qwen3.8:27b \
 
 This fixture-only evaluator uses disposable projects and records every decision.
 It approves exact fixture exploration and test commands, an update to `main.py`,
-and creation of `test_division_edges.py`. Normal sessions require explicit approval.
+and creation of `test_division_edges.py`. To evaluate the reviewer alone on
+prepared actions without executing them, run the local review trial:
+
+```sh
+cargo test --locked evaluate_local_reviewer -- --ignored --nocapture
+```
 
 - [Development flow](docs/development-flow.md)
 - [Review and merge guidelines](docs/review-guidelines.md)

@@ -1,7 +1,25 @@
 //! Shared approval plans and result conventions, not filesystem/sandbox policy.
 use crate::Cancellation;
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::Path;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalMode {
+    #[default]
+    Manual,
+    Auto,
+    FullAccess,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxMode {
+    ReadOnly,
+    #[default]
+    WorkspaceWrite,
+}
 
 pub type Approval = Box<dyn FnMut(&str, &str) -> bool>;
 
@@ -16,24 +34,26 @@ pub(crate) fn patch_diff(from: &str, to: &str, before: &str, after: &str) -> Str
 /// An immutable preview built only after the backend's side-effect-free checks.
 /// The terminal callback still sanitizes the complete display and reads explicit
 /// default-No consent. Consuming a plan never authorizes a later action.
-pub(crate) struct ActionPlan<'a> {
-    kind: &'static str,
-    preview: String,
-    path: Option<&'a str>,
+pub(crate) struct ActionPlan {
+    pub preview: String,
+    pub kind: &'static str,
+    pub path: Option<String>,
+    pub evidence: Value,
 }
 
-impl<'a> ActionPlan<'a> {
-    pub fn patch(path: &'a str, before: &str, after: &str, old: &str, new: &str) -> Self {
+impl ActionPlan {
+    pub fn patch(path: &str, before: &str, after: &str, old: &str, new: &str) -> Self {
         let header = path.escape_debug().to_string();
         let diff = patch_diff(&header, &header, before, after);
         Self {
             kind: "patch",
             preview: format!("{diff}\nExact replacement: {old:?} -> {new:?}"),
-            path: Some(path),
+            evidence: json!({"path":path,"diff":diff,"before_sha256":crate::runtime::hash(before.as_bytes())}),
+            path: Some(path.into()),
         }
     }
 
-    pub fn creation(path: &'a str, content: &str) -> Self {
+    pub fn creation(path: &str, content: &str) -> Self {
         // Bound escaped characters, since terminal controls expand on display.
         // The full content remains in the runtime's event ledger.
         const PREVIEW_CHARS: usize = 8192;
@@ -58,48 +78,17 @@ impl<'a> ActionPlan<'a> {
         Self {
             kind: "patch",
             preview,
-            path: Some(path),
+            evidence: json!({"path":path,"pre_edit_state":"absent","addition":content}),
+            path: Some(path.into()),
         }
     }
 
-    pub fn command(argv: &[String], invocation: &Path, executable: &Path) -> Self {
-        let invocation =
-            if invocation != executable && invocation.to_str() != Some(argv[0].as_str()) {
-                format!("Invocation path = {invocation:?}\n")
-            } else {
-                String::new()
-            };
-        let resolved = if executable.to_str() == Some(argv[0].as_str()) {
-            String::new()
-        } else {
-            format!("Resolved executable = {executable:?}\n")
-        };
-        Self {
-            kind: "command",
-            preview: format!(
-                "argv = {}\n{invocation}{resolved}Read-only project; no network; scratch writes only.",
-                json!(argv)
-            ),
-            path: None,
-        }
-    }
-
-    /// Cancellation takes precedence over either callback answer. On approval,
-    /// the caller must still revalidate and execute in its dedicated backend.
-    pub fn approve(self, approve: &mut Approval, cancel: &Cancellation) -> Result<(), Value> {
-        let approved = approve(self.kind, &self.preview);
-        let status = if cancel.is_canceled() {
-            "canceled"
-        } else if !approved {
-            "denied"
-        } else {
-            return Ok(());
-        };
+    pub fn stopped(&self, status: &str) -> Value {
         let mut result = unexecuted(status);
-        if let Some(path) = self.path {
+        if let Some(path) = &self.path {
             result["path"] = json!(path);
         }
-        Err(result)
+        result
     }
 }
 

@@ -1,5 +1,10 @@
 //! Exact argv policy and macOS Seatbelt isolation. Never retry unsandboxed.
-use crate::{Cancellation, action::unexecuted, schema};
+use crate::{
+    Cancellation,
+    action::{ActionPlan, SandboxMode, unexecuted},
+    network::{CURL, Fetch},
+    schema,
+};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -38,6 +43,8 @@ pub const RUNTIME_DIRS: &[&str] = &[
     "/System",
     "/Library/Apple",
     "/Library/Frameworks",
+    "/Library/Developer/CommandLineTools",
+    "/Applications/Xcode.app/Contents/Developer",
     "/opt/homebrew/Cellar",
     "/opt/homebrew/opt",
     "/opt/homebrew/lib",
@@ -90,38 +97,138 @@ fn installed_executable(path: &Path) -> Option<(PathBuf, fs::Metadata)> {
     }
 }
 
-pub(crate) struct PreparedCommand<'a> {
-    submitted_argv: &'a [String],
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionPolicy {
+    Sandbox(SandboxMode),
+    FullAccess,
+}
+
+pub(crate) struct PreparedCommand {
+    argv: Vec<String>,
     invocation: PathBuf,
     executable: PathBuf,
     metadata: fs::Metadata,
+    root: PathBuf,
+    policy: ExecutionPolicy,
+    pub fetch: Option<Fetch>,
 }
 
-impl<'a> PreparedCommand<'a> {
-    pub(crate) fn new(argv: &'a [String]) -> Result<Self, String> {
-        sandbox_available()?;
+impl PreparedCommand {
+    pub(crate) fn new(
+        root: &Path,
+        argv: Vec<String>,
+        policy: ExecutionPolicy,
+    ) -> Result<Self, String> {
         let program = argv.first().ok_or("Command needs an executable")?;
-        let (invocation, executable, metadata) = resolve_executable(program)?;
+        let fetch = match policy {
+            ExecutionPolicy::Sandbox(_) => {
+                sandbox_available()?;
+                Fetch::from_argv(&argv)?
+            }
+            ExecutionPolicy::FullAccess => None,
+        };
+        let (invocation, executable, metadata) =
+            Self::resolve(root, policy, program, fetch.is_some())?;
+        for path in [root, &invocation, &executable] {
+            path.to_str().ok_or("Command paths must be UTF-8")?;
+        }
         Ok(Self {
-            submitted_argv: argv,
+            argv,
             invocation,
             executable,
             metadata,
+            root: root.to_owned(),
+            policy,
+            fetch,
         })
     }
 
-    pub(crate) fn executable(&self) -> &Path {
-        &self.executable
+    fn resolve(
+        root: &Path,
+        policy: ExecutionPolicy,
+        program: &str,
+        fetch: bool,
+    ) -> Result<(PathBuf, PathBuf, fs::Metadata), String> {
+        if let ExecutionPolicy::Sandbox(_) = policy {
+            return resolve_executable(if fetch { CURL } else { program }).map_err(str::to_owned);
+        }
+        let path = Path::new(program);
+        let mut paths = Vec::new();
+        if path.is_absolute() || program.contains('/') {
+            paths.push(root.join(path));
+        } else if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path).map(|p| root.join(p).join(program)));
+        }
+        paths
+            .into_iter()
+            .find_map(|invocation| {
+                let executable = invocation.canonicalize().ok()?;
+                let metadata = executable.metadata().ok()?;
+                (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                    .then_some((invocation, executable, metadata))
+            })
+            .ok_or_else(|| "Executable not found on PATH or at the given path".into())
     }
 
-    pub(crate) fn invocation(&self) -> &Path {
-        &self.invocation
+    pub(crate) fn plan(&self) -> ActionPlan {
+        let working_directory = if self.fetch.is_some() {
+            "private scratch".to_owned()
+        } else {
+            format!("{:?}", self.root)
+        };
+        let mut preview = format!(
+            "argv = {}\nWorking directory = {working_directory}\n",
+            json!(self.argv)
+        );
+        if self.invocation != self.executable && self.invocation.to_str() != Some(&self.argv[0]) {
+            preview.push_str(&format!("Invocation path = {:?}\n", self.invocation));
+        }
+        if self.executable.to_str() != Some(&self.argv[0]) {
+            preview.push_str(&format!("Resolved executable = {:?}\n", self.executable));
+        }
+        let restrictions = match self.policy {
+            _ if self.fetch.is_some() => "Brokered HTTP(S) GET. Redirects are disabled.",
+            ExecutionPolicy::Sandbox(SandboxMode::ReadOnly) => {
+                "Read-only project; no network; scratch writes only."
+            }
+            ExecutionPolicy::Sandbox(SandboxMode::WorkspaceWrite) => {
+                "Writes to the live project and private scratch; no network or .git access. Child processes inherit the sandbox."
+            }
+            ExecutionPolicy::FullAccess => {
+                "Full access to files, network and inherited environment."
+            }
+        };
+        preview.push_str(restrictions);
+        let permissions = self.fetch.as_ref().map(Fetch::scope);
+        if let Some(scope) = &permissions {
+            preview.push_str(&format!("\nRequested network destination = {scope}"));
+        }
+        ActionPlan {
+            kind: "command",
+            path: None,
+            preview,
+            evidence: json!({"executable":self.executable,"invocation":self.invocation,
+                "project_root":self.root, "working_directory":if self.fetch.is_some() { json!("private scratch") } else { json!(self.root) },
+                "restrictions":restrictions,"requested_network":permissions,
+                "effective_argv":self.fetch.as_ref().map(Fetch::args),
+                "executable_identity":[self.metadata.dev(),self.metadata.ino(),self.metadata.ctime() as u64,self.metadata.ctime_nsec() as u64]}),
+        }
+    }
+
+    pub(crate) fn low_risk(&self) -> bool {
+        // Only fixed argument shapes for known system binaries. An absolute alias,
+        // command option, filename or wrapper never qualifies for this exemption.
+        matches!((self.executable.to_str(), self.argv.as_slice()),
+            (Some("/bin/ls"), [name]) if name == "ls" || name == "/bin/ls")
+            || matches!((self.executable.to_str(), self.argv.as_slice()),
+            (Some("/bin/pwd"), [name]) if name == "pwd" || name == "/bin/pwd")
     }
 
     fn check_executable(&self) -> Result<(), String> {
         let changed = "Command executable changed after preview; command not run";
         let (invocation, resolved, current) =
-            resolve_executable(&self.submitted_argv[0]).map_err(|_| changed)?;
+            Self::resolve(&self.root, self.policy, &self.argv[0], self.fetch.is_some())
+                .map_err(|_| changed)?;
         if invocation != self.invocation
             || resolved != self.executable
             || current.dev() != self.metadata.dev()
@@ -146,14 +253,28 @@ fn sandbox_available() -> Result<(), String> {
 }
 
 pub fn sandbox_argv(root: &Path, scratch: &Path, argv: &[String]) -> Result<Vec<String>, String> {
+    wrap_sandbox(root, scratch, argv, SandboxMode::ReadOnly)
+}
+
+fn wrap_sandbox(
+    root: &Path,
+    scratch: &Path,
+    argv: &[String],
+    mode: SandboxMode,
+) -> Result<Vec<String>, String> {
     sandbox_available()?;
-    let quote = |p: &Path| serde_json::to_string(&p.to_string_lossy()).unwrap();
+    let quote =
+        |p: &Path| serde_json::to_string(p.to_str().expect("validated sandbox path")).unwrap();
+    for path in [root, scratch] {
+        path.to_str().ok_or("Sandbox paths must be UTF-8")?;
+    }
     let readable: Vec<PathBuf> = std::iter::once(root.to_owned())
         .chain(std::iter::once(scratch.to_owned()))
         .chain(
             RUNTIME_DIRS
                 .iter()
-                .filter_map(|p| Path::new(p).canonicalize().ok()),
+                .filter_map(|p| Path::new(p).canonicalize().ok())
+                .filter(|p| p.to_str().is_some()),
         )
         .collect();
     let reads = readable
@@ -161,8 +282,16 @@ pub fn sandbox_argv(root: &Path, scratch: &Path, argv: &[String]) -> Result<Vec<
         .map(|p| format!("(subpath {})", quote(p)))
         .collect::<Vec<_>>()
         .join(" ");
+    let workspace = match mode {
+        SandboxMode::ReadOnly => String::new(),
+        SandboxMode::WorkspaceWrite => format!(
+            "(allow process-fork) (allow file-write* (subpath {})) (deny file-write* (literal {})) (deny file-link)",
+            quote(root),
+            quote(root)
+        ),
+    };
     let profile = format!(
-        "(version 1) (deny default) (allow process-exec) (allow sysctl-read) (allow file-read-metadata) (allow file-read* {reads} (literal \"/\") (literal \"/dev/null\") (literal \"/dev/urandom\") (literal \"/dev/random\") (subpath \"/private/var/db/dyld\")) (allow file-write* (subpath {}) (literal \"/dev/null\")) (deny file-read* (regex #\"/[.][gG][iI][tT](/|$)\"))",
+        r#"(version 1) (deny default) (allow process-exec) (allow sysctl-read) (allow file-read-metadata) (allow file-read* {reads} (literal "/") (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random") (subpath "/private/var/db/dyld")) (allow file-write* (subpath {}) (literal "/dev/null")) {workspace} (deny file-read* file-write* (regex #"/[.][gG][iI][tT](/|$)"))"#,
         quote(scratch)
     );
     let mut out = vec!["/usr/bin/sandbox-exec".into(), "-p".into(), profile];
@@ -298,70 +427,92 @@ pub fn run(
     if cancel.is_canceled() {
         return Ok(unexecuted("canceled"));
     }
-    let prepared = PreparedCommand::new(argv)?;
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    run_prepared(&root, prepared, cancel, timeout, limit)
+    let prepared = PreparedCommand::new(
+        &root,
+        argv.to_vec(),
+        ExecutionPolicy::Sandbox(SandboxMode::ReadOnly),
+    )?;
+    // This low-level API only runs sandboxed commands; it has no approval path.
+    if prepared.fetch.is_some() {
+        return Err("Brokered network requests require approval through the runtime".into());
+    }
+    run_prepared(prepared, cancel, timeout, limit)
 }
 
 pub(crate) fn run_prepared(
-    root: &Path,
-    prepared: PreparedCommand<'_>,
+    prepared: PreparedCommand,
     cancel: &Cancellation,
     timeout: Duration,
     limit: usize,
 ) -> Result<Value, String> {
+    let root = &prepared.root;
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or("Command timeout is too large")?;
     if cancel.is_canceled() {
         return Ok(unexecuted("canceled"));
     }
-    let scratch_parent = std::env::temp_dir()
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
-    if scratch_parent.starts_with(root) {
-        return Err("Command scratch directory would be inside the read-only project".into());
-    }
-    let validation = validate_project_reads(root, cancel, deadline);
-    if cancel.is_canceled() {
-        return Ok(unexecuted("canceled"));
-    }
-    if Instant::now() >= deadline {
-        return Ok(unexecuted("limit_reached"));
-    }
-    validation?;
-    let temporary = tempfile::Builder::new()
-        .prefix("cognix-check-")
-        .tempdir_in(scratch_parent)
-        .map_err(|e| e.to_string())?;
-    let scratch = temporary.path().canonicalize().map_err(|e| e.to_string())?;
-    // Some runtimes, including Python virtual environments, use the invocation path.
-    let mut argv = prepared.submitted_argv.to_vec();
-    argv[0] = prepared
-        .invocation
-        .to_str()
-        .ok_or("Non-UTF8 command path")?
-        .into();
-    let wrapped = sandbox_argv(root, &scratch, &argv)?;
-    let mut command = Command::new(&wrapped[0]);
-    command
-        .args(&wrapped[1..])
-        .current_dir(root)
-        .env_clear()
-        .envs([
+    let mut temporary = None;
+    let mut command = Command::new(&prepared.invocation);
+    command.current_dir(root).stdin(Stdio::null());
+    if let ExecutionPolicy::Sandbox(mode) = prepared.policy {
+        let scratch_parent = std::env::temp_dir()
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        if scratch_parent.starts_with(root) {
+            return Err("Command scratch directory would be inside the project".into());
+        }
+        let temp = tempfile::Builder::new()
+            .prefix("cognix-check-")
+            .tempdir_in(scratch_parent)
+            .map_err(|e| e.to_string())?;
+        let scratch = temp.path().canonicalize().map_err(|e| e.to_string())?;
+        let scratch_str = scratch.to_str().ok_or("Non-UTF8 scratch")?;
+        if let Some(fetch) = &prepared.fetch {
+            // Only the fixed system HTTP client gets network access. No proposed
+            // flags, workspace cwd, proxy settings or user configuration cross
+            // this boundary. The reviewed URL is the only outbound request.
+            command.current_dir(&scratch).args(fetch.args());
+        } else {
+            let validation = validate_project_reads(root, cancel, deadline);
+            if cancel.is_canceled() {
+                return Ok(unexecuted("canceled"));
+            }
+            if Instant::now() >= deadline {
+                return Ok(unexecuted("limit_reached"));
+            }
+            validation?;
+            let mut argv = prepared.argv.clone();
+            argv[0] = prepared
+                .invocation
+                .to_str()
+                .ok_or("Non-UTF8 command path")?
+                .into();
+            let wrapped = wrap_sandbox(root, &scratch, &argv, mode)?;
+            command = Command::new(&wrapped[0]);
+            command
+                .current_dir(root)
+                .stdin(Stdio::null())
+                .args(&wrapped[1..]);
+        }
+        command.env_clear().envs([
             ("PATH", COMMAND_PATH),
-            ("HOME", scratch.to_str().ok_or("Non-UTF8 scratch")?),
-            ("TMPDIR", scratch.to_str().unwrap()),
-            ("TMP", scratch.to_str().unwrap()),
-            ("TEMP", scratch.to_str().unwrap()),
+            ("HOME", scratch_str),
+            ("TMPDIR", scratch_str),
+            ("TMP", scratch_str),
+            ("TEMP", scratch_str),
             ("LANG", "en_US.UTF-8"),
             ("PYTHONDONTWRITEBYTECODE", "1"),
             ("PYTHONNOUSERSITE", "1"),
             ("GIT_CONFIG_NOSYSTEM", "1"),
             ("GIT_CONFIG_GLOBAL", "/dev/null"),
             ("GIT_TERMINAL_PROMPT", "0"),
-        ])
-        .stdin(Stdio::null());
+        ]);
+        temporary = Some(temp);
+    } else {
+        command.args(&prepared.argv[1..]);
+    }
     // One pipe keeps stdout/stderr ordering and permits a single combined byte cap.
     let (mut reader, writer) = std::io::pipe().map_err(|e| e.to_string())?;
     command
@@ -392,7 +543,7 @@ pub(crate) fn run_prepared(
     executable_check?;
     let mut child = command
         .spawn()
-        .map_err(|e| format!("Sandbox launch failed; no unsandboxed retry: {e}"))?;
+        .map_err(|e| format!("Command launch failed: {e}"))?;
     #[cfg(test)]
     boundary("spawned");
     drop(command);
@@ -471,7 +622,7 @@ pub(crate) fn run_prepared(
         Ok(exit) => Some(exit),
         Err(e) => {
             io_error = Some(format!(
-                "Launched sandbox process {pid} could not be reaped: {e}"
+                "Launched command process {pid} could not be reaped: {e}"
             ));
             None
         }
@@ -492,9 +643,16 @@ pub(crate) fn run_prepared(
         decoded.truncate(end);
     }
     let mut result = json!({"status":state.unwrap_or(if io_error.is_some(){"failed"}else if exit.is_some_and(|e|e.success()){"passed"}else{"failed"}),"executed":true,"pid":pid,"exit_code":code,"output":decoded,"limit":if state==Some("limit_reached"){Some("time or output")}else{None}});
+    if prepared.fetch.is_none()
+        && prepared.policy != ExecutionPolicy::Sandbox(SandboxMode::ReadOnly)
+        && !prepared.low_risk()
+    {
+        result["workspace_mutations_possible"] = json!(true);
+    }
     if let Some(error) = io_error {
         result["error"] = json!(error);
     }
+    drop(temporary);
     Ok(result)
 }
 

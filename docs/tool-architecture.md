@@ -16,6 +16,10 @@ reading, and creation tools. See the [implementation guide](implementation.md)
 for the shipped interface. The five-tool baseline and proposed v2 roadmap below
 record the design before that change.
 
+[Issue #30](https://github.com/takahirox/cognix/issues/30) added independent
+approval modes, live workspace writes, and destination-scoped HTTP(S) review
+at the existing tool boundary.
+
 ## Decision and boundaries
 
 Prioritize a small set of composable tools: general `apply_patch` for reviewed
@@ -30,7 +34,7 @@ provide at comparable complexity.
 Capability describes what a backend can do; authorization describes what this
 session and this exact approved action may do. Neither a tool name nor user
 approval grants filesystem, network or process permissions beyond the backend's
-enforced boundary. No unrestricted shell is authorized by this decision.
+enforced boundary. Full access requires a deliberate session setting.
 
 The general editing/command pattern is motivated by the coding-agent reference
 in the Issue. This is an independent Cognix contract, not a claim that Codex has
@@ -44,7 +48,7 @@ local Ollama, without automatic model/provider fallback or downloads.
 ## Five-tool baseline and its limits
 
 This analysis began with the source inherited from `ff984a9` and reflects the
-runtime command approval policy from Issue #26. The
+historical command approval policy from Issue #26. The
 [implementation guide](implementation.md) documents current behavior, and the
 [MVP specification](mvp.md#f4--minimal-tools) preserves the original four-tool
 scope and the later creation extension.
@@ -73,14 +77,15 @@ between checks and syscalls. Cancellation does not undo committed edits or user
 changes; there is no automatic Git reset or rollback. Root/parent identity checks
 are useful defense, not a filesystem transaction or an OS sandbox.
 
-[commands.rs](../src/commands.rs) uses macOS Seatbelt via `sandbox-exec`, with
-deny-by-default rules. Runtime/project reads and scratch writes are permitted;
+The baseline [command backend](../src/commands.rs) used macOS Seatbelt via
+`sandbox-exec` with deny-by-default rules. Runtime/project reads and scratch writes are permitted;
 outside data, network, project writes, Git data, process spawning/forking and Mach
 service lookups are denied. The environment is rebuilt, inherited descriptors
 above stderr are closed on exec, stdin is null, and launch failure never retries
 unsandboxed. After approval a bounded project scan rejects hard-link aliases
 even when absent from argv. Unsupported platforms return `not_run` before
-approval/launch. See [current isolation details](implementation.md#verification-policy-and-isolation).
+approval/launch. The current profiles are described in the
+[implementation guide](implementation.md#verification-policy-and-isolation).
 
 [agent.rs](../src/agent.rs) executes calls sequentially in response order, with
 16 model iterations by default and at most eight calls per response. Malformed
@@ -92,9 +97,9 @@ from the runtime ledger; sanitized model prose is displayed separately and
 cannot turn an unrun check into a pass. Tool output is untrusted data. Denial is
 not permission to retry an equivalent action through a different tool.
 
-The motivating gaps are concrete: a new nested module lacks directory creation;
+Baseline gaps motivating the design included missing directory creation for a new nested module;
 renaming a module and references requires several coordinated changes; obsolete
-tests cannot be deleted; ordinary builds write outputs and launch compilers.
+tests cannot be deleted; ordinary builds wrote outputs and launched compilers outside the original profile.
 Even `git status` needs metadata reads blocked by the current sandbox. Adding
 argv entries cannot overcome these restrictions, and editing source to bypass
 them is prohibited. Current default command limits are 30 seconds and 16,384
@@ -291,165 +296,63 @@ have zero committed substeps; failure after effects must never say nothing ran.
 
 ## Command capability and authorization
 
-### Model contract and permission classes
+### Shipped command and approval contract
 
-The proposed closed `exec_command` arguments are (all four fields are required):
+`run_command(argv)` continues to accept literal argv with no per-call sandbox
+switch. The host selects `read-only` or `workspace-write` independently of
+whether per-action approval is manual or automatic. Workspace-write uses the
+live project tree for build output, formatters and generators. Changes are
+immediately visible in the project. Command limitations and optional exact-argv
+restrictions apply before human or LLM review. Full access is an explicit
+session-wide choice.
 
-```json
-{"argv":["/usr/bin/some-program","argument"],"cwd":".","permission":"read_only","timeout_ms":30000}
-```
+| Profile | Command permissions |
+| --- | --- |
+| `read-only` | Runtime and project reads, scratch writes, and no child processes. |
+| `workspace-write` | The same read boundary, with live project writes and child processes that inherit Seatbelt. |
+| Full access approval mode | Commands use ordinary OS access and the inherited environment without a Cognix sandbox or approval. |
 
-`argv` is 1–64 nonempty NUL-free strings, with an existing absolute executable;
-`cwd` is `.` or a validated existing project-relative directory. `permission`
-selects a requested class from the table, never a grant. `timeout_ms` is a positive
-integer bounded by the session ceiling (default 30,000; maximum 86,400,000).
-Arguments remain capped at 1 MiB; output defaults to 16,384 combined bytes under
-the host setting. No model-supplied environment, stdin, network switch, arbitrary
-write roots or shell command string. Literal metacharacters are argv data.
+In the sandboxed profiles, the selected command starts from the project root,
+uses a rebuilt environment with private HOME/TMP, receives null stdin, and
+inherits no application descriptors. Seatbelt protects outside file data, Git
+metadata, network and service endpoints. An exact argv entry does not turn
+project code or an interpreter into a safe inspection. Only fixed no-argument
+system inspection commands skip approval. Changes outside sandbox policy fail
+at execution even when a reviewer approves the command. Command results
+preserve exit/signal and bounded output. A project command can write directly
+without generating a patch-ledger entry.
 
-| Permission class | Read/write boundary and purpose | Authorization and availability |
-| --- | --- | --- |
-| `read_only` | Project/runtime reads, private scratch writes; no Git metadata or network. Search and compatible verification. | Per-action approval and any configured exact argv restriction. Can wrap today's backend; descendants remain denied. |
-| `build` | Read-only source snapshot; writes only to a fresh private output/cache tree, HOME and TMP. Supports validated compiler/test descendants. | New isolated backend and explicit session opt-in, approved executable/argument/output profile and per-action approval. Not available today. |
-| `project_write` | Writes only to an isolated working copy of the project, then proposes a diff for import through the general patch tool. No live-root writes by the process. | Requires validated build isolation, explicit write opt-in and two approvals: command execution, then actual resulting patch import. Not available today. |
-| `git_read` | Trusted host-generated read-only metadata snapshot plus project reads; no access to live Git administration paths. | Separate opt-in and exact approved Git inspection argv/profile; validated snapshot support required. Not available today. |
+The existing command process group handles normal build/test cancellation.
+Seatbelt restrictions continue to apply to children that deliberately detach.
+Process-group cleanup does not cover detached groups or impose resource quotas.
+The read-only profile is available when no subprocesses should be created.
 
-The read-only wrapper can ship independently of v2 patch delivery or model
-evaluation; keep the existing `run_command` path usable throughout. Build
-isolation, project-write import and Git inspection are separate extensions.
-Each must meet its own containment gates below; exposing `build` is not a
-prerequisite for Git inspection. Project-write import additionally needs the
-validated patch executor, but not a legacy/v2 model comparison.
+### Destination-scoped network requests
 
-`mkdir`, formatters and generators eventually use `project_write`; the result
-becomes a reviewed patch (including its required parents). Builds must redirect
-outputs/caches to the approved private tree, e.g. a host-set `CARGO_TARGET_DIR`.
-A tool that still writes beside source fails or uses `project_write` isolation;
-do not widen the read-only source mount. An empty-directory-only command can
-operate in the isolated copy but importing empty directories is deferred; file
-additions already carry their parents. This deliberate limit should be reported.
+Sandboxed project processes keep network blocked, including loopback. A literal
+`curl` or `/usr/bin/curl` plus one HTTP(S) URL asks the host for a fixed GET
+transport. The hosted action uses the exact validated URL, the system HTTP
+client and private scratch. The scope shows the protocol, host, port, URL and
+method. Ordinary subprocesses receive no broker connection, socket or added
+network rights. The transport runs without user flags, proxy settings or
+redirect following. A new destination from a redirect or a subsequent proposal
+gets its own policy and approval check. Other command network capabilities have
+no destination-enforced path.
 
-Initially keep exact executable-plus-argv approvals. Later reviewed profiles may
-admit specific argument patterns (e.g. bounded search paths or build targets),
-but must reject response files, configuration/plugin loading, output/path escapes,
-Git `-C`/`--git-dir`/config overrides and interpreter options outside that profile.
-Use fixed canonical executable identity and revalidate at launch; PATH lookup
-must not select project programs. Project code executed by an approved
-read-only interpreter remains constrained by today's sandbox. New write-capable
-script/build profiles require the isolated backend, with snapshot hashes and
-permitted descendants bound to approval. Exact argv alone does not make an
-interpreter, shell or build script read-only. No generic shell profile is enabled
-by this decision; a future `/bin/sh -c` mode requires a separate profile and the
-same write/process/network validation gates, not a looser alternate entry point.
+Manual mode asks the user to approve the exact request. Auto mode can approve
+an unlisted destination when justified by user intent. `deny_network` entries
+apply before review. No prior request approval grants rights to a later one.
+There is no escalation based solely on the failure of a sandboxed subprocess.
+Cognix's existing loopback inference transport is separate from command network
+permissions.
 
-### Sandbox, project, Git and network boundaries
+### Future Git inspection
 
-Use a private ordinary-file project snapshot and private outputs for the new
-backend. Processes never write the live root. Copy without following symlinks;
-reject multiply-linked files before reading their data, rather than copying a
-potential outside/Git alias into the snapshot. Reject other unsupported entries
-and exclude Git administration paths. Bound snapshot scans by entry/byte quotas,
-cancellation and deadline; record source hashes/identities. Snapshot inconsistency
-fails before launch. Source
-mounts/copies for `build` must actually be OS-enforced read-only to the child;
-filesystem modes alone are insufficient for a same-user process.
-
-After `project_write`, scan/hash the isolated tree, including untracked and ignored
-files, and produce an explicit diff against the input snapshot. Track adds,
-updates, deletions and inferred unchanged-content moves. A renamed file with
-changed bytes must be represented as delete+add, within the same limits and
-metadata gates; do not generate a move-with-edit record.
-Do not automatically import symlinks, hard links, binaries, special files,
-metadata changes or patches above v2 limits. Report unsupported results and
-bounded artifact locations for inspection; never silently drop them and claim
-all changes imported. The host prepares the import proposal by reading affected
-live files through the same bounded file layer, recording read evidence and
-requiring those hashes to match the input snapshot. It must not replace a stale
-baseline with freshly changed content. Display the exact resulting patch under
-a new approval, with the same post-approval checks as model-requested patches.
-User edits since snapshot creation must survive. No automatic import after nonzero exit,
-cancellation or limit; preserve bounded evidence/artifacts for explicit review.
-
-File tools and command import deny `.git` components and resolved administration
-directories, including linked worktree common dirs, gitdir pointer files and
-nested repository metadata. The child must not discover an enclosing live
-repository through ancestor paths or inherited Git variables. For `git_read`, a
-trusted host routine resolves the selected worktree and common Git dirs, copies
-only required metadata into a read-only private snapshot without following unsafe
-links, and records its revision. Scope commands initially to status, diff and log
-inspection; disable optional locks, hooks, external diff/textconv, pagers,
-credential helpers and system/global/repository config execution. Validate
-worktrees, submodules and config includes before support; otherwise refuse them.
-Git writes, commits, checkout/reset, remote operations and live metadata exposure
-are not authorized. An unsupported Git query returns `not_run`, not fabricated
-inspection output. Git data and paths in results remain untrusted.
-
-Network is denied for all four classes, including loopback, DNS, child processes
-and socket/service routes. Local Ollama access belongs to the trusted parent,
-never the command child. Dependencies are provisioned separately by the user;
-offline build failures are visible. Future network access requires a separate
-destination-scoped policy, backend enforcement and approval design; no approval
-prompt here can turn it on. Outside private data remains unreadable; installed
-runtime dependencies remain an explicitly trusted read surface.
-
-Rebuild the environment as today: fixed runtime PATH and locale, private
-HOME/TMP, no API keys, proxies, SSH agents, loader/language injection variables,
-parent Git variables or user config. Add only host-owned profile variables such
-as output/cache locations, and show them in approval. Close inherited descriptors
-other than redirected standard streams; never pass root/approval handles into
-the child. No interactive TTY or inherited stdin.
-
-### Approval, limits, failures and platform gates
-
-Before the default-No terminal approval, show the exact escaped argv, resolved
-executable identity, cwd, requested/effective class, snapshot identity, readable
-scope, writable outputs, environment additions, network denial and time/output
-ceilings. `project_write` explicitly says that execution produces a separate
-import proposal. A command cannot provide an exact predicted diff; its preview
-must describe the writable scope honestly. Bind the approval to this plan and
-policy revision; changed argv/cwd/code/profile/scope needs another approval.
-Startup opt-in only establishes a ceiling. It never replaces per-action consent.
-
-Share one deadline across inspection, snapshot preparation and process execution.
-Initial new-backend ceilings are 100,000 snapshot entries, 1 GiB snapshot data,
-1 GiB combined writable outputs/artifacts and 64 simultaneous descendant
-processes. Session configuration may lower these; raising them needs explicit
-host configuration and a new preview. Quotas must be enforced during execution,
-not only measured afterward. Refuse launch if required disk/process containment
-is unavailable. Enforce CPU/memory
-and file-size limits where the validated backend supports them; advertise actual
-limits and refuse classes whose required containment cannot be enforced. Timeout,
-output overflow and Ctrl-C stop execution, kill and reap the entire descendant
-tree and prevent subsequent/import actions. Keep the deadline active even if
-stdout/stderr close early. Descendants that change process groups/sessions or
-daemonize must not survive: process-group killing alone is insufficient once
-forks are permitted. Bounded captured output and cleanup errors stay in evidence.
-
-Missing isolation, changed roots/executables, insufficient policy, scan errors,
-unsupported platforms or sandbox launch failure return `not_run` with
-`executed: false`. No unsandboxed retry, class escalation or equivalent retry
-after denial. A launched process has `executed: true` even on failure, timeout,
-cancellation or cleanup error; report exit/signal and actual changed artifacts.
-A successful exit records only that command's pass, not task correctness. Import
-failure is separate from command success; it may have explicit partial effects
-under the patch contract. Cleanup failure stops the session before further
-commands and identifies retained artifacts/processes without claiming isolation
-or complete cleanup.
-
-The current macOS Seatbelt profile cannot safely enable ordinary build/test
-process trees, Git inspection or project writes merely by adding argv entries.
-It denies descendants and Git reads, and allows writes only to scratch. Removing
-these denies, granting the project tree, or trusting a prompt would invalidate
-the tested boundary. `sandbox-exec` is deprecated and is not assumed to offer a
-durable containment mechanism for escaped descendants or sufficient resource
-quotas. A backend feasibility milestone may select a stronger macOS facility or
-retain `not_run` if it cannot satisfy the requirements. No write-capable class
-ships until real-host adversarial tests pass for private/outside reads and
-writes, symlink/hard-link aliases, root/parent swaps, Git/worktree boundaries,
-FD/environment leaks, network/services, output/disk/time limits and escaping
-descendant cleanup. Linux/Windows remain unsupported for commands until their
-own separately scoped backend and real-host tests exist; no Linux implementation
-is required by this decision.
+A future `git_read` profile may use a trusted host-generated, read-only metadata
+snapshot. It would need validation for worktrees, submodules and config includes,
+and must prevent live Git writes, hooks, external diff/textconv, credential
+helpers and remote operations. Unsupported queries must remain unexecuted.
+This proposal is independent of workspace-write and the internal v2 planner.
 
 ## Shared policy and evidence
 
@@ -457,7 +360,8 @@ Evolve the existing runtime rather than introducing a second agent runtime or a
 general plugin framework. Extract only repeated action preparation/approval and
 evidence ownership; retain safe operation-specific file and command backends.
 Use the same pipeline for legacy wrappers and new contracts. Bounded read/list
-tools keep their current no-prompt policy; mutations and commands require consent:
+tools can use their bounded inspection exemption. Other actions in manual or
+auto mode use the same approval boundary:
 
 1. Validate the closed tool-call envelope, IDs, fields, byte/count bounds and
    session cancellation before planning. Preserve sequential calls and bounded
@@ -477,20 +381,16 @@ backend identity, timing/limits and reason codes. Each file effect records
 normalized source/destination, before/after hash and existence, bytes, created
 directories and committed substeps. Track deleted paths and both sides of moves
 in the modified-file report, even though a deleted path has no current hash.
-Commands record exact argv/cwd, snapshot/output scope, launch flag, exit/signal,
-bounded output, limit/cancel/cleanup reason, and discovered effects; imported
-effects link to their separately approved patch action. No process launch means
-no exit code and no verification pass. A command in a snapshot verifies that
-snapshot; it does not prove a subsequently edited live tree passed. Display the
-verified snapshot/patch identity and mark changed-source verification stale.
+Commands record submitted argv, launch flag, exit/signal, bounded output and
+limit/cancel evidence. The action plan identifies the working directory and
+effective permissions. A command without process launch has no exit code or
+verification pass.
 
 Use distinct `denied`, `not_run`, `failed`, `canceled`, `limit_reached`, `partial`
 and success outcomes, plus structured reasons and per-substep execution flags.
 Preserve failed checks when later checks pass. Unknown/undiscoverable effects
-must be marked unknown, never reported as an empty diff. On new-backend mutation
-tracking failure, do not import and stop for inspection. Private output writes
-are artifacts, not live modified files. Temporary internal staging cleanup is
-distinct from approved user-visible effects.
+must be marked unknown, never reported as an empty diff. Temporary internal staging cleanup is distinct from approved user-visible
+effects.
 
 Keep full validated patch intent in the in-memory ledger as today; bound and
 escape terminal/model output, including paths, control characters and Unicode
@@ -573,9 +473,8 @@ comparison of failures, retries and context/time costs. Zero observed escapes
 is a necessary gate, not proof of safety. Maintainers must
 assess observed regressions before changing the default; no success percentage
 is invented by this design. A poorly supported schema keeps v2 opt-in and legacy
-available while the contract is revised and reevaluated. The build-output
-workflow has the same per-tag completion gate before making `build` a default
-capability; it does not block patch migration while that backend remains absent.
+available while the contract is revised and reevaluated. The workspace-write command backend has its own validation record and does
+not depend on patch migration.
 
 ## Ordered implementation roadmap
 
@@ -593,19 +492,14 @@ its evidence and rollback boundary. Do not build competing execution frameworks.
 | 3 | Implement descriptor-relative v2 executor behind an explicit experimental session mode. Depends on 2. | Failure/cancel/race injection proves per-substep effects, unchanged moves, no-clobber publication, stale checks, parent creation and partial-result ledger; execution metadata detection/refusal or safe preservation and preview-before-consent CLI tests pass. No command-policy changes; v1 remains default. |
 | 4 | Add session-selected experimental schema/provider support. Depends on 3; incorporate 2a findings before broad rollout. | Test schema transport and supported tasks on both tags. Advertise exactly one `apply_patch` signature per session; v1 maps to shared primitives without imposing stricter v2 path/metadata rules, and `create_file` retains no-parent/no-overwrite semantics. Unsupported models keep v1. Never reinterpret an old in-flight call as v2. The full comparison is reserved for 10. |
 | 5 | Introduce `exec_command` read-only contract as a wrapper around the existing exact-argv backend. Depends only on 1, independently of 2–4 and patch model evaluation. | Policy/unit and actual CLI/macOS tests show no extra permissions, cwd confinement, ceilings and evidence; `run_command` stays a compatible wrapper. Schema mode is fixed for a session, no duplicate command tool names advertised. Roll back to old advertisement without weakening isolation. |
-| 6 | Prototype isolated build backend, initially host/test-only. Depends on 5. | Document chosen macOS containment and prove real-host read-only source, output quotas, network/FD/environment boundaries and descendant-tree cancellation (including setsid/double-fork). If containment is unavailable, retain `not_run`; no write flags exposed. |
-| 7 | Expose opt-in `build` only after 6 passes. | Offline representative build/test writes solely to private outputs and kills all descendants on time/output/cancel limits; snapshot identity appears in checks. Existing read-only regressions pass; disabling the class restores the previous ceiling. |
-| 8 | Add opt-in isolated `project_write` and explicit patch import. Depends on 3 and 6's validated containment, not build exposure in 7, patch schema exposure or model comparison. | Formatter/generator/mkdir fixtures produce reviewed diffs; validate the writable-copy boundary, second approval, stale live source, unsupported effects, import failure/partial success and user-edit preservation. No process writes live source. Disable the class without deleting approved edits/artifacts. |
-| 9 | Add opt-in `git_read` snapshot support. Depends on 5 and 6's containment evidence, not build exposure in 7 or patch delivery. | Real normal/linked-worktree fixtures verify status/diff/log without live metadata access, config execution, locks, network or Git writes; unsupported layouts fail closed. Disabling it restores Git refusal. |
-| 10 | Consider default v2 advertisement or retirement of legacy patch interfaces. Depends on 4 and the full published legacy/v2 comparison; command wrapper delivery is independent. | Meet the local-model default/retirement gates, document schema selection/deprecation, preserve a release rollback to legacy mode and rerun affected deterministic/macOS checks. Retiring `run_command` separately needs 5 and command compatibility evidence; 7–9 gate only their own classes. Retain `read_file`/`list_files` unless replacement proves their hashing/bounded-read benefits. No shell/write permission is gained by retiring a tool name. |
+| 9 | Add opt-in `git_read` snapshot support after validating the snapshot boundary. | Real normal/linked-worktree fixtures verify status/diff/log without live metadata access, config execution, locks, network or Git writes; unsupported layouts fail closed. Disabling it restores Git refusal. |
+| 10 | Consider default v2 advertisement or retirement of legacy patch interfaces. Depends on 4 and the full published legacy/v2 comparison; command wrapper delivery is independent. | Meet the local-model default/retirement gates, document schema selection/deprecation, preserve a release rollback to legacy mode and rerun affected deterministic/macOS checks. Retiring `run_command` separately needs 5 and command compatibility evidence. Retain `read_file`/`list_files` unless replacement proves their hashing/bounded-read benefits. No shell/write permission is gained by retiring a tool name. |
 
 Every new capability needs implementation-guide/current README updates and a
 fresh validation record. Disabling an experimental mode affects future actions,
 never rolls back user files. Do not support changing schema versions mid-session:
-retained tool history must stay interpretable. A future write-capable shell mode
-requires milestones 6 and 8, adversarial child/resource/network validation, a specific
-shell/executable profile and explicit session/per-action authorization; it needs
-its own follow-up decision before exposure.
+retained tool history must stay interpretable. Issue #30 supersedes the former
+isolated build and project-copy import milestones (6–8).
 
 ## Issue #20 and PR #21 acceptance changes
 
