@@ -50,6 +50,10 @@ if [[ ${BUILD_WAIT:-0} == 1 ]]; then
     printf '%s' "$$" > "$FIXTURE/build.pid"
     exec /bin/sleep 30
 fi
+if [[ ${BUILD_EXIT:-0} != 0 ]]; then
+    /bin/sleep 10 </dev/null >/dev/null 2>&1 &
+    printf '%s' "$!" > "$FIXTURE/build-worker.pid"
+fi
 exit "${BUILD_EXIT:-0}"
 "#,
         );
@@ -219,6 +223,7 @@ fn build_failure_and_hangup_never_start_cognix() {
         &finished(failed.command().env("BUILD_EXIT", "17").spawn().unwrap()),
         17,
     );
+    failed.assert_stopped("build-worker.pid");
     assert!(!failed.path("argv").exists());
 
     let canceled = Fixture::new();

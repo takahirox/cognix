@@ -40,7 +40,7 @@ set +m
 wait "$build_pid"
 status=$?
 ((signal_status == 0)) || exit "$signal_status"
-build_pid=
 ((status == 0)) || exit "$status"
+build_pid=
 
 exec "$repo/target/debug/cognix" --dev-provision-model "$@"
