@@ -1,5 +1,9 @@
 //! Shared argument contract for Cognix and the development launcher helper.
-use crate::provider::{normalize_ollama_url, validate_model};
+use crate::{
+    action::{ApprovalMode, SandboxMode},
+    network::deny_origin,
+    provider::{normalize_ollama_url, validate_model},
+};
 use clap::{CommandFactory, FromArgMatches, Parser, error::ErrorKind, parser::ValueSource};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -35,6 +39,10 @@ fn context(n: usize) -> Result<usize, String> {
 #[serde(deny_unknown_fields)]
 struct Config {
     model: Option<String>,
+    review_model: Option<String>,
+    approval_mode: Option<ApprovalMode>,
+    sandbox_mode: Option<SandboxMode>,
+    deny_network: Option<Vec<String>>,
     ollama_url: Option<String>,
     max_steps: Option<usize>,
     num_ctx: Option<usize>,
@@ -78,10 +86,18 @@ impl Config {
         let mut contents = String::new();
         file.read_to_string(&mut contents)
             .map_err(|e| error(&e.to_string()))?;
-        let config: Self =
+        let mut config: Self =
             toml::from_str(&contents).map_err(|e| error(&crate::terminal::text(&e.to_string())))?;
         if let Some(model) = &config.model {
             validate_model(model).map_err(|e| error(&format!("model: {e}")))?;
+        }
+        if let Some(model) = &config.review_model {
+            validate_model(model).map_err(|e| error(&format!("review_model: {e}")))?;
+        }
+        if let Some(origins) = &mut config.deny_network {
+            for origin in origins {
+                *origin = deny_origin(origin).map_err(|e| error(&format!("deny_network: {e}")))?;
+            }
         }
         if let Some(url) = &config.ollama_url {
             normalize_ollama_url(url).map_err(|e| error(&format!("ollama_url: {e}")))?;
@@ -111,6 +127,17 @@ pub struct Args {
     pub root: PathBuf,
     #[arg(long, env = "COGNIX_MODEL", default_value = "qwen3-coder:30b")]
     pub model: String,
+    /// Local reviewer model in auto mode. Defaults to the effective working model.
+    #[arg(long, value_parser = |s: &str| validate_model(s).map(|()| s.to_owned()))]
+    pub review_model: Option<String>,
+    /// Approval mechanism selected for this session.
+    #[arg(long, value_enum, default_value = "manual")]
+    pub approval_mode: ApprovalMode,
+    /// Filesystem isolation used in manual and auto modes.
+    #[arg(long, value_enum, default_value = "workspace-write")]
+    pub sandbox_mode: SandboxMode,
+    #[arg(skip)]
+    pub deny_network: Vec<String>,
     #[arg(
         long,
         env = "COGNIX_OLLAMA_URL",
@@ -119,7 +146,7 @@ pub struct Args {
     pub ollama_url: String,
     #[arg(long)]
     pub task: Option<String>,
-    /// Restrict command proposals to these exact argv arrays. Approval is still required.
+    /// Restrict command proposals to these exact argv arrays in manual or auto mode.
     #[arg(long, value_name = "JSON_ARGV")]
     pub allow_command: Vec<String>,
     #[arg(long, default_value = "16", value_parser = |s: &str| parse_number(s).and_then(positive))]
@@ -146,6 +173,14 @@ impl Args {
         if use_config("model") {
             args.model = config.model.unwrap_or(args.model);
         }
+        args.review_model = args.review_model.or(config.review_model);
+        if use_config("approval_mode") {
+            args.approval_mode = config.approval_mode.unwrap_or(args.approval_mode);
+        }
+        if use_config("sandbox_mode") {
+            args.sandbox_mode = config.sandbox_mode.unwrap_or(args.sandbox_mode);
+        }
+        args.deny_network = config.deny_network.unwrap_or_default();
         if use_config("ollama_url") {
             args.ollama_url = config.ollama_url.unwrap_or(args.ollama_url);
         }
@@ -175,12 +210,20 @@ impl Args {
         Ok(args)
     }
 
+    pub fn reviewer_model(&self) -> &str {
+        self.review_model.as_deref().unwrap_or(&self.model)
+    }
+
     #[doc(hidden)]
     pub fn launcher_settings_digest(&self) -> String {
         // Only these effective settings can change when the same argv and
         // environment are parsed again after the user configuration was edited.
         let settings = serde_json::json!([
             self.model,
+            self.reviewer_model(),
+            self.approval_mode,
+            self.sandbox_mode,
+            self.deny_network,
             self.ollama_url,
             self.max_steps,
             self.num_ctx,

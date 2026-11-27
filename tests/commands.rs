@@ -1,5 +1,7 @@
 #[cfg(not(target_os = "macos"))]
 use cognix::commands::sandbox_argv;
+#[cfg(target_os = "macos")]
+mod common;
 use cognix::{
     Cancellation,
     commands::{parse_command, run},
@@ -168,4 +170,233 @@ fn cancellation_reaps_and_preserves_launch_evidence() {
         16384,
     );
     assert_eq!(r, json!({"status":"canceled","executed":false}));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn workspace_write_runs_build_children_and_enforces_file_and_network_boundaries() {
+    use cognix::runtime::{Runtime, SandboxMode};
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().canonicalize().unwrap().join("secret");
+    let nonexistent = outside.path().canonicalize().unwrap().join("new");
+    fs::write(&secret, "private").unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    std::os::unix::fs::symlink(&secret, project.path().join("outside-link")).unwrap();
+    fs::write(
+        project.path().join("verify.sh"),
+        "set -e\n/bin/mkdir -p build\n/bin/echo built > build/result\n/bin/cat build/result\n",
+    )
+    .unwrap();
+    let mut runtime = Runtime::new(
+        project.path(),
+        Box::new(|_, _| true),
+        Cancellation::default(),
+    )
+    .unwrap();
+    let build = json!({"argv":["/bin/bash","verify.sh"]});
+    let result = runtime.execute("run_command", build);
+    assert_eq!(result["status"], "passed", "{result}");
+    assert_eq!(
+        fs::read_to_string(project.path().join("build/result")).unwrap(),
+        "built\n"
+    );
+
+    let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    endpoint.set_nonblocking(true).unwrap();
+    let probe = r#"
+import os, sys
+pid = os.posix_spawn(sys.executable, [sys.executable, '-c', sys.argv[1]], os.environ)
+_, status = os.waitpid(pid, 0)
+assert os.waitstatus_to_exitcode(status) == 1
+"#;
+    for code in [
+        format!("open({}).read()", json!(secret)),
+        format!("open({},'w').write('bad')", json!(secret)),
+        format!("open({},'w').write('bad')", json!(nonexistent)),
+        format!("import os; os.link({}, 'outside-hardlink')", json!(secret)),
+        "open('outside-link','w').write('bad')".into(),
+        "open('.git/config','w').write('bad')".into(),
+        "import os; os.rename('.git','metadata')".into(),
+        format!(
+            "import socket; socket.create_connection(('127.0.0.1',{}), timeout=1)",
+            endpoint.local_addr().unwrap().port()
+        ),
+    ] {
+        let result = runtime.execute(
+            "run_command",
+            json!({"argv":[common::FRAMEWORK_PYTHON,"-c",probe,code]}),
+        );
+        assert_eq!(result["status"], "passed", "{code} {result}");
+        assert!(
+            result["output"]
+                .as_str()
+                .unwrap()
+                .contains("PermissionError:"),
+            "{code} {result}"
+        );
+    }
+    assert!(endpoint.accept().is_err());
+    assert_eq!(fs::read_to_string(secret).unwrap(), "private");
+    assert!(!nonexistent.exists());
+    assert!(project.path().join(".git").is_dir());
+    assert!(!project.path().join(".git/config").exists());
+
+    runtime.sandbox_mode = SandboxMode::ReadOnly;
+    let result = runtime.execute(
+        "run_command",
+        json!({"argv":["/bin/mkdir","readonly-output"]}),
+    );
+    assert_eq!(result["status"], "failed", "{result}");
+    assert!(!project.path().join("readonly-output").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn fixed_inspection_bypasses_approval_but_options_and_hard_policy_do_not() {
+    use cognix::runtime::Runtime;
+    let project = tempfile::tempdir().unwrap();
+    let mut runtime = Runtime::new(
+        project.path(),
+        Box::new(|_, _| false),
+        Cancellation::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        runtime.execute("run_command", json!({"argv":["ls"]}))["status"],
+        "passed"
+    );
+    assert_eq!(
+        runtime.execute("run_command", json!({"argv":["ls","-l"]}))["status"],
+        "denied"
+    );
+    runtime.allowed_commands = vec![vec!["cat".into(), "file".into()]];
+    assert_eq!(
+        runtime.execute("run_command", json!({"argv":["ls"]}))["status"],
+        "not_run"
+    );
+}
+
+#[test]
+fn full_access_requires_opt_in_and_uses_the_project_executable() {
+    use cognix::runtime::{ApprovalMode, Runtime};
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let destination = outside.path().join("full-access-only");
+    let program = project.path().join("local-script");
+    fs::write(&program, "#!/bin/sh\nprintf confirmed > \"$1\"\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut runtime = Runtime::new(
+        project.path(),
+        Box::new(|_, _| panic!("unexpected approval")),
+        Cancellation::default(),
+    )
+    .unwrap();
+    runtime.allowed_commands = vec![vec!["/usr/bin/true".into()]];
+    let args = json!({"argv":["./local-script",destination]});
+    assert_eq!(
+        runtime.execute("run_command", args.clone())["status"],
+        "not_run"
+    );
+    assert!(!destination.exists());
+    runtime.approval_mode = ApprovalMode::FullAccess;
+    let result = runtime.execute("run_command", args);
+    assert_eq!(result["status"], "passed", "{result}");
+    assert_eq!(fs::read_to_string(destination).unwrap(), "confirmed");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn workspace_cleanup_stops_detached_writers_after_exit_and_cancellation() {
+    use cognix::runtime::Runtime;
+
+    let code = r#"
+import os, sys, time
+from pathlib import Path
+
+writer = '''
+import os, sys, time
+from pathlib import Path
+
+# Reparent before signaling readiness, keeping stdout and stderr open.
+if os.fork() != 0:
+    os._exit(0)
+name = sys.argv[1]
+while os.getppid() != 1:
+    time.sleep(0.005)
+assert os.getpgrp() != int(sys.argv[2])
+with open(name + '.writes', 'wb', buffering=0) as output:
+    output.write(b'x')
+    Path(name).touch()
+    for _ in range(300):
+        time.sleep(0.01)
+        output.write(b'x')
+'''
+for name, flags in [('session', {'setsid': True}), ('group', {'setpgroup': 0})]:
+    pid = os.posix_spawn(sys.executable, [sys.executable, '-c', writer, name, str(os.getpgrp())], os.environ, **flags)
+    assert os.waitpid(pid, 0)[1] == 0
+deadline = time.monotonic() + 3
+while not all(Path(name).is_file() for name in ('session', 'group')):
+    assert time.monotonic() < deadline
+    time.sleep(0.005)
+if sys.argv[1] == 'wait':
+    time.sleep(5)
+print('parent stdout', flush=True)
+print('x' * 8192, file=sys.stderr, flush=True)
+sys.exit(23)
+"#;
+    for (action, status, exit_code) in
+        [("exit", "failed", 23), ("wait", "canceled", -libc::SIGKILL)]
+    {
+        let project = tempfile::tempdir().unwrap();
+        let cancel = Cancellation::default();
+        let mut runtime =
+            Runtime::new(project.path(), Box::new(|_, _| true), cancel.clone()).unwrap();
+        runtime.timeout = Duration::from_secs(2);
+        let root = project.path().to_owned();
+        let timer = (action == "wait").then(|| {
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let started = || {
+                    ["session", "group"]
+                        .iter()
+                        .all(|name| root.join(name).is_file())
+                };
+                while !started() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                cancel.cancel();
+                assert!(
+                    started(),
+                    "detached children did not start before cancellation"
+                );
+            })
+        });
+        let result = runtime.execute(
+            "run_command",
+            json!({"argv":[common::FRAMEWORK_PYTHON,"-c",code,action]}),
+        );
+        if let Some(timer) = timer {
+            timer.join().unwrap();
+        }
+        assert_eq!(result["status"], status, "{result}");
+        assert_eq!(result["executed"], true);
+        assert_eq!(result["exit_code"], exit_code);
+        if action == "exit" {
+            assert_eq!(
+                result["output"],
+                format!("parent stdout\n{}\n", "x".repeat(8192))
+            );
+        }
+        let lengths = || {
+            ["session.writes", "group.writes"]
+                .map(|name| fs::metadata(project.path().join(name)).unwrap().len())
+        };
+        let at_return = lengths();
+        assert!(at_return.iter().all(|&len| len < 301));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(lengths(), at_return);
+    }
 }

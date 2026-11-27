@@ -4,7 +4,8 @@ use cognix::{
     agent::Agent,
     commands,
     provider::Ollama,
-    runtime::Runtime,
+    review::Reviewer,
+    runtime::{ApprovalMode, Runtime},
     terminal::{input, render, show, submitted_input},
 };
 use std::time::Duration;
@@ -38,21 +39,26 @@ async fn session(args: Args, cancel: &Cancellation) -> Result<i32, String> {
     let allowed = args
         .allow_command
         .iter()
+        .filter(|_| args.approval_mode != ApprovalMode::FullAccess)
         .map(|s| commands::parse_command(s))
         .collect::<Result<Vec<_>, _>>()?;
-    let approval_cancel = cancel.clone();
-    let mut runtime = Runtime::new(
-        &args.root,
-        Box::new(move |kind, preview| {
+    let mut runtime = Runtime::new(&args.root, Box::new(|_, _| false), cancel.clone())?
+        .with_cancellable_approval(Box::new(|kind, preview, action_cancel| {
             show(&format!("\nProposed {kind}:\n{preview}"));
-            submitted_input("Approve this action? [y/N] ", &approval_cancel)
+            submitted_input("Approve this action? [y/N] ", action_cancel)
                 .ok()
                 .flatten()
                 .is_some_and(|s| s.trim().eq_ignore_ascii_case("y"))
-        }),
-        cancel.clone(),
-    )?;
+        }));
     runtime.allowed_commands = allowed;
+    runtime.approval_mode = args.approval_mode;
+    runtime.sandbox_mode = args.sandbox_mode;
+    runtime.denied_network_origins = args.deny_network.clone();
+    if args.approval_mode == ApprovalMode::FullAccess {
+        show(
+            "WARNING: Full access is enabled. Commands can read and change files outside the project, use the network and inherit your environment without approval.",
+        );
+    }
     runtime.timeout = Duration::from_secs(args.command_timeout as u64);
     runtime.output_limit = args.output_limit;
     let mut provider = Ollama::new(
@@ -72,6 +78,31 @@ async fn session(args: Args, cancel: &Cancellation) -> Result<i32, String> {
         "Ollama {}; model {}. Ctrl-C cancels. /exit quits.",
         provider.version, args.model
     ));
+    if args.approval_mode == ApprovalMode::Auto {
+        let model = args.reviewer_model();
+        let review_provider = Ollama::new(
+            model,
+            &args.ollama_url,
+            Duration::from_secs(args.model_timeout as u64),
+            args.num_ctx.min(32768),
+        );
+        let review_provider = match review_provider {
+            Ok(mut provider) => match provider.validate_local_model(false, cancel).await {
+                Ok(()) => Ok(provider),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        match review_provider {
+            Ok(provider) => {
+                show(&format!("Automatic review model: {model}"));
+                runtime.reviewer = Some(Reviewer::new(provider));
+            }
+            Err(error) => show(&format!(
+                "Automatic reviewer {model:?} unavailable. Actions requiring approval will ask for confirmation. {error}"
+            )),
+        }
+    }
     let mut agent = Agent::new(provider, runtime);
     agent.max_steps = args.max_steps;
     agent.context_budget = args.num_ctx;
@@ -117,18 +148,21 @@ async fn session(args: Args, cancel: &Cancellation) -> Result<i32, String> {
             });
         }
         if args.task.is_some() {
-            return Ok(
-                if agent
-                    .runtime
-                    .events
-                    .iter()
-                    .any(|e| !matches!(e["result"]["status"].as_str(), Some("ok" | "passed")))
-                {
-                    1
-                } else {
-                    0
-                },
-            );
+            let failed = agent.runtime.events.iter().any(|e| {
+                let result = &e["result"];
+                !matches!(result["status"].as_str(), Some("ok" | "passed"))
+                    || result["network_requests"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|request| {
+                            matches!(
+                                request["status"].as_str(),
+                                Some("denied" | "not_run" | "failed")
+                            )
+                        })
+            });
+            return Ok(if failed { 1 } else { 0 });
         }
     }
 }

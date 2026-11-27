@@ -107,65 +107,78 @@ A root change also prevents command execution.
 
 ## Verification policy and isolation
 
-Bare names resolve in the fixed order `/usr/bin`, `/bin`, `/opt/homebrew/bin`.
-Relative executable paths are rejected. An absolute path must resolve to an
-executable in a documented system runtime directory. If the user supplies any repeatable `--allow-command JSON_ARGV`
-options, the command must match one exact full argv, including the executable
-string. Model calls cannot extend or rewrite the list. Every eligible invocation
-shows its submitted argv and any distinct resolved executable path for separate
-approval. Cognix rechecks the lookup and file identity before launch. It passes
-the selected absolute invocation path and literal arguments directly, preserving
-eligible aliases used by runtimes such as Python. There is no shell parsing,
-expansion, or inherited stdin. The
-sandbox also constrains explicitly chosen shells and interpreters. An
-unsupported sandbox or sandbox launch failure never triggers an unsandboxed
-retry.
+In manual and auto modes, bare names resolve in the fixed order `/usr/bin`,
+`/bin`, `/opt/homebrew/bin`. Absolute invocations must resolve to installed
+executables under a trusted runtime directory. The readable runtime directories
+are `/usr`, `/bin`, `/sbin`, `/System`, `/Library/Apple`,
+`/Library/Frameworks`, `/Library/Developer/CommandLineTools`,
+`/Applications/Xcode.app/Contents/Developer`, and Homebrew's `Cellar`, `opt`,
+`lib`, and `bin`, when present. Workspace-write sets `DEVELOPER_DIR` to the
+standalone Apple Command Line Tools when they are installed. Developer-tool
+shims can depend on Xcode services or frameworks outside the readable paths.
 
-After approval, every command checks the readable project tree before launch.
-Any regular file with multiple hard links refuses the entire command with
-`not_run` and `executed: false`, even when that file is absent from argv: a test
-runner can open arbitrary project files. Use an ordinary copy instead of a hard
-link. Seatbelt's path rules alone cannot distinguish a project file from an alias
-to outside data or Git metadata. This check skips `.git` (already denied by
-Seatbelt), never follows symlinks, and fails closed on inspection errors or more
-than 100,000 entries. Inspection shares the command deadline and cancellation
-flag. As with the file tools, concurrent hostile changes by another process
-running as the same user are outside this boundary.
+The optional `--allow-command` policy checks the full submitted argv before
+review. The runtime binds approval to the exact prepared action and effective
+scope, checks the root and executable identity again, and passes literal
+arguments with null stdin. A bounded project scan rejects hard-link aliases,
+skips `.git`, avoids symlink traversal and shares the command deadline.
+Inspection errors or more than 100,000 entries stop launch. Simultaneous hostile
+changes from another same-user process remain outside this boundary.
 
-Commands refuse to run if the scratch directory would be inside the project.
-They receive a fresh environment with a fixed PATH, scratch HOME/TMP,
-disabled Python bytecode/user site, and disabled global/system Git configuration.
-API keys, SSH agents, proxy settings, Python paths and other parent variables are
-not inherited. Before exec on macOS, the forked child enumerates its actual file
-descriptor table and marks every descriptor above stderr close-on-exec. Enumeration
-or flag-setting failures abort launch; an incomplete table never permits execution.
-Only redirected stdin/stdout/stderr survive exec, while Rust's spawn-error pipe
-remains usable until exec succeeds or reports failure. The parent is unaffected.
-The sandbox allows project and runtime reads, scratch writes,
-and no network or project writes. Verification that needs dependency downloads,
-project build output, child services, or user configuration can fail under this
-policy; install dependencies separately and choose checks compatible with it.
+Seatbelt denies external file data, network connections and Mach service
+lookups by default. Commands read the project and installed runtimes, with
+private scratch for HOME and temporary files. Commands receive a rebuilt
+environment and inherit no Cognix application descriptors. Both profiles
+protect Git metadata and outside files. `workspace-write` additionally permits
+live workspace writes and subprocesses under the same Seatbelt policy.
+It also allows reads from macOS's system Ruby gem directory for local build and
+test tasks. LibreSSL sees its optional system configuration as absent in this
+profile and in sandboxed broker clients.
+`read-only` keeps the workspace read-only to commands and disallows descendants.
+Approved patch publication uses its own descriptor-relative boundary in both
+profiles.
 
-- **macOS:** Seatbelt through `/usr/bin/sandbox-exec`, deny by default. Permit
-  execution, runtime reads, metadata, root directory listing and sysctl reads.
-  No Mach service lookups, network, process forks/spawns or external file-data
-  reads. Disallowing descendants prevents a child from escaping cancellation
-  through a new session/process group. Scratch files are the only writable
-  directory; `/dev/null` is writable. `.git` is unreadable. `sandbox-exec` is a
-  deprecated OS facility; unavailable/changed behavior fails closed.
-- **Other platforms, including Linux:** command execution is unsupported and
-  returns `not_run` before approval/launch. There is no unsandboxed fallback or
-  unverified Linux backend. A future backend requires real-host isolation tests.
+The scoped network transport accepts a single HTTP(S) GET from private scratch,
+using a fixed system client and Cognix-owned options. Configuration, stdin,
+workspace paths, proxy settings, URL globbing and redirect following are absent
+from this transport. The URL submitted for approval identifies the HTTP origin
+by scheme, host and port. DNS resolution and TLS use the system transport.
+Origin denials apply before any approval. A command proposed with `http_get:
+true` receives a single private Unix socket path. Its direct network access
+remains blocked. The broker accepts absolute HTTP(S) URLs in GET requests and
+returns the HTTP status, bounded body and any single valid redirect `Location`,
+resolved against the approved request URL. Each GET needs its own approval and
+must complete while the parent command is active. Cognix releases any pending
+confirmation when that command exits or times out. A denied GET makes `--task`
+exit 1 while the report preserves the parent command's exit code. Cognix drops
+client headers and leaves the redirect target unrequested until a separate GET
+passes the normal policy and approval checks. Each command can submit up to 16
+requests and receive up to 4 MiB of body data per response. The broker caps
+upstream headers and trailers at 64 KiB combined.
 
-Runtime directories are `/usr`, `/bin`, `/sbin`, `/System`, `/Library/Apple`,
-`/Library/Frameworks`, Homebrew's `Cellar`, `opt`, `lib`, and `bin`, when present.
-These installed dependencies are trusted; do not keep private project data
-there. A Python installed under a user's home is deliberately
-not executable under this policy. On the evaluation Mac use
-`/opt/homebrew/bin/python3`; Apple's `/usr/bin/python3` needs Xcode directories
-that this policy does not expose. Sandbox isolation protects the filesystem and
-network, not total resource consumption: commands can still consume memory/CPU
-until their deadline. Review each proposed command before approval.
+When approval mode is `auto`, the approval boundary prepares an independent
+local Ollama request with a security instruction and bounded structured
+evidence. It offers the reviewer zero tools. A strict JSON verdict allows or
+denies the prepared action, or sends it to the same default-No confirmation
+used in manual mode. Review failures, timeouts and oversize contexts also use
+that prompt. When canceled, the request returns without prompting or committing.
+The review result includes a reason and a digest of the prepared action and
+policy. Manual confirmations recorded by the runtime travel separately from
+assistant claims and untrusted tool output.
+[Ollama structured chat output](https://github.com/ollama/ollama/blob/v0.34.4/docs/api.md#chat-request-structured-outputs)
+
+`sandbox-exec` is a deprecated macOS facility. An unavailable or failed sandbox
+never triggers an unsandboxed retry. Explicit full access disables command
+isolation and ordinary approval and retains usual OS restrictions. Workspace-write
+uses a temporary launchd job with a dedicated resource coalition. Cognix verifies
+the coalition before launch and checks that its kernel task count reaches zero
+during cleanup. Cleanup starts when the command exits, including when children
+still hold the output pipe open. Cognix then drains the buffered output.
+Children created by `posix_spawn` inherit the coalition, even
+if they change groups or sessions. A containment setup failure stops the command
+before execution. Full-access commands use process-group cleanup and can detach.
+Seatbelt provides no total CPU, memory, disk or process quota.
+[Apple XNU resource coalitions](https://github.com/apple-oss-distributions/xnu/blob/main/doc/observability/coalitions.md)
 
 ## Limits, cancellation and reporting
 
@@ -186,8 +199,8 @@ until their deadline. Review each proposed command before approval.
 Ctrl-C cancels prompts/model waits, kills running command execution and prevents
 subsequent actions. HTTP cancellation closes the socket; the Ollama server may
 finish internal inference after disconnect, but Cognix accepts no further work.
-Command time/output limits kill execution, including a command that closes its
-output pipes then keeps running. macOS denies child creation. Captured output
+Command time/output limits terminate execution, including a command that
+closes its output pipes then keeps running. Captured output
 is returned to the model as data.
 Terminal control and invisible Unicode formatting characters are escaped in
 tool output, paths and diffs.

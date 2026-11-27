@@ -1,3 +1,6 @@
+#[cfg(target_os = "macos")]
+mod common;
+
 use cognix::{Cancellation, Error, agent::Agent, provider::Provider, runtime::Runtime};
 use serde_json::{Value, json};
 use std::{collections::VecDeque, fs};
@@ -336,7 +339,7 @@ async fn fixture_inspect_fail_patch_verify_recovery() {
     }
     fs::write(t.path().join("unrelated"), "user edit").unwrap();
     let argv = vec![
-        "/opt/homebrew/bin/python3",
+        common::FRAMEWORK_PYTHON,
         "-I",
         "-B",
         "-m",

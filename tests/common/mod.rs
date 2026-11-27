@@ -130,3 +130,6 @@ pub fn ready(path: &str, _: &Value) -> Reply {
         }
     })
 }
+// Use the interpreter binary directly for the sandbox probes.
+#[cfg(target_os = "macos")]
+pub const FRAMEWORK_PYTHON: &str = "/opt/homebrew/opt/python@3/Frameworks/Python.framework/Versions/Current/Resources/Python.app/Contents/MacOS/Python";

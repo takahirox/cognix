@@ -55,6 +55,338 @@ fn final_answer() -> Reply {
     )
 }
 
+#[cfg(target_os = "macos")]
+fn command_task_server(argv: Value, http_get: bool) -> Server {
+    Server::new(move |p, b| {
+        if p != "/api/chat" || b["messages"].as_array().unwrap().len() == 1 {
+            ready(p, b)
+        } else if b["messages"].as_array().unwrap().len() == 2 {
+            tool("run_command", json!({"argv":argv,"http_get":http_get}))
+        } else {
+            final_answer()
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn default_workspace_profile_builds_and_tests_a_ruby_gem() {
+    let project = tempfile::tempdir().unwrap();
+    for (path, content) in [
+        (
+            "Rakefile",
+            r#"require 'openssl'
+require 'rake/testtask'
+
+task :build do
+  sh '/usr/bin/ruby', '-S', 'gem', 'build', 'sample.gemspec'
+end
+Rake::TestTask.new { |t| t.pattern = 'test_sample.rb' }
+task default: [:build, :test]
+"#,
+        ),
+        (
+            "sample.gemspec",
+            r#"Gem::Specification.new do |s|
+  s.name = 'sample'
+  s.version = '0.1.0'
+  s.summary = 'Sandbox test fixture'
+  s.authors = ['Cognix']
+  s.license = 'MIT'
+  s.files = ['sample.rb']
+end
+"#,
+        ),
+        ("sample.rb", "def add(a, b)\n  a + b\nend\n"),
+        (
+            "test_sample.rb",
+            r#"require 'minitest/autorun'
+require_relative 'sample'
+
+class TestSample < Minitest::Test
+  def test_add
+    assert_equal 5, add(2, 3)
+  end
+end
+"#,
+        ),
+    ] {
+        fs::write(project.path().join(path), content).unwrap();
+    }
+    let server = command_task_server(json!(["/usr/bin/ruby", "-S", "rake"]), false);
+    let out = run(
+        command(project.path(), &server.url).args(["--task", "Build and test the gem"]),
+        "y\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("\"passed\"; executed=true; exit=0"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("1 runs, 1 assertions, 0 failures"),
+        "{stdout}"
+    );
+    assert!(project.path().join("sample-0.1.0.gem").is_file());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn default_workspace_profile_builds_with_make_and_cargo() {
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    // Cargo would reject this inherited configuration if it reached the build.
+    fs::write(outside.path().join("config.toml"), "invalid Cargo config").unwrap();
+    for path in ["src", ".cargo", "vendor/sandbox-dependency/src"] {
+        fs::create_dir_all(project.path().join(path)).unwrap();
+    }
+    for (path, content) in [
+        ("Makefile", "all:\n\t/bin/echo built > make-artifact\n"),
+        (
+            "Cargo.toml",
+            "[package]\nname = 'sandbox-fixture'\nversion = '0.1.0'\nedition = '2021'\n\
+             [dependencies]\nsandbox-dependency = '=0.1.0'\n",
+        ),
+        (
+            "src/main.rs",
+            "fn main() { println!(\"{}\", sandbox_dependency::message()); }\n",
+        ),
+        (
+            ".cargo/config.toml",
+            "[source.crates-io]\nreplace-with = 'vendored'\n[source.vendored]\ndirectory = 'vendor'\n",
+        ),
+        (
+            "vendor/sandbox-dependency/Cargo.toml",
+            "[package]\nname = 'sandbox-dependency'\nversion = '0.1.0'\nedition = '2021'\n",
+        ),
+        (
+            "vendor/sandbox-dependency/src/lib.rs",
+            "pub fn message() -> &'static str { \"built with a vendored dependency\" }\n",
+        ),
+        (
+            "vendor/sandbox-dependency/.cargo-checksum.json",
+            r#"{"package":null,"files":{}}"#,
+        ),
+    ] {
+        fs::write(project.path().join(path), content).unwrap();
+    }
+    for (argv, artifact) in [
+        (json!(["/usr/bin/make"]), "make-artifact"),
+        (
+            json!(["/opt/homebrew/bin/cargo", "build", "--offline"]),
+            "target/debug/sandbox-fixture",
+        ),
+    ] {
+        let server = command_task_server(argv, false);
+        let out = run(
+            command(project.path(), &server.url)
+                .env("CARGO_HOME", outside.path())
+                .args(["--task", "Build the fixture"]),
+            "y\n",
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}");
+        assert!(
+            stdout.contains("\"passed\"; executed=true; exit=0"),
+            "{stdout}"
+        );
+        assert!(project.path().join(artifact).is_file(), "{stdout}");
+    }
+    let artifact = Command::new(project.path().join("target/debug/sandbox-fixture"))
+        .output()
+        .unwrap();
+    assert!(artifact.status.success());
+    assert_eq!(artifact.stdout, b"built with a vendored dependency\n");
+}
+
+#[cfg(target_os = "macos")]
+const BROKER_CURL: &str = r#"/usr/bin/curl --disable --silent --fail --unix-socket "$COGNIX_HTTP_SOCKET" --request-target "$1" http://localhost/"#;
+
+#[cfg(target_os = "macos")]
+#[test]
+fn denied_broker_request_fails_task_and_preserves_parent_exit_code() {
+    let project = tempfile::tempdir().unwrap();
+    let destination = Server::new(|_, _| Reply::json(json!("must stay blocked")));
+    let url = format!("{}/artifact", destination.url);
+    let script = format!("if {BROKER_CURL}; then exit 2; fi; exit 0");
+    let server = command_task_server(json!(["/bin/bash", "-c", script, "get", url]), true);
+    let out = run(
+        command(project.path(), &server.url).args(["--task", "Get the artifact"]),
+        "y\nn\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"passed\"; executed=true; exit=0"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("Network GET \"{url}\" \"denied\"")),
+        "{stdout}"
+    );
+    assert!(destination.requests.lock().unwrap().is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn failed_broker_request_fails_task_and_preserves_parent_exit_code() {
+    let project = tempfile::tempdir().unwrap();
+    // Accept the connection but close it without sending an HTTP response.
+    let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/artifact", endpoint.local_addr().unwrap());
+    let worker = std::thread::spawn(move || {
+        let (connection, _) = endpoint.accept().unwrap();
+        drop(connection);
+    });
+    let script = format!("if {BROKER_CURL}; then exit 2; fi; exit 0");
+    let server = command_task_server(json!(["/bin/bash", "-c", script, "get", url]), true);
+    let out = run(
+        command(project.path(), &server.url).args(["--task", "Get the artifact"]),
+        "y\ny\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"passed\"; executed=true; exit=0"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("Network GET \"{url}\" \"failed\"")),
+        "{stdout}"
+    );
+    worker.join().unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn upstream_http_error_fails_task_even_when_the_parent_handles_it() {
+    let project = tempfile::tempdir().unwrap();
+    for status in [404, 503] {
+        let destination = Server::new(move |_, _| Reply {
+            status,
+            ..Reply::json(json!("artifact unavailable"))
+        });
+        let url = format!("{}/artifact", destination.url);
+        let script = format!("if {BROKER_CURL}; then exit 2; fi; exit 0");
+        let server = command_task_server(json!(["/bin/bash", "-c", script, "get", url]), true);
+        let out = run(
+            command(project.path(), &server.url).args(["--task", "Get the artifact"]),
+            "y\ny\n",
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains("\"passed\"; executed=true; exit=0"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("Network GET \"{url}\" \"failed\" (HTTP {status})")),
+            "{stdout}"
+        );
+        assert_eq!(destination.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn broker_request_limit_fails_task_even_when_the_parent_handles_it() {
+    let project = tempfile::tempdir().unwrap();
+    let destination = Server::new(|_, _| Reply::json(json!("artifact")));
+    let script = format!(
+        r#"
+        get() {{ {BROKER_CURL} --output /dev/null --write-out '%{{http_code}}'; }}
+        for ((i=0; i<16; i++)); do
+            [ "$(get "$1/artifact")" = 200 ] || exit 2
+        done
+        [ "$(get "$1/over-budget-first")" = 429 ] && [ "$(get "$1/over-budget-second")" = 429 ]
+        "#
+    );
+    let server = command_task_server(
+        json!(["/bin/bash", "-c", script, "get", destination.url]),
+        true,
+    );
+    let out = run(
+        command(project.path(), &server.url).args(["--task", "Get the artifacts"]),
+        &"y\n".repeat(17),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"passed\"; executed=true; exit=0"),
+        "{stdout}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("Network GET \"failed\" (HTTP 429): Too many requests for this action")
+            .count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("Approve this action?").count(), 17);
+    let requests = destination.requests.lock().unwrap();
+    assert_eq!(requests.len(), 16);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["path"] == "/artifact")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn broker_prompt_stops_when_command_exits_or_times_out() {
+    let project = tempfile::tempdir().unwrap();
+    let destination = Server::new(|_, _| Reply::json(json!("must stay blocked")));
+    let url = format!("{}/artifact", destination.url);
+    for (script, timeout, expected_code, expected_result) in [
+        (
+            BROKER_CURL.to_owned(),
+            "1",
+            1,
+            "\"limit_reached\"; executed=true; exit=-9",
+        ),
+        (
+            // Keep the output pipe open while the leader exits. The broker
+            // must stop the prompt even before the command output reaches EOF.
+            format!("{BROKER_CURL} & /bin/sleep 1; exit 0"),
+            "10",
+            0,
+            "\"passed\"; executed=true; exit=0",
+        ),
+    ] {
+        let server = command_task_server(json!(["/bin/bash", "-c", script, "get", url]), true);
+        let mut child = command(project.path(), &server.url)
+            .args(["--task", "Get the artifact", "--command-timeout", timeout])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Leave stdin open without answering the destination prompt.
+        child.stdin.as_mut().unwrap().write_all(b"y\n").unwrap();
+        let status = finished(&mut child);
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert_eq!(status.code(), Some(expected_code), "{stdout}");
+        assert_eq!(
+            stdout.matches("Approve this action?").count(),
+            2,
+            "{stdout}"
+        );
+        assert!(stdout.contains(expected_result), "{stdout}");
+        assert!(
+            stdout.contains(&format!("Network GET \"{url}\" \"stopped\"")),
+            "{stdout}"
+        );
+    }
+    assert!(destination.requests.lock().unwrap().is_empty());
+}
+
 #[test]
 fn create_file_preview_approval_defaults_and_eof() {
     for input in ["y\n", "n\n", "\n", "", "y"] {
@@ -332,7 +664,7 @@ fn approved_command_cannot_use_inherited_outside_descriptors() {
     let code = format!(
         "import errno,os\nfor fd in {fds:?}:\n for action in [lambda:os.read(fd,100),lambda:os.write(fd,b'corrupt'),lambda:os.fstat(fd)]:\n  try: action()\n  except OSError as e: assert e.errno==errno.EBADF,e\n  else: raise AssertionError('inherited outside handle accessible')\nassert os.read(0,1)==b''\nos.write(1,b'stdout preserved\\n')\nos.write(2,b'stderr preserved\\n')"
     );
-    let argv = json!(["/opt/homebrew/bin/python3", "-c", code]);
+    let argv = json!([common::FRAMEWORK_PYTHON, "-c", code]);
     let request = argv.clone();
     let server = Server::new(move |p, b| {
         if p != "/api/chat" || b["messages"].as_array().unwrap().len() == 1 {
@@ -608,6 +940,13 @@ fn invalid_user_configuration_names_the_file_and_setting() {
         ("modle = 'typo'", "unknown field"),
         ("model = ''", "nonempty local model tag"),
         ("ollama_url = 'https://example.com'", "local HTTP origin"),
+        ("approval_mode = 'unsafe'", "approval_mode"),
+        ("sandbox_mode = 'arbitrary'", "sandbox_mode"),
+        ("review_model = 'remote-cloud'", "review_model"),
+        (
+            "deny_network = ['https://example.com/path']",
+            "deny_network",
+        ),
         ("max_steps = 0", "max_steps must be greater than zero"),
         ("num_ctx = 8191", "num_ctx must be at least 8192"),
         (
@@ -713,7 +1052,7 @@ fn sigint_after_patch_and_during_command_preserves_evidence() {
         let t = tempfile::tempdir().unwrap();
         fs::write(t.path().join("file"), "before").unwrap();
         let argv = json!([
-            "/opt/homebrew/bin/python3",
+            common::FRAMEWORK_PYTHON,
             "-c",
             "import time;print('launched',flush=True);time.sleep(20)"
         ]);
