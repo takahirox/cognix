@@ -614,6 +614,83 @@ async fn running_build_can_request_a_scoped_get_in_manual_and_auto_modes() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn refused_broker_get_blocks_its_canonical_url_only() {
+    let destination = Server::new(|path, _| {
+        assert_eq!(path, "/second");
+        Reply::json(json!("artifact"))
+    });
+    for verdict in [None, Some("deny"), Some("ask_user")] {
+        let root = tempfile::tempdir().unwrap();
+        let first = format!("{}/first", destination.url);
+        let second = format!("{}/second", destination.url);
+        let script = r#"
+            get() { /usr/bin/curl --disable --silent --fail --unix-socket "$COGNIX_HTTP_SOCKET" --request-target "$1" http://localhost/; }
+            if get "$1/first"; then exit 2; fi
+            if get "$1/alias/../first"; then exit 3; fi
+            get "$1/second"
+        "#;
+        let mut agent = task(
+            root.path(),
+            vec![propose(vec![
+                call(
+                    "run_command",
+                    json!({"argv":["/bin/bash","-c",script,"get",&destination.url],"http_get":true}),
+                ),
+                call("run_command", json!({"argv":["/usr/bin/curl",&first]})),
+            ])],
+        );
+        let approved_first = first.clone();
+        let manual_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let calls = manual_calls.clone();
+        agent.runtime.approve = Box::new(move |_, preview| {
+            calls.set(calls.get() + 1);
+            !preview.contains(&approved_first)
+        });
+        let reviewed_first = first.clone();
+        let reviewer = Server::new(move |_, body| {
+            let evidence: Value =
+                serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            let scope =
+                &evidence["prepared_action"]["effective_policy"]["additional_network_permission"];
+            if scope["url"] == reviewed_first {
+                return response(
+                    &json!({"decision":verdict.unwrap(),"reason":"The first URL needs authorization"})
+                        .to_string(),
+                );
+            }
+            response(ALLOW)
+        });
+        if verdict.is_some() {
+            setup_review(&mut agent, &reviewer, Duration::from_secs(3));
+        }
+        let report = agent.run("Get the second artifact").await;
+        let result = &report["checks"][0]["result"];
+        assert_eq!(result["status"], "passed", "{report}");
+        let requests = &result["network_requests"];
+        assert_eq!(requests[0]["status"], "denied");
+        assert_eq!(requests[1]["status"], "not_run");
+        assert_eq!(requests[1]["scope"]["url"], first);
+        assert_eq!(requests[2]["status"], "completed");
+        assert_eq!(requests[2]["scope"]["url"], second);
+        assert_eq!(report["checks"][1]["result"]["status"], "not_run");
+        assert_eq!(
+            reviewer.requests.lock().unwrap().len(),
+            if verdict.is_some() { 3 } else { 0 }
+        );
+        assert_eq!(
+            manual_calls.get(),
+            match verdict {
+                None => 3,
+                Some("ask_user") => 1,
+                Some(_) => 0,
+            }
+        );
+    }
+    assert_eq!(destination.requests.lock().unwrap().len(), 3);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn cancellation_during_a_running_commands_get_review_blocks_the_request() {
     let destination = Server::new(|_, _| Reply::json(json!("must stay blocked")));
     let root = tempfile::tempdir().unwrap();

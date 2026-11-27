@@ -156,7 +156,10 @@ async fn session(args: Args, cancel: &Cancellation) -> Result<i32, String> {
                         .into_iter()
                         .flatten()
                         .any(|request| {
-                            matches!(request["status"].as_str(), Some("denied" | "not_run"))
+                            matches!(
+                                request["status"].as_str(),
+                                Some("denied" | "not_run" | "failed")
+                            )
                         })
             });
             return Ok(if failed { 1 } else { 0 });
