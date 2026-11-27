@@ -112,9 +112,13 @@ pub fn render(report: &Value) -> String {
         if let Some(requests) = r["network_requests"].as_array() {
             for request in requests {
                 out.push_str(&format!(
-                    "  Network GET {} {}\n",
+                    "  Network GET {} {}",
                     request["scope"]["url"], request["status"]
                 ));
+                if let Some(code) = request["http_status"].as_u64() {
+                    out.push_str(&format!(" (HTTP {code})"));
+                }
+                out.push('\n');
                 render_review(&mut out, request);
             }
         }

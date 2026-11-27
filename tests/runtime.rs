@@ -349,7 +349,7 @@ fn shared_approval_preserves_previews_and_stopped_result_shapes() {
             let mut r = Runtime::new(t.path(), Box::new(|_, _| true), cancel.clone()).unwrap();
             r.allowed_commands = vec![vec!["/usr/bin/true".into()]];
             let command_preview = format!(
-                "argv = [\"/usr/bin/true\"]\nWorking directory = {:?}\nWrites to the live project and private scratch; no direct network or .git access. Fork/exec children inherit the sandbox and cannot detach. posix_spawn is blocked.",
+                "argv = [\"/usr/bin/true\"]\nWorking directory = {:?}\nWrites to the live project and private scratch; no direct network or .git access. Child processes inherit the sandbox and are stopped with the command.",
                 r.root
             );
             let (args, expected_kind, expected_preview) = match tool {

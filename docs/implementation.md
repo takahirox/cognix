@@ -113,9 +113,9 @@ executables under a trusted runtime directory. The readable runtime directories
 are `/usr`, `/bin`, `/sbin`, `/System`, `/Library/Apple`,
 `/Library/Frameworks`, `/Library/Developer/CommandLineTools`,
 `/Applications/Xcode.app/Contents/Developer`, and Homebrew's `Cellar`, `opt`,
-`lib`, and `bin`, when present. Developer-tool shims can depend on Xcode
-services or frameworks outside those locations. Use an eligible absolute path
-to the installed program when a shim fails.
+`lib`, and `bin`, when present. Workspace-write sets `DEVELOPER_DIR` to the
+standalone Apple Command Line Tools when they are installed. Developer-tool
+shims can depend on Xcode services or frameworks outside the readable paths.
 
 The optional `--allow-command` policy checks the full submitted argv before
 review. The runtime binds approval to the exact prepared action and effective
@@ -127,10 +127,10 @@ changes from another same-user process remain outside this boundary.
 
 Seatbelt denies external file data, network connections and Mach service
 lookups by default. Commands read the project and installed runtimes, with
-private scratch for HOME and temporary files. The environment is rebuilt and
-inherited descriptors above stderr are marked close-on-exec. Both profiles
+private scratch for HOME and temporary files. Commands receive a rebuilt
+environment and inherit no Cognix application descriptors. Both profiles
 protect Git metadata and outside files. `workspace-write` additionally permits
-live workspace writes and fork/exec subprocesses under the same Seatbelt policy.
+live workspace writes and subprocesses under the same Seatbelt policy.
 It also allows reads from macOS's system Ruby gem directory for local build and
 test tasks. LibreSSL sees its optional system configuration as absent in this
 profile and in sandboxed broker clients.
@@ -166,13 +166,14 @@ assistant claims and untrusted tool output.
 
 `sandbox-exec` is a deprecated macOS facility. An unavailable or failed sandbox
 never triggers an unsandboxed retry. Explicit full access disables command
-isolation and ordinary approval and retains usual OS restrictions. The command
-time/output limit stops the launched process group. Seatbelt blocks workspace-write
-descendants from creating groups or sessions, including via `posix_spawn`.
-Tools that rely on `posix_spawn` cannot run those operations in workspace-write.
-Cognix holds the group leader's PID until it checks that the kernel's group
-membership has drained. Full-access commands can detach and outlive group
-cleanup. Seatbelt provides no total CPU, memory, disk or process quota.
+isolation and ordinary approval and retains usual OS restrictions. Workspace-write
+uses a temporary launchd job with a dedicated resource coalition. Cognix verifies
+the coalition before launch and checks that its kernel task count reaches zero
+during cleanup. Children created by `posix_spawn` inherit the coalition, even
+if they change groups or sessions. A containment setup failure stops the command
+before execution. Full-access commands use process-group cleanup and can detach.
+Seatbelt provides no total CPU, memory, disk or process quota.
+[Apple XNU resource coalitions](https://github.com/apple-oss-distributions/xnu/blob/main/doc/observability/coalitions.md)
 
 ## Limits, cancellation and reporting
 
@@ -193,8 +194,8 @@ cleanup. Seatbelt provides no total CPU, memory, disk or process quota.
 Ctrl-C cancels prompts/model waits, kills running command execution and prevents
 subsequent actions. HTTP cancellation closes the socket; the Ollama server may
 finish internal inference after disconnect, but Cognix accepts no further work.
-Command time/output limits terminate the launched process group, including a
-command that closes its output pipes then keeps running. Captured output
+Command time/output limits terminate execution, including a command that
+closes its output pipes then keeps running. Captured output
 is returned to the model as data.
 Terminal control and invisible Unicode formatting characters are escaped in
 tool output, paths and diffs.

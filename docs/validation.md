@@ -358,3 +358,18 @@ zero false approvals or denials and 6.107–9.517 s review latency.
 
 All 118 default tests, formatting, Clippy, and the Markdown and link checker
 passed on the revised implementation.
+
+The subsequent build and HTTP status fix was verified on Apple Silicon macOS
+27.2.1 with Homebrew Cargo 1.94.0 and Apple Make 3.81. Both build fixtures
+produced artifacts through the default workspace-write CLI approval path.
+Spawned processes could not write outside the workspace or connect to a
+loopback listener. Reparented processes in a separate group or session stopped
+writing before the command returned, on normal exit and cancellation. The CLI
+exited 1 for brokered HTTP 404 and 503 responses, while recording exit 0 for the
+parent that handled the failure.
+
+All 125 default tests, formatting, Clippy, the Markdown and link checker, and
+the release build passed on this revision.
+
+The `qwen3.8:27b` trial on Ollama 0.34.4 matched all seven expected decisions,
+with zero false approvals, zero false denials and 6.357–9.912 s review latency.

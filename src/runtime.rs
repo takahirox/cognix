@@ -729,7 +729,7 @@ impl Runtime {
             );
             match outcome {
                 Ok((code, body)) => {
-                    event["status"] = json!("completed");
+                    event["status"] = json!(if code >= 400 { "failed" } else { "completed" });
                     event["http_status"] = json!(code);
                     request.respond(code, &body);
                 }

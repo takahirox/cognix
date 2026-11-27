@@ -132,6 +132,43 @@ end
 }
 
 #[cfg(target_os = "macos")]
+#[test]
+fn default_workspace_profile_builds_with_make_and_cargo() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("src")).unwrap();
+    for (path, content) in [
+        ("Makefile", "all:\n\t/bin/echo built > make-artifact\n"),
+        (
+            "Cargo.toml",
+            "[package]\nname = 'sandbox-fixture'\nversion = '0.1.0'\nedition = '2021'\n",
+        ),
+        ("src/main.rs", "fn main() {}\n"),
+    ] {
+        fs::write(project.path().join(path), content).unwrap();
+    }
+    for (argv, artifact) in [
+        (json!(["/usr/bin/make"]), "make-artifact"),
+        (
+            json!(["/opt/homebrew/bin/cargo", "build", "--offline"]),
+            "target/debug/sandbox-fixture",
+        ),
+    ] {
+        let server = command_task_server(argv, false);
+        let out = run(
+            command(project.path(), &server.url).args(["--task", "Build the fixture"]),
+            "y\n",
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}");
+        assert!(
+            stdout.contains("\"passed\"; executed=true; exit=0"),
+            "{stdout}"
+        );
+        assert!(project.path().join(artifact).is_file(), "{stdout}");
+    }
+}
+
+#[cfg(target_os = "macos")]
 const BROKER_CURL: &str = r#"/usr/bin/curl --disable --silent --fail --unix-socket "$COGNIX_HTTP_SOCKET" --request-target "$1" http://localhost/"#;
 
 #[cfg(target_os = "macos")]
@@ -187,6 +224,36 @@ fn failed_broker_request_fails_task_and_preserves_parent_exit_code() {
         "{stdout}"
     );
     worker.join().unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn upstream_http_error_fails_task_even_when_the_parent_handles_it() {
+    let project = tempfile::tempdir().unwrap();
+    for status in [404, 503] {
+        let destination = Server::new(move |_, _| Reply {
+            status,
+            ..Reply::json(json!("artifact unavailable"))
+        });
+        let url = format!("{}/artifact", destination.url);
+        let script = format!("if {BROKER_CURL}; then exit 2; fi; exit 0");
+        let server = command_task_server(json!(["/bin/bash", "-c", script, "get", url]), true);
+        let out = run(
+            command(project.path(), &server.url).args(["--task", "Get the artifact"]),
+            "y\ny\n",
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains("\"passed\"; executed=true; exit=0"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("Network GET \"{url}\" \"failed\" (HTTP {status})")),
+            "{stdout}"
+        );
+        assert_eq!(destination.requests.lock().unwrap().len(), 1);
+    }
 }
 
 #[cfg(target_os = "macos")]
