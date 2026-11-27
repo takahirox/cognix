@@ -10,8 +10,22 @@ use std::{
 
 pub(crate) const CURL: &str = "/usr/bin/curl";
 pub(crate) const MAX_BROKER_BODY: usize = 4 * 1024 * 1024;
+const MAX_BROKER_HEADERS: usize = 64 * 1024;
+// Curl appends a newline and the decimal body length.
+pub(crate) const MAX_BROKER_OUTPUT: usize = MAX_BROKER_BODY + MAX_BROKER_HEADERS + 24;
 
 pub(crate) struct Fetch(Url);
+
+pub(crate) struct BrokerResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub location: Option<Fetch>,
+}
+
+fn valid_url_characters(url: &str) -> bool {
+    !url.chars()
+        .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
+}
 
 impl Fetch {
     pub(crate) fn from_argv(argv: &[String]) -> Result<Option<Self>, String> {
@@ -26,10 +40,7 @@ impl Fetch {
     }
 
     fn parse(url: &str) -> Result<Self, String> {
-        if url
-            .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
-        {
+        if !valid_url_characters(url) {
             return Err("Network URL contains whitespace, controls or backslashes".into());
         }
         let scheme = url.split_once("://").ok_or("Use an absolute HTTP(S) URL")?;
@@ -97,9 +108,89 @@ impl Fetch {
 
     pub(crate) fn broker_args(&self) -> Vec<String> {
         let mut args = self.args();
-        args.retain(|arg| arg != "--include" && arg != "--fail");
-        args.extend(["--write-out".into(), "\\n%{http_code}".into()]);
+        args.retain(|arg| arg != "--fail");
+        args.extend(["--write-out".into(), "\\n%{size_download}".into()]);
         args
+    }
+
+    pub(crate) fn broker_response(&self, mut bytes: Vec<u8>) -> Result<BrokerResponse, String> {
+        let malformed = "Invalid upstream response";
+        let footer = bytes.iter().rposition(|&b| b == b'\n').ok_or(malformed)?;
+        let body_size = std::str::from_utf8(&bytes[footer + 1..])
+            .ok()
+            .and_then(|text| text.parse::<usize>().ok())
+            .filter(|&size| size <= MAX_BROKER_BODY && size <= footer)
+            .ok_or(malformed)?;
+        // With --include, curl can write informational headers before the final
+        // headers and chunked trailers after the body. Only relay the body bytes
+        // and consult the final response block for Location.
+        let extra = footer - body_size;
+        if extra > MAX_BROKER_HEADERS {
+            return Err("Upstream response exceeded its header limit".into());
+        }
+        let mut headers = &bytes[..extra];
+        let (status, location) = loop {
+            let end = headers
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .ok_or(malformed)?;
+            let mut lines = headers[..end].split(|&b| b == b'\n');
+            let status = lines
+                .next()
+                .and_then(|line| line.strip_prefix(b"HTTP/"))
+                .and_then(|line| line.split(|&b| b == b' ').nth(1))
+                .and_then(|code| std::str::from_utf8(code).ok())
+                .and_then(|code| code.trim_end_matches('\r').parse::<u16>().ok())
+                .filter(|code| (100..600).contains(code))
+                .ok_or(malformed)?;
+            headers = &headers[end + 4..];
+            if status >= 200 {
+                let location = if matches!(status, 300 | 301 | 302 | 303 | 307 | 308) {
+                    self.redirect_location(lines)
+                } else {
+                    None
+                };
+                break (status, location);
+            }
+        };
+        let body_start = extra - headers.len();
+        bytes.truncate(body_start + body_size);
+        Ok(BrokerResponse {
+            status,
+            body: bytes.split_off(body_start),
+            location,
+        })
+    }
+
+    fn redirect_location<'a>(&self, lines: impl Iterator<Item = &'a [u8]>) -> Option<Self> {
+        let mut location = None;
+        let mut previous_was_location = false;
+        for line in lines {
+            if previous_was_location && matches!(line.first(), Some(b' ' | b'\t')) {
+                return None;
+            }
+            let mut parts = line.splitn(2, |&b| b == b':');
+            previous_was_location = parts.next()?.eq_ignore_ascii_case(b"location");
+            if previous_was_location {
+                if location.is_some() {
+                    return None;
+                }
+                let value = parts.next()?;
+                location =
+                    Some(std::str::from_utf8(value.strip_suffix(b"\r").unwrap_or(value)).ok()?);
+            }
+        }
+        let location = location?.trim_matches([' ', '\t']);
+        if location.is_empty() || !valid_url_characters(location) {
+            return None;
+        }
+        if location.starts_with("//") {
+            Self::parse(&format!("{}:{location}", self.0.scheme())).ok()
+        } else if location.split(['/', '?', '#']).next()?.contains(':') {
+            Self::parse(location).ok()
+        } else {
+            Self::parse(self.0.join(location).ok()?.as_str()).ok()
+        }
     }
 }
 
@@ -116,7 +207,7 @@ const MAX_REQUEST_BYTES: usize = 8192;
 const MAX_REQUESTS: usize = 16;
 
 /// Private per-command HTTP GET endpoint. HTTP headers and bodies supplied by
-/// the project are never forwarded. No CONNECT, redirects or general tunneling.
+/// the project are never forwarded. No CONNECT, redirect following or tunneling.
 pub(crate) struct Broker {
     listener: UnixListener,
     socket: PathBuf,
@@ -128,7 +219,7 @@ pub(crate) struct Broker {
 pub(crate) struct Request(UnixStream);
 
 impl Request {
-    pub(crate) fn respond(mut self, status: u16, body: &[u8]) {
+    pub(crate) fn respond(mut self, status: u16, body: &[u8], location: Option<&Fetch>) {
         // Keep a child that stops reading from holding the broker open.
         if self.0.set_nonblocking(false).is_ok()
             && self
@@ -136,11 +227,15 @@ impl Request {
                 .set_write_timeout(Some(Duration::from_millis(100)))
                 .is_ok()
         {
+            let location = location.map_or_else(String::new, |target| {
+                format!("Location: {}\r\n", target.url())
+            });
             let _ = write!(
                 self.0,
-                "HTTP/1.1 {status} Broker response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status} Broker response\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
-            ).and_then(|()| self.0.write_all(body));
+            )
+            .and_then(|()| self.0.write_all(body));
         }
     }
 }
@@ -174,7 +269,7 @@ impl Broker {
             stream.set_nonblocking(true).ok()?;
             let request = Request(stream);
             if self.remaining == 0 {
-                request.respond(429, b"Too many requests for this action");
+                request.respond(429, b"Too many requests for this action", None);
                 return None;
             }
             self.remaining -= 1;
@@ -189,7 +284,7 @@ impl Broker {
             Err(_) => return None,
         }
         if bytes.len() > MAX_REQUEST_BYTES || started.elapsed() >= Duration::from_secs(1) {
-            request.respond(400, b"Incomplete or oversized broker request");
+            request.respond(400, b"Incomplete or oversized broker request", None);
             return None;
         }
         if !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
@@ -205,9 +300,44 @@ impl Broker {
         match fetch {
             Some(fetch) => Some((request, fetch)),
             None => {
-                request.respond(400, b"Use an absolute HTTP(S) URL in a GET request");
+                request.respond(400, b"Use an absolute HTTP(S) URL in a GET request", None);
                 None
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broker_only_exposes_a_single_valid_redirect_location() {
+        let fetch = Fetch::parse("https://example.test/artifacts/v1/start").unwrap();
+        for (headers, expected) in [
+            (
+                "Location: ../target?asset=42",
+                Some("https://example.test/artifacts/target?asset=42"),
+            ),
+            (
+                "Location: //other.test/path",
+                Some("https://other.test/path"),
+            ),
+            ("Location: file:///tmp/private", None),
+            ("Location: //user@other.test/path", None),
+            ("Location: /target#fragment", None),
+            ("Location: /target\r\nLocation: /duplicate", None),
+            ("Location: /target\r\n\t/folded", None),
+        ] {
+            let response = format!("HTTP/1.1 302 Found\r\n{headers}\r\n\r\nbody\n4");
+            let reply = fetch.broker_response(response.into_bytes()).unwrap();
+            assert_eq!(reply.status, 302);
+            assert_eq!(reply.body, b"body");
+            assert_eq!(
+                reply.location.as_ref().map(Fetch::url),
+                expected,
+                "{headers}"
+            );
         }
     }
 }

@@ -392,50 +392,62 @@ fn cli_uses_effective_model_and_falls_back_when_reviewer_is_missing() {
 }
 
 #[cfg(target_os = "macos")]
-#[tokio::test]
-async fn destination_approvals_are_scoped_in_manual_and_auto_modes() {
+fn raw_get(
+    path: &'static str,
+    response: String,
+) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let worker = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => panic!("No approved HTTP request: {e}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, format!("GET {path} HTTP/1.1\r\n"));
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if line.is_empty() || line == "\r\n" {
+                break;
+            }
+        }
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    (addr, worker)
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn destination_approvals_are_scoped_in_manual_and_auto_modes() {
     let blocked = Server::new(|_, _| Reply::json(json!("this destination must stay blocked")));
     let other = Server::new(|_, _| Reply::json(json!("no implicit redirect approval")));
     for auto in [false, true] {
         let redirect_target = format!("{}/target", other.url);
-        let redirect_server = TcpListener::bind("127.0.0.1:0").unwrap();
-        redirect_server.set_nonblocking(true).unwrap();
-        let addr = redirect_server.local_addr().unwrap();
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {redirect_target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (addr, worker) = raw_get("/requested?value=42", redirect);
         let url = format!("http://{addr}/requested?value=42");
-        let worker = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            let mut stream = loop {
-                match redirect_server.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            && std::time::Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(e) => panic!("No approved HTTP request: {e}"),
-                }
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            assert_eq!(line, "GET /requested?value=42 HTTP/1.1\r\n");
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line.is_empty() || line == "\r\n" {
-                    break;
-                }
-            }
-            write!(stream, "HTTP/1.1 302 Found\r\nLocation: {redirect_target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-        });
         let root = tempfile::tempdir().unwrap();
         let denied_url = format!("{}/denied", blocked.url);
         let sandboxed = call(
@@ -512,6 +524,79 @@ async fn destination_approvals_are_scoped_in_manual_and_auto_modes() {
         assert!(blocked.requests.lock().unwrap().is_empty());
         assert!(other.requests.lock().unwrap().is_empty());
     }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn broker_reports_redirect_and_checks_the_follow_up_get_separately() {
+    let target = Server::new(|path, _| {
+        assert_eq!(path, "/target?asset=42");
+        Reply::json(json!("approved follow-up"))
+    });
+    let target_url = format!("{}/target?asset=42", target.url);
+    let (addr, worker) = raw_get(
+        "/start",
+        format!(
+            "HTTP/1.1 103 Early Hints\r\nLocation: /interim\r\n\r\n\
+             HTTP/1.1 302 Found\r\nlOcAtIoN: {target_url}\r\nSet-Cookie: upstream=only\r\n\
+             Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+             3\r\nabc\r\n0\r\nLocation: /trailer\r\n\r\n"
+        ),
+    );
+    let start_url = format!("http://{addr}/start");
+    let root = tempfile::tempdir().unwrap();
+    let script = r#"
+        get() {
+            url=$1; shift
+            /usr/bin/curl --disable --silent --fail --unix-socket "$COGNIX_HTTP_SOCKET" \
+                --request-target "$url" http://localhost/ "$@"
+        }
+        get "$1" --dump-header headers > redirect-body || exit 1
+        while IFS=' ' read -r name value; do
+            [ "$name" = Location: ] || continue
+            get "${value%$'\r'}" > artifact
+            exit $?
+        done < headers
+        exit 2
+    "#;
+    let mut agent = task(
+        root.path(),
+        vec![propose(vec![call(
+            "run_command",
+            json!({"argv":["/bin/bash", "-c", script, "get", &start_url],"http_get":true}),
+        )])],
+    );
+    let upstream = target.requests.clone();
+    let approved_target = target_url.clone();
+    let mut approvals = 0;
+    agent.runtime.approve = Box::new(move |_, preview| {
+        approvals += 1;
+        assert!(upstream.lock().unwrap().is_empty());
+        match approvals {
+            1 => assert!(!preview.contains("Requested network destination")),
+            2 => assert!(preview.contains(&start_url)),
+            3 => assert!(preview.contains(&approved_target)),
+            _ => panic!("Unexpected approval request: {preview}"),
+        }
+        true
+    });
+    let report = agent
+        .run("Get the artifact through the approved URLs")
+        .await;
+    worker.join().unwrap();
+    let result = &report["checks"][0]["result"];
+    assert_eq!(result["status"], "passed", "{report}");
+    let requests = result["network_requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["http_status"], 302);
+    assert_eq!(requests[0]["redirect_location"], target_url);
+    assert_eq!(requests[1]["scope"]["url"], target_url);
+    assert_eq!(requests[1]["http_status"], 200);
+    let headers = fs::read_to_string(root.path().join("headers")).unwrap();
+    assert!(headers.contains(&format!("Location: {target_url}\r\n")));
+    assert!(!headers.contains("Set-Cookie"));
+    assert_eq!(fs::read(root.path().join("redirect-body")).unwrap(), b"abc");
+    assert_eq!(target.requests.lock().unwrap().len(), 1);
 }
 
 #[cfg(target_os = "macos")]

@@ -720,6 +720,7 @@ impl Runtime {
             request.respond(
                 403,
                 b"Network request was not approved for an active action",
+                None,
             );
         } else {
             let outcome = commands::broker_get(
@@ -728,14 +729,21 @@ impl Runtime {
                 job.deadline.saturating_duration_since(Instant::now()),
             );
             match outcome {
-                Ok((code, body)) => {
-                    event["status"] = json!(if code >= 400 { "failed" } else { "completed" });
-                    event["http_status"] = json!(code);
-                    request.respond(code, &body);
+                Ok(reply) => {
+                    event["status"] = json!(if reply.status >= 400 {
+                        "failed"
+                    } else {
+                        "completed"
+                    });
+                    event["http_status"] = json!(reply.status);
+                    if let Some(location) = &reply.location {
+                        event["redirect_location"] = json!(location.url());
+                    }
+                    request.respond(reply.status, &reply.body, reply.location.as_ref());
                 }
                 Err(error) => {
                     event["status"] = json!("failed");
-                    request.respond(502, error.as_bytes());
+                    request.respond(502, error.as_bytes(), None);
                 }
             }
         }
@@ -752,7 +760,7 @@ impl Runtime {
             let error = "An automatic review denied an action in this task";
             job.requests
                 .push(json!({"status":"denied","scope":fetch.scope(),"error":error}));
-            request.respond(403, error.as_bytes());
+            request.respond(403, error.as_bytes(), None);
             return None;
         }
         match self.prepare_broker_get(&fetch, parent) {
@@ -760,7 +768,7 @@ impl Runtime {
             Err(error) => {
                 job.requests
                     .push(json!({"status":"not_run","scope":fetch.scope(),"error":error}));
-                request.respond(403, error.as_bytes());
+                request.respond(403, error.as_bytes(), None);
                 None
             }
         }
