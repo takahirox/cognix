@@ -1,12 +1,11 @@
-//! Shared argument contract for Cognix and the development launcher helper.
+//! Cognix arguments and persisted settings.
 use crate::{
     action::{ApprovalMode, SandboxMode},
     network::deny_origin,
-    provider::{normalize_ollama_url, validate_model},
+    provider::{DEFAULT_OLLAMA_URL, normalize_ollama_url, validate_model},
 };
 use clap::{CommandFactory, FromArgMatches, Parser, error::ErrorKind, parser::ValueSource};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::{
     ffi::OsString,
     fs::OpenOptions,
@@ -138,12 +137,10 @@ pub struct Args {
     pub sandbox_mode: SandboxMode,
     #[arg(skip)]
     pub deny_network: Vec<String>,
-    #[arg(
-        long,
-        env = "COGNIX_OLLAMA_URL",
-        default_value = "http://127.0.0.1:11434"
-    )]
+    #[arg(long, env = "COGNIX_OLLAMA_URL", default_value = DEFAULT_OLLAMA_URL)]
     pub ollama_url: String,
+    #[arg(long, hide = true)]
+    pub dev_provision_model: bool,
     #[arg(long)]
     pub task: Option<String>,
     /// Restrict command proposals to these exact argv arrays in manual or auto mode.
@@ -199,38 +196,10 @@ impl Args {
         if use_config("output_limit") {
             args.output_limit = config.output_limit.unwrap_or(args.output_limit);
         }
-        if std::env::var_os("COGNIX_DEV_SETTINGS_DIGEST")
-            .is_some_and(|expected| expected != args.launcher_settings_digest().as_str())
-        {
-            return Err(clap::Error::raw(
-                ErrorKind::ValueValidation,
-                "Cognix settings changed during development launcher startup. Run scripts/dev.sh again.",
-            ));
-        }
         Ok(args)
     }
 
     pub fn reviewer_model(&self) -> &str {
         self.review_model.as_deref().unwrap_or(&self.model)
-    }
-
-    #[doc(hidden)]
-    pub fn launcher_settings_digest(&self) -> String {
-        // Only these effective settings can change when the same argv and
-        // environment are parsed again after the user configuration was edited.
-        let settings = serde_json::json!([
-            self.model,
-            self.reviewer_model(),
-            self.approval_mode,
-            self.sandbox_mode,
-            self.deny_network,
-            self.ollama_url,
-            self.max_steps,
-            self.num_ctx,
-            self.model_timeout,
-            self.command_timeout,
-            self.output_limit,
-        ]);
-        format!("{:x}", Sha256::digest(settings.to_string()))
     }
 }
