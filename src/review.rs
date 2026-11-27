@@ -51,7 +51,9 @@ impl Reviewer {
         let invalid = || Error::Provider("Invalid structured reviewer verdict".into());
         let message = &value["message"];
         if value["done"] != true
-            || value["done_reason"] == "length"
+            || value
+                .get("done_reason")
+                .is_some_and(|reason| reason.as_str() != Some("stop"))
             || message["role"] != "assistant"
             || message
                 .get("tool_calls")

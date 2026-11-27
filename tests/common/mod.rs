@@ -130,3 +130,7 @@ pub fn ready(path: &str, _: &Value) -> Reply {
         }
     })
 }
+// Launch Python itself. The Homebrew CLI shim uses POSIX_SPAWN_SETEXEC,
+// which workspace-write blocks along with other posix_spawn variants.
+#[cfg(target_os = "macos")]
+pub const FRAMEWORK_PYTHON: &str = "/opt/homebrew/opt/python@3/Frameworks/Python.framework/Versions/Current/Resources/Python.app/Contents/MacOS/Python";

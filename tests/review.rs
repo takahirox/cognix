@@ -255,6 +255,34 @@ async fn uncertain_invalid_and_timed_out_verdicts_require_confirmation() {
 }
 
 #[tokio::test]
+async fn unsuccessful_completion_cannot_authorize_a_valid_allow() {
+    for reason in [json!("error"), json!("length"), json!(false), Value::Null] {
+        let root = tempfile::tempdir().unwrap();
+        let server = Server::new(move |_, _| {
+            Reply::json(json!({"done":true,"done_reason":reason,
+                "message":{"role":"assistant","content":ALLOW}}))
+        });
+        let mut agent = task(
+            root.path(),
+            vec![propose(vec![call(
+                "apply_patch",
+                json!({"path":"new","old_text":null,"new_text":"content"}),
+            )])],
+        );
+        setup_review(&mut agent, &server, Duration::from_secs(3));
+        agent.runtime.approve = Box::new(|_, preview| {
+            assert!(preview.contains("Invalid structured reviewer verdict"));
+            false
+        });
+        let report = agent.run("Create a file").await;
+        let result = &report["events"][0]["result"];
+        assert_eq!(result["automatic_review"]["decision"], "ask_user");
+        assert_eq!(result["executed"], false);
+        assert!(!root.path().join("new").exists());
+    }
+}
+
+#[tokio::test]
 async fn cancellation_during_review_never_falls_through_to_manual_or_execution() {
     let root = tempfile::tempdir().unwrap();
     let mut agent = task(
@@ -484,6 +512,137 @@ async fn destination_approvals_are_scoped_in_manual_and_auto_modes() {
         assert!(blocked.requests.lock().unwrap().is_empty());
         assert!(other.requests.lock().unwrap().is_empty());
     }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn running_build_can_request_a_scoped_get_in_manual_and_auto_modes() {
+    let allowed = Server::new(|path, _| {
+        assert_eq!(path, "/artifact");
+        Reply::json(json!("build input"))
+    });
+    let denied = Server::new(|_, _| Reply::json(json!("explicitly denied")));
+    let unrelated = Server::new(|_, _| Reply::json(json!("outside the broker")));
+    for auto in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = format!("{}/artifact", allowed.url);
+        fs::write(root.path().join("source"), &artifact).unwrap();
+        let script = r#"
+            get() { /usr/bin/curl --disable --silent --fail --unix-socket "$COGNIX_HTTP_SOCKET" --request-target "$1" http://localhost/; }
+            IFS= read -r url < source || test -n "$url"
+            get "$url" > artifact || exit 1
+            if get "$1"; then exit 2; fi
+            if /usr/bin/curl --disable --silent --fail "$2"; then exit 3; fi
+            if /usr/bin/curl --disable --silent --fail --unix-socket "$COGNIX_HTTP_SOCKET" -X CONNECT --request-target "$2" http://localhost/; then exit 4; fi
+            if get "$2"; then exit 5; fi
+            exit 0
+        "#;
+        let argv = json!([
+            "/bin/bash",
+            "-c",
+            script,
+            "build",
+            &denied.url,
+            &unrelated.url
+        ]);
+        let mut agent = task(
+            root.path(),
+            vec![propose(vec![call(
+                "run_command",
+                json!({"argv":argv,"http_get":true}),
+            )])],
+        );
+        agent.runtime.denied_network_origins = vec![denied.url.clone()];
+        let evidence_url = artifact.clone();
+        let unrelated_url = format!("{}/", unrelated.url);
+        let expected_argv = argv.clone();
+        let reviewer = Server::new(move |_, body| {
+            let evidence: Value =
+                serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            let action = &evidence["prepared_action"];
+            assert_eq!(action["validated_arguments"]["argv"], expected_argv);
+            let scope = &action["effective_policy"]["additional_network_permission"];
+            if !scope.is_null() {
+                if scope["url"] == unrelated_url {
+                    return response(r#"{"decision":"deny","reason":"Unrelated destination"}"#);
+                }
+                assert_eq!(scope["url"], evidence_url);
+                assert_eq!(scope["host"], "127.0.0.1");
+                assert_eq!(scope["protocol"], "http");
+                assert_eq!(scope["method"], "GET");
+                assert_eq!(
+                    action["prepared"]["parent_command"]["executable"],
+                    "/bin/bash"
+                );
+            }
+            response(ALLOW)
+        });
+        if auto {
+            setup_review(&mut agent, &reviewer, Duration::from_secs(3));
+        } else {
+            let mut calls = 0;
+            agent.runtime.approve = Box::new(move |_, preview| {
+                calls += 1;
+                if calls == 2 {
+                    assert!(preview.contains(&artifact));
+                    assert!(preview.contains("Requested network destination"));
+                }
+                calls < 3
+            });
+        }
+        let report = agent
+            .run("Run the build and fetch its source artifact")
+            .await;
+        let result = &report["checks"][0]["result"];
+        assert_eq!(result["status"], "passed", "{report}");
+        assert_eq!(result["network_requests"][0]["status"], "completed");
+        assert_eq!(result["network_requests"][1]["status"], "not_run");
+        assert_eq!(result["network_requests"][2]["status"], "denied");
+        assert_eq!(
+            fs::read_to_string(root.path().join("artifact")).unwrap(),
+            "\"build input\""
+        );
+        assert_eq!(
+            reviewer.requests.lock().unwrap().len(),
+            if auto { 3 } else { 0 }
+        );
+        assert!(denied.requests.lock().unwrap().is_empty());
+        assert!(unrelated.requests.lock().unwrap().is_empty());
+    }
+    assert_eq!(allowed.requests.lock().unwrap().len(), 2);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn cancellation_during_a_running_commands_get_review_blocks_the_request() {
+    let destination = Server::new(|_, _| Reply::json(json!("must stay blocked")));
+    let root = tempfile::tempdir().unwrap();
+    let script = r#"exec /usr/bin/curl --disable --fail --unix-socket "$COGNIX_HTTP_SOCKET" --request-target "$1" http://localhost/"#;
+    let mut agent = task(
+        root.path(),
+        vec![propose(vec![call(
+            "run_command",
+            json!({"argv":["/bin/bash","-c",script,"get",&destination.url],"http_get":true}),
+        )])],
+    );
+    let cancellation = agent.cancellation();
+    let reviewer = Server::new(move |_, body| {
+        let evidence: Value =
+            serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        if !evidence["prepared_action"]["effective_policy"]["additional_network_permission"]
+            .is_null()
+        {
+            cancellation.cancel();
+        }
+        response(ALLOW)
+    });
+    setup_review(&mut agent, &reviewer, Duration::from_secs(3));
+    let report = agent.run("Fetch the requested artifact").await;
+    assert_eq!(report["status"], "canceled", "{report}");
+    let result = &report["checks"][0]["result"];
+    assert_eq!(result["executed"], true);
+    assert_eq!(result["network_requests"][0]["status"], "stopped");
+    assert!(destination.requests.lock().unwrap().is_empty());
 }
 
 #[cfg(target_os = "macos")]

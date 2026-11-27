@@ -2,7 +2,7 @@
 use crate::{
     Cancellation,
     action::{ActionPlan, SandboxMode, unexecuted},
-    network::{CURL, Fetch},
+    network::{CURL, Fetch, MAX_BROKER_BODY},
     schema,
 };
 use serde_json::{Value, json};
@@ -111,6 +111,7 @@ pub(crate) struct PreparedCommand {
     root: PathBuf,
     policy: ExecutionPolicy,
     pub fetch: Option<Fetch>,
+    pub broker: bool,
 }
 
 impl PreparedCommand {
@@ -140,7 +141,16 @@ impl PreparedCommand {
             root: root.to_owned(),
             policy,
             fetch,
+            broker: false,
         })
+    }
+
+    pub(crate) fn enable_broker(&mut self) -> Result<(), String> {
+        if self.policy == ExecutionPolicy::FullAccess || self.fetch.is_some() {
+            return Err("http_get requires an ordinary sandboxed command".into());
+        }
+        self.broker = true;
+        Ok(())
     }
 
     fn resolve(
@@ -192,13 +202,18 @@ impl PreparedCommand {
                 "Read-only project; no network; scratch writes only."
             }
             ExecutionPolicy::Sandbox(SandboxMode::WorkspaceWrite) => {
-                "Writes to the live project and private scratch; no network or .git access. Child processes inherit the sandbox."
+                "Writes to the live project and private scratch; no direct network or .git access. Fork/exec children inherit the sandbox and cannot detach. posix_spawn is blocked."
             }
             ExecutionPolicy::FullAccess => {
                 "Full access to files, network and inherited environment."
             }
         };
         preview.push_str(restrictions);
+        if self.broker {
+            preview.push_str(
+                "\nProject requests to the private HTTP(S) GET broker require separate approval.",
+            );
+        }
         let permissions = self.fetch.as_ref().map(Fetch::scope);
         if let Some(scope) = &permissions {
             preview.push_str(&format!("\nRequested network destination = {scope}"));
@@ -209,7 +224,7 @@ impl PreparedCommand {
             preview,
             evidence: json!({"executable":self.executable,"invocation":self.invocation,
                 "project_root":self.root, "working_directory":if self.fetch.is_some() { json!("private scratch") } else { json!(self.root) },
-                "restrictions":restrictions,"requested_network":permissions,
+                "restrictions":restrictions,"requested_network":permissions,"http_get_broker":self.broker,
                 "effective_argv":self.fetch.as_ref().map(Fetch::args),
                 "executable_identity":[self.metadata.dev(),self.metadata.ino(),self.metadata.ctime() as u64,self.metadata.ctime_nsec() as u64]}),
         }
@@ -218,10 +233,11 @@ impl PreparedCommand {
     pub(crate) fn low_risk(&self) -> bool {
         // Only fixed argument shapes for known system binaries. An absolute alias,
         // command option, filename or wrapper never qualifies for this exemption.
-        matches!((self.executable.to_str(), self.argv.as_slice()),
+        !self.broker
+            && (matches!((self.executable.to_str(), self.argv.as_slice()),
             (Some("/bin/ls"), [name]) if name == "ls" || name == "/bin/ls")
-            || matches!((self.executable.to_str(), self.argv.as_slice()),
-            (Some("/bin/pwd"), [name]) if name == "pwd" || name == "/bin/pwd")
+                || matches!((self.executable.to_str(), self.argv.as_slice()),
+            (Some("/bin/pwd"), [name]) if name == "pwd" || name == "/bin/pwd"))
     }
 
     fn check_executable(&self) -> Result<(), String> {
@@ -253,7 +269,7 @@ fn sandbox_available() -> Result<(), String> {
 }
 
 pub fn sandbox_argv(root: &Path, scratch: &Path, argv: &[String]) -> Result<Vec<String>, String> {
-    wrap_sandbox(root, scratch, argv, SandboxMode::ReadOnly)
+    wrap_sandbox(root, scratch, argv, SandboxMode::ReadOnly, None)
 }
 
 fn wrap_sandbox(
@@ -261,6 +277,7 @@ fn wrap_sandbox(
     scratch: &Path,
     argv: &[String],
     mode: SandboxMode,
+    socket: Option<&Path>,
 ) -> Result<Vec<String>, String> {
     sandbox_available()?;
     let quote =
@@ -284,14 +301,24 @@ fn wrap_sandbox(
         .join(" ");
     let workspace = match mode {
         SandboxMode::ReadOnly => String::new(),
+        // posix_spawn can set a new group or session inside the kernel without
+        // calling setpgid/setsid. Seatbelt cannot filter those spawn attributes.
         SandboxMode::WorkspaceWrite => format!(
-            "(allow process-fork) (allow file-write* (subpath {})) (deny file-write* (literal {})) (deny file-link)",
+            "(allow process-fork) (deny syscall-unix (syscall-number SYS_setsid SYS_setpgid SYS_posix_spawn) (with errno EPERM)) (allow file-write* (subpath {})) (deny file-write* (literal {})) (deny file-link)",
             quote(root),
             quote(root)
         ),
     };
+    let broker = socket.map_or_else(String::new, |path| {
+        // System curl loads its TLS config even for HTTP. Present it as absent
+        // without granting reads outside the workspace.
+        format!(
+            "(allow network-outbound (remote unix-socket (path {}))) (deny file-read-data (literal \"/private/etc/ssl/openssl.cnf\") (with errno ENOENT))",
+            quote(path)
+        )
+    });
     let profile = format!(
-        r#"(version 1) (deny default) (allow process-exec) (allow sysctl-read) (allow file-read-metadata) (allow file-read* {reads} (literal "/") (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random") (subpath "/private/var/db/dyld")) (allow file-write* (subpath {}) (literal "/dev/null")) {workspace} (deny file-read* file-write* (regex #"/[.][gG][iI][tT](/|$)"))"#,
+        r#"(version 1) (deny default) (allow process-exec) (allow sysctl-read) (allow file-read-metadata) (allow file-read* {reads} (literal "/") (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random") (subpath "/private/var/db/dyld")) (allow file-write* (subpath {}) (literal "/dev/null")) {workspace} {broker} (deny file-read* file-write* (regex #"/[.][gG][iI][tT](/|$)"))"#,
         quote(scratch)
     );
     let mut out = vec!["/usr/bin/sandbox-exec".into(), "-p".into(), profile];
@@ -417,6 +444,62 @@ fn sanitize_descriptors(buffer: &mut [libc::proc_fdinfo]) -> std::io::Result<()>
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn command_exited(pid: i32) -> std::io::Result<bool> {
+    // WNOWAIT leaves the leader's PID reserved until group cleanup completes.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as _,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+#[cfg(target_os = "macos")]
+fn stop_workspace_group(pid: i32) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        // Darwin signals a snapshot of the group. Repeat so a concurrent fork
+        // cannot outlive the signal to its parent.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        if command_exited(pid).map_err(|error| error.to_string())? {
+            // PROC_PGRP_ONLY is a kernel snapshot including zombies. Two slots
+            // suffice to distinguish a lone unreaped leader from any other member.
+            const PROC_PGRP_ONLY: u32 = 2;
+            let mut pids = [0i32; 2];
+            let bytes = unsafe {
+                libc::proc_listpids(
+                    PROC_PGRP_ONLY,
+                    pid as u32,
+                    pids.as_mut_ptr().cast(),
+                    size_of_val(&pids) as i32,
+                )
+            };
+            if bytes == size_of::<i32>() as i32 && pids[0] == pid {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Could not verify that every process in command group {pid} stopped"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 pub fn run(
     root: &Path,
     argv: &[String],
@@ -446,12 +529,68 @@ pub(crate) fn run_prepared(
     timeout: Duration,
     limit: usize,
 ) -> Result<Value, String> {
+    run_command(prepared, cancel, timeout, limit, None)
+}
+
+pub(crate) fn run_command(
+    prepared: PreparedCommand,
+    cancel: &Cancellation,
+    timeout: Duration,
+    limit: usize,
+    broker: Option<(&Path, &Cancellation)>,
+) -> Result<Value, String> {
+    if prepared.broker != broker.is_some() {
+        return Err("Command broker does not match the prepared permissions".into());
+    }
+    let (mut result, output) = capture(prepared, cancel, timeout, limit, broker, false)?;
+    if result["executed"] == true {
+        // Lossy decoding can expand invalid bytes; keep even decoded text bounded.
+        let mut decoded = String::from_utf8_lossy(&output).into_owned();
+        if decoded.len() > limit {
+            let mut end = limit;
+            while !decoded.is_char_boundary(end) {
+                end -= 1;
+            }
+            decoded.truncate(end);
+        }
+        result["output"] = json!(decoded);
+    }
+    Ok(result)
+}
+
+pub(crate) fn broker_get(
+    prepared: PreparedCommand,
+    cancel: &Cancellation,
+    timeout: Duration,
+) -> Result<(u16, Vec<u8>), String> {
+    // Allow room for the four-byte status trailer from curl.
+    let (result, mut bytes) = capture(prepared, cancel, timeout, MAX_BROKER_BODY + 4, None, true)?;
+    if result["status"] != "passed" || bytes.len() < 4 {
+        return Err("Upstream GET failed or exceeded its action limits".into());
+    }
+    let footer = bytes.split_off(bytes.len() - 4);
+    let code = std::str::from_utf8(&footer)
+        .ok()
+        .and_then(|text| text.strip_prefix('\n')?.parse::<u16>().ok())
+        .filter(|code| (200..600).contains(code))
+        .ok_or("Invalid upstream status")?;
+    Ok((code, bytes))
+}
+
+fn capture(
+    prepared: PreparedCommand,
+    cancel: &Cancellation,
+    timeout: Duration,
+    limit: usize,
+    broker: Option<(&Path, &Cancellation)>,
+    broker_reply: bool,
+) -> Result<(Value, Vec<u8>), String> {
     let root = &prepared.root;
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or("Command timeout is too large")?;
     if cancel.is_canceled() {
-        return Ok(unexecuted("canceled"));
+        return Ok((unexecuted("canceled"), Vec::new()));
     }
     let mut temporary = None;
     let mut command = Command::new(&prepared.invocation);
@@ -473,14 +612,18 @@ pub(crate) fn run_prepared(
             // Only the fixed system HTTP client gets network access. No proposed
             // flags, workspace cwd, proxy settings or user configuration cross
             // this boundary. The reviewed URL is the only outbound request.
-            command.current_dir(&scratch).args(fetch.args());
+            command.current_dir(&scratch).args(if broker_reply {
+                fetch.broker_args()
+            } else {
+                fetch.args()
+            });
         } else {
             let validation = validate_project_reads(root, cancel, deadline);
             if cancel.is_canceled() {
-                return Ok(unexecuted("canceled"));
+                return Ok((unexecuted("canceled"), Vec::new()));
             }
             if Instant::now() >= deadline {
-                return Ok(unexecuted("limit_reached"));
+                return Ok((unexecuted("limit_reached"), Vec::new()));
             }
             validation?;
             let mut argv = prepared.argv.clone();
@@ -489,7 +632,13 @@ pub(crate) fn run_prepared(
                 .to_str()
                 .ok_or("Non-UTF8 command path")?
                 .into();
-            let wrapped = wrap_sandbox(root, &scratch, &argv, mode)?;
+            let wrapped = wrap_sandbox(
+                root,
+                &scratch,
+                &argv,
+                mode,
+                broker.map(|(socket, _)| socket),
+            )?;
             command = Command::new(&wrapped[0]);
             command
                 .current_dir(root)
@@ -509,6 +658,9 @@ pub(crate) fn run_prepared(
             ("GIT_CONFIG_GLOBAL", "/dev/null"),
             ("GIT_TERMINAL_PROMPT", "0"),
         ]);
+        if let Some((path, _)) = broker {
+            command.env("COGNIX_HTTP_SOCKET", path);
+        }
         temporary = Some(temp);
     } else {
         command.args(&prepared.argv[1..]);
@@ -535,10 +687,10 @@ pub(crate) fn run_prepared(
     // Refuse to launch if the submitted path no longer resolves to the approved executable.
     let executable_check = prepared.check_executable();
     if cancel.is_canceled() {
-        return Ok(unexecuted("canceled"));
+        return Ok((unexecuted("canceled"), Vec::new()));
     }
     if Instant::now() >= deadline {
-        return Ok(unexecuted("limit_reached"));
+        return Ok((unexecuted("limit_reached"), Vec::new()));
     }
     executable_check?;
     let mut child = command
@@ -590,8 +742,12 @@ pub(crate) fn run_prepared(
                 break;
             }
         }
-        match child.try_wait() {
-            Ok(Some(_)) if eof => break,
+        #[cfg(target_os = "macos")]
+        let exited = command_exited(pid);
+        #[cfg(not(target_os = "macos"))]
+        let exited = child.try_wait().map(|status| status.is_some());
+        match exited {
+            Ok(true) if eof => break,
             Ok(_) => {}
             Err(e) => {
                 io_error = Some(e.to_string());
@@ -613,11 +769,27 @@ pub(crate) fn run_prepared(
         }
     }
     // Always reap; no cancellation check may bypass cleanup or lose launch evidence.
+    if let Some((_, network_lifetime)) = broker {
+        network_lifetime.cancel();
+    }
     #[cfg(test)]
     boundary("cleanup");
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
+    #[cfg(target_os = "macos")]
+    let workspace = prepared.policy == ExecutionPolicy::Sandbox(SandboxMode::WorkspaceWrite)
+        && prepared.fetch.is_none();
+    #[cfg(not(target_os = "macos"))]
+    let workspace = false;
+    if !workspace {
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
     }
+    #[cfg(target_os = "macos")]
+    let cleanup_error = if workspace {
+        stop_workspace_group(pid).err()
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let cleanup_error: Option<String> = None;
     let exit = match child.wait() {
         Ok(exit) => Some(exit),
         Err(e) => {
@@ -632,17 +804,13 @@ pub(crate) fn run_prepared(
     if cancel.is_canceled() {
         state = Some("canceled");
     }
-    let code = exit.map(|e| e.code().unwrap_or_else(|| -e.signal().unwrap_or(1)));
-    // Lossy decoding can expand invalid bytes; keep even the decoded text bounded.
-    let mut decoded = String::from_utf8_lossy(&output).into_owned();
-    if decoded.len() > limit {
-        let mut end = limit;
-        while !decoded.is_char_boundary(end) {
-            end -= 1;
-        }
-        decoded.truncate(end);
+    if let Some(error) = cleanup_error {
+        state = Some("cleanup_failed");
+        io_error = Some(error);
+        cancel.cancel();
     }
-    let mut result = json!({"status":state.unwrap_or(if io_error.is_some(){"failed"}else if exit.is_some_and(|e|e.success()){"passed"}else{"failed"}),"executed":true,"pid":pid,"exit_code":code,"output":decoded,"limit":if state==Some("limit_reached"){Some("time or output")}else{None}});
+    let code = exit.map(|e| e.code().unwrap_or_else(|| -e.signal().unwrap_or(1)));
+    let mut result = json!({"status":state.unwrap_or(if io_error.is_some(){"failed"}else if exit.is_some_and(|e|e.success()){"passed"}else{"failed"}),"executed":true,"pid":pid,"exit_code":code,"limit":if state==Some("limit_reached"){Some("time or output")}else{None}});
     if prepared.fetch.is_none()
         && prepared.policy != ExecutionPolicy::Sandbox(SandboxMode::ReadOnly)
         && !prepared.low_risk()
@@ -653,7 +821,7 @@ pub(crate) fn run_prepared(
         result["error"] = json!(error);
     }
     drop(temporary);
-    Ok(result)
+    Ok((result, output))
 }
 
 #[cfg(all(test, target_os = "macos"))]

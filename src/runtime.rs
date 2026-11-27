@@ -2,6 +2,7 @@ use crate::{
     Cancellation,
     action::{ActionPlan, finish_result, unexecuted},
     commands::{self, ExecutionPolicy, PreparedCommand},
+    network::{Broker, Fetch, MAX_BROKER_BODY, Request},
     review::{Decision, Reviewer},
     schema,
 };
@@ -17,7 +18,8 @@ use std::{
         unix::fs::{MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
-    time::Duration,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
@@ -103,6 +105,50 @@ struct PreparedPatch {
 enum PreparedAction {
     Patch(PreparedPatch),
     Command(PreparedCommand),
+}
+
+impl PreparedAction {
+    fn origin(&self) -> Option<String> {
+        match self {
+            Self::Command(command) => command.fetch.as_ref().map(Fetch::origin),
+            Self::Patch(_) => None,
+        }
+    }
+}
+
+struct BrokerJob {
+    broker: Broker,
+    worker: Option<JoinHandle<Result<Value, String>>>,
+    cancel: Cancellation,
+    network_lifetime: Cancellation,
+    deadline: Instant,
+    requests: Vec<Value>,
+}
+
+impl BrokerJob {
+    fn active(&self) -> bool {
+        !self.network_lifetime.is_canceled() && Instant::now() < self.deadline
+    }
+
+    fn finish(mut self) -> Result<Value, String> {
+        let mut result = self
+            .worker
+            .take()
+            .unwrap()
+            .join()
+            .map_err(|_| "Command worker failed")??;
+        result["network_requests"] = json!(std::mem::take(&mut self.requests));
+        Ok(result)
+    }
+}
+
+impl Drop for BrokerJob {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            self.cancel.cancel();
+            let _ = worker.join();
+        }
+    }
 }
 
 enum PatchPublication {
@@ -554,17 +600,154 @@ impl Runtime {
             }
             ExecutionPolicy::Sandbox(self.sandbox_mode)
         };
-        let prepared = PreparedCommand::new(&self.root, argv, policy)?;
+        let mut prepared = PreparedCommand::new(&self.root, argv, policy)?;
+        if args["http_get"] == true {
+            prepared.enable_broker()?;
+        }
         if let Some(fetch) = &prepared.fetch {
-            let origin = fetch.origin();
-            if self.denied_network_origins.contains(&origin)
-                || self.denied_network_in_session.contains(&origin)
-            {
-                return Err(format!("Network destination {origin} is explicitly denied"));
-            }
+            self.check_network_origin(&fetch.origin())?;
         }
         let plan = prepared.plan();
         Ok((PreparedAction::Command(prepared), plan))
+    }
+
+    fn check_network_origin(&self, origin: &str) -> Result<(), String> {
+        if self
+            .denied_network_origins
+            .iter()
+            .any(|denied| denied == origin)
+            || self.denied_network_in_session.contains(origin)
+        {
+            return Err(format!("Network destination {origin} is explicitly denied"));
+        }
+        Ok(())
+    }
+
+    fn check_command_root(&self) -> Result<(), String> {
+        if !identity(
+            &self.root.symlink_metadata().map_err(err)?,
+            &self.root_fd.metadata().map_err(err)?,
+        ) {
+            return Err("Project root changed during session".into());
+        }
+        Ok(())
+    }
+
+    fn start_broker(&self, command: PreparedCommand) -> Result<BrokerJob, String> {
+        self.check_command_root()?;
+        let broker =
+            Broker::new().map_err(|error| format!("Cannot start HTTP(S) GET broker: {error}"))?;
+        let socket = broker.socket().to_owned();
+        if socket.starts_with(&self.root) {
+            return Err("HTTP(S) GET broker socket would be inside the project".into());
+        }
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or("Command timeout is too large")?;
+        let cancel = self.cancel.child();
+        let process_cancel = cancel.clone();
+        let network_lifetime = cancel.child();
+        let requests = network_lifetime.clone();
+        let limit = self.output_limit;
+        let worker = thread::Builder::new()
+            .spawn(move || {
+                let result = commands::run_command(
+                    command,
+                    &process_cancel,
+                    deadline.saturating_duration_since(Instant::now()),
+                    limit,
+                    Some((&socket, &requests)),
+                );
+                requests.cancel();
+                result
+            })
+            .map_err(err)?;
+        Ok(BrokerJob {
+            broker,
+            worker: Some(worker),
+            cancel,
+            network_lifetime,
+            deadline,
+            requests: Vec::new(),
+        })
+    }
+
+    fn prepare_broker_get(
+        &self,
+        fetch: &Fetch,
+        parent: &ActionPlan,
+    ) -> Result<(PreparedCommand, ActionPlan), String> {
+        let scope = fetch.scope();
+        self.check_network_origin(&fetch.origin())?;
+        let prepared = PreparedCommand::new(
+            &self.root,
+            vec!["curl".into(), fetch.url().into()],
+            ExecutionPolicy::Sandbox(self.sandbox_mode),
+        )?;
+        let mut plan = prepared.plan();
+        plan.preview = format!(
+            "Requested network destination = {scope}\nParent command\n{}",
+            parent.preview
+        );
+        plan.evidence["parent_command"] = parent.evidence.clone();
+        plan.evidence["effective_argv"] = json!(fetch.broker_args());
+        plan.evidence["response_limit_bytes"] = json!(MAX_BROKER_BODY);
+        Ok((prepared, plan))
+    }
+
+    fn serve_broker_get(
+        job: &mut BrokerJob,
+        request: Request,
+        fetch: PreparedCommand,
+        mut event: Value,
+        approved: bool,
+    ) {
+        if !approved || !job.active() {
+            event["status"] = json!(if job.active() { "denied" } else { "stopped" });
+            request.respond(
+                403,
+                b"Network request was not approved for an active action",
+            );
+        } else {
+            let outcome = commands::broker_get(
+                fetch,
+                &job.network_lifetime,
+                job.deadline.saturating_duration_since(Instant::now()),
+            );
+            match outcome {
+                Ok((code, body)) => {
+                    event["status"] = json!("completed");
+                    event["http_status"] = json!(code);
+                    request.respond(code, &body);
+                }
+                Err(error) => {
+                    event["status"] = json!("failed");
+                    request.respond(502, error.as_bytes());
+                }
+            }
+        }
+        job.requests.push(event);
+    }
+
+    fn next_broker_get(
+        &self,
+        job: &mut BrokerJob,
+        parent: &ActionPlan,
+    ) -> Option<(Request, PreparedCommand, ActionPlan, String)> {
+        let (request, fetch) = job.broker.next()?;
+        if self.auto_denied {
+            request.respond(403, b"An automatic review denied an action in this task");
+            return None;
+        }
+        match self.prepare_broker_get(&fetch, parent) {
+            Ok((prepared, plan)) => Some((request, prepared, plan, fetch.origin())),
+            Err(error) => {
+                job.requests
+                    .push(json!({"status":"not_run","scope":fetch.scope(),"error":error}));
+                request.respond(403, error.as_bytes());
+                None
+            }
+        }
     }
 
     fn commit(&mut self, action: PreparedAction) -> Result<Value, String> {
@@ -574,12 +757,7 @@ impl Runtime {
         match action {
             PreparedAction::Patch(patch) => self.commit_patch(patch),
             PreparedAction::Command(command) => {
-                if !identity(
-                    &self.root.symlink_metadata().map_err(err)?,
-                    &self.root_fd.metadata().map_err(err)?,
-                ) {
-                    return Err("Project root changed during session".into());
-                }
+                self.check_command_root()?;
                 commands::run_prepared(command, &self.cancel, self.timeout, self.output_limit)
             }
         }
@@ -653,15 +831,16 @@ impl Runtime {
         evidence
     }
 
-    fn manual(
+    fn confirm(
         &mut self,
-        action: PreparedAction,
         plan: &ActionPlan,
         digest: &str,
         fallback: Option<&str>,
-    ) -> Result<Value, String> {
-        if self.cancel.is_canceled() {
-            return Ok(plan.stopped("canceled"));
+        origin: Option<&str>,
+        cancel: &Cancellation,
+    ) -> bool {
+        if cancel.is_canceled() {
+            return false;
         }
         let preview = match fallback {
             Some(reason) => format!(
@@ -671,25 +850,127 @@ impl Runtime {
             None => plan.preview.clone(),
         };
         let allowed = (self.approve)(plan.kind, &preview);
-        if self.cancel.is_canceled() {
-            return Ok(plan.stopped("canceled"));
+        if cancel.is_canceled() {
+            return false;
         }
-        let origin = match &action {
-            PreparedAction::Command(command) => command.fetch.as_ref().map(|fetch| fetch.origin()),
-            _ => None,
-        };
         self.human_decisions.push(json!({"decision":if allowed { "allow" } else { "not_approved" },
             "action_sha256":digest,"scope_excerpt":plan.preview.chars().take(512).collect::<String>(),
             "network_origin":origin}));
-        if allowed {
-            self.commit(action)
-        } else {
+        if !allowed {
             if let Some(origin) = origin {
-                self.denied_network_in_session.insert(origin);
+                self.denied_network_in_session.insert(origin.to_owned());
             }
             self.auto_denied = self.approval_mode == ApprovalMode::Auto;
-            Ok(plan.stopped("denied"))
         }
+        allowed
+    }
+
+    async fn authorize(
+        &mut self,
+        plan: &ActionPlan,
+        evidence: Value,
+        history: &[Value],
+        origin: Option<&str>,
+        cancel: &Cancellation,
+    ) -> (bool, Value) {
+        let digest = hash(evidence.to_string().as_bytes());
+        let reviewer = self
+            .reviewer
+            .as_ref()
+            .expect("automatic review was selected");
+        let review = reviewer
+            .review(&self.review_context(reviewer, evidence, history), cancel)
+            .await;
+        let (allowed, mut audit) = if cancel.is_canceled() {
+            (false, json!({"decision":"canceled"}))
+        } else {
+            match review {
+                Ok(verdict) => {
+                    let allowed = match verdict.decision {
+                        Decision::Allow => true,
+                        Decision::Deny => {
+                            if let Some(origin) = origin {
+                                self.denied_network_in_session.insert(origin.to_owned());
+                            }
+                            self.auto_denied = true;
+                            false
+                        }
+                        Decision::AskUser => {
+                            self.confirm(plan, &digest, Some(&verdict.reason), origin, cancel)
+                        }
+                    };
+                    (allowed, json!(verdict))
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    (
+                        self.confirm(plan, &digest, Some(&reason), origin, cancel),
+                        json!({"decision":"ask_user","reason":reason}),
+                    )
+                }
+            }
+        };
+        audit["action_sha256"] = json!(digest);
+        (allowed, audit)
+    }
+
+    async fn serve_broker(
+        &mut self,
+        command: PreparedCommand,
+        parent: &ActionPlan,
+        args: &Value,
+        history: &[Value],
+    ) -> Result<Value, String> {
+        let mut job = self.start_broker(command)?;
+        while job.active() {
+            if let Some((request, fetch, plan, origin)) = self.next_broker_get(&mut job, parent) {
+                let evidence = self.action_evidence("run_command", args, &plan);
+                let (allowed, audit) = self
+                    .authorize(
+                        &plan,
+                        evidence,
+                        history,
+                        Some(&origin),
+                        &job.network_lifetime,
+                    )
+                    .await;
+                let event =
+                    json!({"scope":plan.evidence["requested_network"],"automatic_review":audit});
+                Self::serve_broker_get(&mut job, request, fetch, event, allowed);
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        job.finish()
+    }
+
+    fn serve_broker_sync(
+        &mut self,
+        command: PreparedCommand,
+        parent: &ActionPlan,
+        args: &Value,
+    ) -> Result<Value, String> {
+        let mut job = self.start_broker(command)?;
+        while job.active() {
+            if let Some((request, fetch, plan, origin)) = self.next_broker_get(&mut job, parent) {
+                let evidence = self.action_evidence("run_command", args, &plan);
+                let digest = hash(evidence.to_string().as_bytes());
+                let fallback =
+                    (self.approval_mode == ApprovalMode::Auto).then_some("Reviewer unavailable");
+                let allowed = self.confirm(
+                    &plan,
+                    &digest,
+                    fallback,
+                    Some(&origin),
+                    &job.network_lifetime,
+                );
+                let event = json!({"scope":plan.evidence["requested_network"]});
+                Self::serve_broker_get(&mut job, request, fetch, event, allowed);
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        job.finish()
     }
 
     pub(crate) fn begin_task(&mut self) {
@@ -716,44 +997,26 @@ impl Runtime {
             let result = self.commit(action);
             return self.record_result(name, args, result);
         }
-        let reviewer = self.reviewer.as_ref().unwrap();
+        let cancel = self.cancel.clone();
+        let origin = action.origin();
         let evidence = self.action_evidence(name, &args, &plan);
-        let digest = hash(evidence.to_string().as_bytes());
-        let review = reviewer
-            .review(
-                &self.review_context(reviewer, evidence, history),
-                &self.cancel,
-            )
+        let (allowed, audit) = self
+            .authorize(&plan, evidence, history, origin.as_deref(), &cancel)
             .await;
-        let (result, audit) = if self.cancel.is_canceled() {
-            (Ok(plan.stopped("canceled")), json!({"decision":"canceled"}))
+        let result = if cancel.is_canceled() {
+            Ok(plan.stopped("canceled"))
+        } else if !allowed {
+            Ok(plan.stopped("denied"))
         } else {
-            match review {
-                Ok(verdict) => {
-                    let result = match verdict.decision {
-                        Decision::Allow => self.commit(action),
-                        Decision::Deny => {
-                            self.auto_denied = true;
-                            Ok(plan.stopped("denied"))
-                        }
-                        Decision::AskUser => {
-                            self.manual(action, &plan, &digest, Some(&verdict.reason))
-                        }
-                    };
-                    (result, json!(verdict))
+            match action {
+                PreparedAction::Command(command) if command.broker => {
+                    self.serve_broker(command, &plan, &args, history).await
                 }
-                Err(error) => {
-                    let reason = error.to_string();
-                    (
-                        self.manual(action, &plan, &digest, Some(&reason)),
-                        json!({"decision":"ask_user","reason":reason}),
-                    )
-                }
+                _ => self.commit(action),
             }
         };
         let mut result = finish_result(name, result, &self.cancel);
         result["automatic_review"] = audit;
-        result["automatic_review"]["action_sha256"] = json!(digest);
         self.record_result(name, args, Ok(result))
     }
     pub(crate) fn record_result(
@@ -763,6 +1026,9 @@ impl Runtime {
         result: Result<Value, String>,
     ) -> Value {
         let result = finish_result(name, result, &self.cancel);
+        if result["status"] == "cleanup_failed" {
+            self.cancel.cancel();
+        }
         self.events
             .push(json!({"tool":name,"arguments":args,"result":result}));
         result
@@ -783,7 +1049,21 @@ impl Runtime {
                 );
                 let fallback =
                     (self.approval_mode == ApprovalMode::Auto).then_some("Reviewer unavailable");
-                self.manual(action, &plan, &digest, fallback)
+                let cancel = self.cancel.clone();
+                let origin = action.origin();
+                let allowed = self.confirm(&plan, &digest, fallback, origin.as_deref(), &cancel);
+                if cancel.is_canceled() {
+                    return Ok(plan.stopped("canceled"));
+                }
+                if !allowed {
+                    return Ok(plan.stopped("denied"));
+                }
+                match action {
+                    PreparedAction::Command(command) if command.broker => {
+                        self.serve_broker_sync(command, &plan, &args)
+                    }
+                    _ => self.commit(action),
+                }
             })
         };
         self.record_result(name, args, result)

@@ -268,6 +268,8 @@ fn unrestricted_proposals_reject_project_programs_and_unknown_names() {
 #[test]
 fn approved_python_alias_uses_the_project_virtual_environment() {
     let (t, mut r) = setup();
+    // The framework launcher uses a same-process posix_spawn in this profile.
+    r.sandbox_mode = cognix::runtime::SandboxMode::ReadOnly;
     let venv = t.path().canonicalize().unwrap().join(".venv");
     fs::create_dir_all(venv.join("bin")).unwrap();
     fs::write(
@@ -347,7 +349,7 @@ fn shared_approval_preserves_previews_and_stopped_result_shapes() {
             let mut r = Runtime::new(t.path(), Box::new(|_, _| true), cancel.clone()).unwrap();
             r.allowed_commands = vec![vec!["/usr/bin/true".into()]];
             let command_preview = format!(
-                "argv = [\"/usr/bin/true\"]\nWorking directory = {:?}\nWrites to the live project and private scratch; no network or .git access. Child processes inherit the sandbox.",
+                "argv = [\"/usr/bin/true\"]\nWorking directory = {:?}\nWrites to the live project and private scratch; no direct network or .git access. Fork/exec children inherit the sandbox and cannot detach. posix_spawn is blocked.",
                 r.root
             );
             let (args, expected_kind, expected_preview) = match tool {

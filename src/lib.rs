@@ -16,13 +16,17 @@ use std::sync::{
 };
 
 #[derive(Clone, Default)]
-pub struct Cancellation(Arc<AtomicBool>);
+pub struct Cancellation(Arc<AtomicBool>, Option<Arc<Self>>);
 impl Cancellation {
+    pub(crate) fn child(&self) -> Self {
+        Self(Arc::default(), Some(Arc::new(self.clone())))
+    }
+
     pub fn cancel(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
     pub fn is_canceled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.load(Ordering::SeqCst) || self.1.as_deref().is_some_and(Self::is_canceled)
     }
     pub async fn wait(&self) {
         while !self.is_canceled() {

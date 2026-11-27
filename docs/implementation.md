@@ -130,7 +130,7 @@ lookups by default. Commands read the project and installed runtimes, with
 private scratch for HOME and temporary files. The environment is rebuilt and
 inherited descriptors above stderr are marked close-on-exec. Both profiles
 protect Git metadata and outside files. `workspace-write` additionally permits
-live workspace writes and subprocesses under the same Seatbelt policy.
+live workspace writes and fork/exec subprocesses under the same Seatbelt policy.
 `read-only` keeps the workspace read-only to commands and disallows descendants.
 Approved patch publication uses its own descriptor-relative boundary in both
 profiles.
@@ -140,8 +140,13 @@ using a fixed system client and Cognix-owned options. Configuration, stdin,
 workspace paths, proxy settings, URL globbing and redirect following are absent
 from this transport. The URL submitted for approval identifies the HTTP origin
 by scheme, host and port. DNS resolution and TLS use the system transport.
-Origin denials apply before any approval. Arbitrary network clients remain
-inside the network-denied Seatbelt profile.
+Origin denials apply before any approval. A command proposed with `http_get:
+true` receives a single private Unix socket path. Its direct network access
+remains blocked. The broker accepts absolute HTTP(S) URLs in GET requests and
+returns the HTTP status and bounded body. Each GET needs its own approval and
+must complete within the original command's deadline. Cognix drops client
+headers and returns no redirect location. Each command can submit up to 16
+requests and receive up to 4 MiB per response.
 
 When approval mode is `auto`, the approval boundary prepares an independent
 local Ollama request with a security instruction and bounded structured
@@ -157,10 +162,12 @@ assistant claims and untrusted tool output.
 `sandbox-exec` is a deprecated macOS facility. An unavailable or failed sandbox
 never triggers an unsandboxed retry. Explicit full access disables command
 isolation and ordinary approval and retains usual OS restrictions. The command
-time/output limit sends a signal to the launched process group. Deliberately
-detached descendants can outlive group cleanup in workspace-write or full
-access. In workspace-write they retain the same filesystem and network
-restrictions. Seatbelt provides no total CPU, memory, disk or process quota.
+time/output limit stops the launched process group. Seatbelt blocks workspace-write
+descendants from creating groups or sessions, including via `posix_spawn`.
+Tools that rely on `posix_spawn` cannot run those operations in workspace-write.
+Cognix holds the group leader's PID until it checks that the kernel's group
+membership has drained. Full-access commands can detach and outlive group
+cleanup. Seatbelt provides no total CPU, memory, disk or process quota.
 
 ## Limits, cancellation and reporting
 
