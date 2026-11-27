@@ -235,8 +235,10 @@ In either profile, exactly `["curl","https://host/path"]` (or the equivalent
 `/usr/bin/curl` invocation) requests one brokered HTTP(S) GET. Cognix shows or
 reviews the URL, host, port and protocol, including any query data sent by the
 request. A configured `deny_network` entry blocks the corresponding origin
-before review. Each additional URL is a new proposal. The broker returns
-redirect responses for inspection and leaves the redirected URL unrequested.
+before review. A refused GET blocks retries of that URL for the session.
+Other URLs, including those on the same origin, receive their own approval
+checks. The broker returns redirect responses for inspection and leaves the
+redirected URL unrequested.
 
 Build and test scripts that fetch files can opt in to the private broker with
 `"http_get": true` alongside the command's `argv`. A running script can request
@@ -258,7 +260,8 @@ to end the session, or `--task 'request'` for one task. Reports record patch pat
 and command exit codes and output. Commands with write access may also change
 files directly, outside the patch ledger. In single-task mode, any failed or
 denied action makes the exit code 1, even if a later action succeeds. This
-includes a brokered GET denial handled by a command that exits with code 0.
+includes brokered GET failures and denials, even when the parent command
+handles them and exits with code 0.
 
 ### Verify a fix
 

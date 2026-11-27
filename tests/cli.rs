@@ -161,6 +161,36 @@ fn denied_broker_request_fails_task_and_preserves_parent_exit_code() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn failed_broker_request_fails_task_and_preserves_parent_exit_code() {
+    let project = tempfile::tempdir().unwrap();
+    // Accept the connection but close it without sending an HTTP response.
+    let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/artifact", endpoint.local_addr().unwrap());
+    let worker = std::thread::spawn(move || {
+        let (connection, _) = endpoint.accept().unwrap();
+        drop(connection);
+    });
+    let script = format!("if {BROKER_CURL}; then exit 2; fi; exit 0");
+    let server = command_task_server(json!(["/bin/bash", "-c", script, "get", url]), true);
+    let out = run(
+        command(project.path(), &server.url).args(["--task", "Get the artifact"]),
+        "y\ny\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"passed\"; executed=true; exit=0"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("Network GET \"{url}\" \"failed\"")),
+        "{stdout}"
+    );
+    worker.join().unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn broker_prompt_stops_when_command_exits_or_times_out() {
     let project = tempfile::tempdir().unwrap();
     let destination = Server::new(|_, _| Reply::json(json!("must stay blocked")));

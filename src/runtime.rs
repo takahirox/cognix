@@ -44,7 +44,7 @@ pub struct Runtime {
     pub reviewer: Option<Reviewer>,
     pub denied_network_origins: Vec<String>,
     human_decisions: Vec<Value>,
-    denied_network_in_session: BTreeSet<String>,
+    denied_gets: BTreeSet<String>,
     auto_denied: bool,
     pub cancel: Cancellation,
     /// Nonempty lists restrict proposals to exact argv matches.
@@ -110,9 +110,9 @@ enum PreparedAction {
 }
 
 impl PreparedAction {
-    fn origin(&self) -> Option<String> {
+    fn fetch(&self) -> Option<&Fetch> {
         match self {
-            Self::Command(command) => command.fetch.as_ref().map(Fetch::origin),
+            Self::Command(command) => command.fetch.as_ref(),
             Self::Patch(_) => None,
         }
     }
@@ -247,7 +247,7 @@ impl Runtime {
             reviewer: None,
             denied_network_origins: vec![],
             human_decisions: vec![],
-            denied_network_in_session: BTreeSet::new(),
+            denied_gets: BTreeSet::new(),
             auto_denied: false,
             cancel,
             allowed_commands: vec![],
@@ -615,20 +615,23 @@ impl Runtime {
             prepared.enable_broker()?;
         }
         if let Some(fetch) = &prepared.fetch {
-            self.check_network_origin(&fetch.origin())?;
+            self.check_network_request(fetch)?;
         }
         let plan = prepared.plan();
         Ok((PreparedAction::Command(prepared), plan))
     }
 
-    fn check_network_origin(&self, origin: &str) -> Result<(), String> {
+    fn check_network_request(&self, fetch: &Fetch) -> Result<(), String> {
+        let origin = fetch.origin();
         if self
             .denied_network_origins
             .iter()
-            .any(|denied| denied == origin)
-            || self.denied_network_in_session.contains(origin)
+            .any(|denied| denied == &origin)
         {
             return Err(format!("Network destination {origin} is explicitly denied"));
+        }
+        if self.denied_gets.contains(fetch.url()) {
+            return Err("This HTTP(S) GET was previously refused in this session".into());
         }
         Ok(())
     }
@@ -688,7 +691,7 @@ impl Runtime {
         parent: &ActionPlan,
     ) -> Result<(PreparedCommand, ActionPlan), String> {
         let scope = fetch.scope();
-        self.check_network_origin(&fetch.origin())?;
+        self.check_network_request(fetch)?;
         let prepared = PreparedCommand::new(
             &self.root,
             vec!["curl".into(), fetch.url().into()],
@@ -743,7 +746,7 @@ impl Runtime {
         &self,
         job: &mut BrokerJob,
         parent: &ActionPlan,
-    ) -> Option<(Request, PreparedCommand, ActionPlan, String)> {
+    ) -> Option<(Request, PreparedCommand, ActionPlan)> {
         let (request, fetch) = job.broker.next()?;
         if self.auto_denied {
             let error = "An automatic review denied an action in this task";
@@ -753,7 +756,7 @@ impl Runtime {
             return None;
         }
         match self.prepare_broker_get(&fetch, parent) {
-            Ok((prepared, plan)) => Some((request, prepared, plan, fetch.origin())),
+            Ok((prepared, plan)) => Some((request, prepared, plan)),
             Err(error) => {
                 job.requests
                     .push(json!({"status":"not_run","scope":fetch.scope(),"error":error}));
@@ -849,7 +852,7 @@ impl Runtime {
         plan: &ActionPlan,
         digest: &str,
         fallback: Option<&str>,
-        origin: Option<&str>,
+        fetch: Option<&Fetch>,
         cancel: &Cancellation,
     ) -> bool {
         if cancel.is_canceled() {
@@ -871,14 +874,20 @@ impl Runtime {
         }
         self.human_decisions.push(json!({"decision":if allowed { "allow" } else { "not_approved" },
             "action_sha256":digest,"scope_excerpt":plan.preview.chars().take(512).collect::<String>(),
-            "network_origin":origin}));
+            "network_origin":fetch.map(Fetch::origin)}));
         if !allowed {
-            if let Some(origin) = origin {
-                self.denied_network_in_session.insert(origin.to_owned());
-            }
-            self.auto_denied = self.approval_mode == ApprovalMode::Auto;
+            self.record_refusal(fetch);
         }
         allowed
+    }
+
+    fn record_refusal(&mut self, fetch: Option<&Fetch>) {
+        // Both GET entry points use the canonical URL that the transport sends.
+        if let Some(fetch) = fetch {
+            self.denied_gets.insert(fetch.url().to_owned());
+        } else {
+            self.auto_denied = self.approval_mode == ApprovalMode::Auto;
+        }
     }
 
     async fn authorize(
@@ -886,7 +895,7 @@ impl Runtime {
         plan: &ActionPlan,
         evidence: Value,
         history: &[Value],
-        origin: Option<&str>,
+        fetch: Option<&Fetch>,
         cancel: &Cancellation,
     ) -> (bool, Value) {
         let digest = hash(evidence.to_string().as_bytes());
@@ -905,14 +914,11 @@ impl Runtime {
                     let allowed = match verdict.decision {
                         Decision::Allow => true,
                         Decision::Deny => {
-                            if let Some(origin) = origin {
-                                self.denied_network_in_session.insert(origin.to_owned());
-                            }
-                            self.auto_denied = true;
+                            self.record_refusal(fetch);
                             false
                         }
                         Decision::AskUser => {
-                            self.confirm(plan, &digest, Some(&verdict.reason), origin, cancel)
+                            self.confirm(plan, &digest, Some(&verdict.reason), fetch, cancel)
                         }
                     };
                     (allowed, json!(verdict))
@@ -920,7 +926,7 @@ impl Runtime {
                 Err(error) => {
                     let reason = error.to_string();
                     (
-                        self.confirm(plan, &digest, Some(&reason), origin, cancel),
+                        self.confirm(plan, &digest, Some(&reason), fetch, cancel),
                         json!({"decision":"ask_user","reason":reason}),
                     )
                 }
@@ -939,14 +945,14 @@ impl Runtime {
     ) -> Result<Value, String> {
         let mut job = self.start_broker(command)?;
         while job.active() {
-            if let Some((request, fetch, plan, origin)) = self.next_broker_get(&mut job, parent) {
+            if let Some((request, fetch, plan)) = self.next_broker_get(&mut job, parent) {
                 let evidence = self.action_evidence("run_command", args, &plan);
                 let (allowed, audit) = self
                     .authorize(
                         &plan,
                         evidence,
                         history,
-                        Some(&origin),
+                        fetch.fetch.as_ref(),
                         &job.network_lifetime,
                     )
                     .await;
@@ -968,7 +974,7 @@ impl Runtime {
     ) -> Result<Value, String> {
         let mut job = self.start_broker(command)?;
         while job.active() {
-            if let Some((request, fetch, plan, origin)) = self.next_broker_get(&mut job, parent) {
+            if let Some((request, fetch, plan)) = self.next_broker_get(&mut job, parent) {
                 let evidence = self.action_evidence("run_command", args, &plan);
                 let digest = hash(evidence.to_string().as_bytes());
                 let fallback =
@@ -977,7 +983,7 @@ impl Runtime {
                     &plan,
                     &digest,
                     fallback,
-                    Some(&origin),
+                    fetch.fetch.as_ref(),
                     &job.network_lifetime,
                 );
                 let event = json!({"scope":plan.evidence["requested_network"]});
@@ -1014,10 +1020,9 @@ impl Runtime {
             return self.record_result(name, args, result);
         }
         let cancel = self.cancel.clone();
-        let origin = action.origin();
         let evidence = self.action_evidence(name, &args, &plan);
         let (allowed, audit) = self
-            .authorize(&plan, evidence, history, origin.as_deref(), &cancel)
+            .authorize(&plan, evidence, history, action.fetch(), &cancel)
             .await;
         let result = if cancel.is_canceled() {
             Ok(plan.stopped("canceled"))
@@ -1066,8 +1071,7 @@ impl Runtime {
                 let fallback =
                     (self.approval_mode == ApprovalMode::Auto).then_some("Reviewer unavailable");
                 let cancel = self.cancel.clone();
-                let origin = action.origin();
-                let allowed = self.confirm(&plan, &digest, fallback, origin.as_deref(), &cancel);
+                let allowed = self.confirm(&plan, &digest, fallback, action.fetch(), &cancel);
                 if cancel.is_canceled() {
                     return Ok(plan.stopped("canceled"));
                 }
