@@ -111,12 +111,14 @@ impl Drop for OwnedServer {
 enum Probe {
     Ready(String),
     Refused,
+    TimedOut,
     Invalid,
 }
 
 async fn probe(client: &Client, endpoint: &str) -> Probe {
     let mut response = match client.get(format!("{endpoint}/api/version")).send().await {
         Ok(response) => response,
+        Err(error) if error.is_timeout() => return Probe::TimedOut,
         Err(error) => {
             if error.is_connect() {
                 let mut source = error.source();
@@ -143,6 +145,7 @@ async fn probe(client: &Client, endpoint: &str) -> Probe {
                 body.extend_from_slice(&chunk);
             }
             Ok(None) => break,
+            Err(error) if error.is_timeout() => return Probe::TimedOut,
             _ => return Probe::Invalid,
         }
     }
@@ -195,7 +198,7 @@ async fn ensure_ready_with(
         _ = cancel.wait() => return Err(Error::Canceled),
         result = probe(&client, endpoint) => match result {
             Probe::Ready(version) => return Ok((version, None)),
-            Probe::Invalid => return Err(invalid()),
+            Probe::Invalid | Probe::TimedOut => return Err(invalid()),
             Probe::Refused if endpoint != default_endpoint => return Err(Error::Provider(format!(
                 "Ollama unavailable at {endpoint}. Start the custom server manually. Automatic startup is available at {default_endpoint}"
             ))),
@@ -217,7 +220,7 @@ async fn ensure_ready_with(
                     return Ok(version);
                 }
                 Probe::Invalid => return Err(invalid()),
-                Probe::Refused => sleep(POLL_INTERVAL).await,
+                Probe::Refused | Probe::TimedOut => sleep(POLL_INTERVAL).await,
             }
         }
     };

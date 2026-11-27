@@ -24,10 +24,18 @@ fn serve_fixture() {
         eprintln!("fixture failed to start");
         std::process::exit(9);
     }
-    let _server = if mode == "ready" {
-        // Leave the port refused until a readiness retry is necessary.
-        std::thread::sleep(Duration::from_millis(120));
+    let _server = if matches!(mode.as_str(), "ready" | "slow") {
+        if mode == "ready" {
+            // Leave the port refused until a readiness retry is necessary.
+            std::thread::sleep(Duration::from_millis(120));
+        }
         let listener = TcpListener::bind(std::env::var("OLLAMA_HOST").unwrap()).unwrap();
+        if mode == "slow" {
+            // Hold the first connection open until its request times out.
+            let (connection, _) = listener.accept().unwrap();
+            std::thread::sleep(PROBE_TIMEOUT + Duration::from_millis(200));
+            drop(connection);
+        }
         Some(Server::listen(listener, ready))
     } else {
         None
@@ -114,6 +122,26 @@ async fn starts_on_refusal_waits_for_readiness_and_stops_only_owned_group() {
     drop(owner);
     fixture.assert_stopped();
     assert!(matches!(probe(&client, &endpoint).await, Probe::Refused));
+}
+
+#[tokio::test]
+async fn retries_a_timed_out_probe_until_owned_server_responds() {
+    let fixture = Fixture::new();
+    let endpoint = unused_endpoint();
+    let (version, owner) = ensure_ready_with(
+        &endpoint,
+        &endpoint,
+        Duration::from_secs(4),
+        &Cancellation::default(),
+        fixture.command("slow"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(version, "fixture-1");
+    assert!(owner.is_some());
+
+    drop(owner);
+    fixture.assert_stopped();
 }
 
 #[tokio::test]
