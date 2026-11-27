@@ -33,10 +33,12 @@ pub(crate) mod patch;
 pub use crate::action::{Approval, ApprovalMode, SandboxMode};
 #[cfg(test)]
 type CommitHook = Box<dyn FnMut(&str)>;
+type CancellableApproval = Box<dyn FnMut(&str, &str, &Cancellation) -> bool>;
 pub struct Runtime {
     pub root: PathBuf,
     root_fd: File,
     pub approve: Approval,
+    cancellable_approval: Option<CancellableApproval>,
     pub approval_mode: ApprovalMode,
     pub sandbox_mode: SandboxMode,
     pub reviewer: Option<Reviewer>,
@@ -239,6 +241,7 @@ impl Runtime {
             root,
             root_fd,
             approve,
+            cancellable_approval: None,
             approval_mode: ApprovalMode::default(),
             sandbox_mode: SandboxMode::default(),
             reviewer: None,
@@ -258,6 +261,13 @@ impl Runtime {
             hook: None,
         })
     }
+
+    /// Use a confirmation callback that can stop waiting when its action ends.
+    pub fn with_cancellable_approval(mut self, approve: CancellableApproval) -> Self {
+        self.cancellable_approval = Some(approve);
+        self
+    }
+
     fn parts(path: &str) -> Result<Vec<&str>, String> {
         if path.is_empty() || path.contains('\0') || Path::new(path).is_absolute() {
             return Err("Use a relative project path".into());
@@ -736,7 +746,10 @@ impl Runtime {
     ) -> Option<(Request, PreparedCommand, ActionPlan, String)> {
         let (request, fetch) = job.broker.next()?;
         if self.auto_denied {
-            request.respond(403, b"An automatic review denied an action in this task");
+            let error = "An automatic review denied an action in this task";
+            job.requests
+                .push(json!({"status":"denied","scope":fetch.scope(),"error":error}));
+            request.respond(403, error.as_bytes());
             return None;
         }
         match self.prepare_broker_get(&fetch, parent) {
@@ -849,7 +862,10 @@ impl Runtime {
             ),
             None => plan.preview.clone(),
         };
-        let allowed = (self.approve)(plan.kind, &preview);
+        let allowed = match &mut self.cancellable_approval {
+            Some(approve) => approve(plan.kind, &preview, cancel),
+            None => (self.approve)(plan.kind, &preview),
+        };
         if cancel.is_canceled() {
             return false;
         }

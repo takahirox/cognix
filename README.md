@@ -220,12 +220,13 @@ In the default `workspace-write` profile, commands and their children can
 write directly to the live project and private scratch space. The sandbox
 blocks external file data apart from installed runtimes, protects `.git`, and
 blocks direct network access. Workspace-write supports children created with
-fork and exec. It blocks `posix_spawn` and process group changes so descendants
-stay within cancellation scope. Tools that require `posix_spawn`, including
-Apple's Make and Homebrew's Python launcher, are incompatible with this
-profile. A shell build script or direct interpreter executable can run
-within the contained group. `read-only` permits command writes only to
-scratch and prevents child processes. Approved `apply_patch` calls can write
+fork and exec. A shell build script or a system Ruby build and test task such as
+`ruby -S rake` can run within the contained group. The profile blocks
+`posix_spawn` and process group changes so descendants stay within cancellation
+scope. Tools that require `posix_spawn`, including Homebrew Cargo, Apple's Make
+and Homebrew's Python launcher, are incompatible with this profile.
+`read-only` permits command writes only to scratch and prevents child
+processes. Approved `apply_patch` calls can write
 in either profile. Check
 [the sandbox details](docs/implementation.md#verification-policy-and-isolation)
 for the readable runtime paths and process limits.
@@ -247,6 +248,7 @@ an exact URL through the Unix socket identified by `COGNIX_HTTP_SOCKET`.
 ```
 
 Each GET has its own confirmation in manual mode or review in auto mode.
+Pending confirmation ends when the parent command exits or times out.
 The configured origin denials apply in both modes. The private connection
 returns the upstream status and body (up to 4 MiB per request). Outbound
 headers, uploads, tunnels, redirects and direct network access remain blocked.
@@ -255,7 +257,8 @@ Ctrl-C cancels work and exits with code 130. Use `/exit` or EOF at the task prom
 to end the session, or `--task 'request'` for one task. Reports record patch paths
 and command exit codes and output. Commands with write access may also change
 files directly, outside the patch ledger. In single-task mode, any failed or
-denied action makes the exit code 1, even if a later action succeeds.
+denied action makes the exit code 1, even if a later action succeeds. This
+includes a brokered GET denial handled by a command that exits with code 0.
 
 ### Verify a fix
 

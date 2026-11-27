@@ -51,6 +51,8 @@ pub const RUNTIME_DIRS: &[&str] = &[
     "/opt/homebrew/bin",
 ];
 const COMMAND_PATH: &str = "/usr/bin:/bin:/opt/homebrew/bin";
+// macOS system Ruby loads Rake, Minitest and other runtime gems from here.
+const SYSTEM_RUBY_GEMS: &str = "/Library/Ruby/Gems/2.6.0";
 
 pub fn parse_command(text: &str) -> Result<Vec<String>, String> {
     let v: Value =
@@ -285,11 +287,14 @@ fn wrap_sandbox(
     for path in [root, scratch] {
         path.to_str().ok_or("Sandbox paths must be UTF-8")?;
     }
+    let workspace_runtime = (mode == SandboxMode::WorkspaceWrite).then_some(SYSTEM_RUBY_GEMS);
     let readable: Vec<PathBuf> = std::iter::once(root.to_owned())
         .chain(std::iter::once(scratch.to_owned()))
         .chain(
             RUNTIME_DIRS
                 .iter()
+                .copied()
+                .chain(workspace_runtime)
                 .filter_map(|p| Path::new(p).canonicalize().ok())
                 .filter(|p| p.to_str().is_some()),
         )
@@ -310,15 +315,20 @@ fn wrap_sandbox(
         ),
     };
     let broker = socket.map_or_else(String::new, |path| {
-        // System curl loads its TLS config even for HTTP. Present it as absent
-        // without granting reads outside the workspace.
         format!(
-            "(allow network-outbound (remote unix-socket (path {}))) (deny file-read-data (literal \"/private/etc/ssl/openssl.cnf\") (with errno ENOENT))",
+            "(allow network-outbound (remote unix-socket (path {})))",
             quote(path)
         )
     });
+    // LibreSSL treats an inaccessible optional config as fatal. Make it appear
+    // absent for workspace builds and the broker's sandboxed curl client.
+    let tls_config = if mode == SandboxMode::WorkspaceWrite || socket.is_some() {
+        r#"(deny file-read-data (literal "/private/etc/ssl/openssl.cnf") (with errno ENOENT))"#
+    } else {
+        ""
+    };
     let profile = format!(
-        r#"(version 1) (deny default) (allow process-exec) (allow sysctl-read) (allow file-read-metadata) (allow file-read* {reads} (literal "/") (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random") (subpath "/private/var/db/dyld")) (allow file-write* (subpath {}) (literal "/dev/null")) {workspace} {broker} (deny file-read* file-write* (regex #"/[.][gG][iI][tT](/|$)"))"#,
+        r#"(version 1) (deny default) (allow process-exec) (allow sysctl-read) (allow file-read-metadata) (allow file-read* {reads} (literal "/") (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random") (subpath "/private/var/db/dyld")) (allow file-write* (subpath {}) (literal "/dev/null")) {workspace} {broker} {tls_config} (deny file-read* file-write* (regex #"/[.][gG][iI][tT](/|$)"))"#,
         quote(scratch)
     );
     let mut out = vec!["/usr/bin/sandbox-exec".into(), "-p".into(), profile];
@@ -747,7 +757,15 @@ fn capture(
         #[cfg(not(target_os = "macos"))]
         let exited = child.try_wait().map(|status| status.is_some());
         match exited {
-            Ok(true) if eof => break,
+            Ok(true) => {
+                // A descendant can hold the output pipe after the leader exits.
+                if let Some((_, network_lifetime)) = broker {
+                    network_lifetime.cancel();
+                }
+                if eof {
+                    break;
+                }
+            }
             Ok(_) => {}
             Err(e) => {
                 io_error = Some(e.to_string());
