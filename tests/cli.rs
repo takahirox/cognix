@@ -135,14 +135,39 @@ end
 #[test]
 fn default_workspace_profile_builds_with_make_and_cargo() {
     let project = tempfile::tempdir().unwrap();
-    fs::create_dir(project.path().join("src")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    // Cargo would reject this inherited configuration if it reached the build.
+    fs::write(outside.path().join("config.toml"), "invalid Cargo config").unwrap();
+    for path in ["src", ".cargo", "vendor/sandbox-dependency/src"] {
+        fs::create_dir_all(project.path().join(path)).unwrap();
+    }
     for (path, content) in [
         ("Makefile", "all:\n\t/bin/echo built > make-artifact\n"),
         (
             "Cargo.toml",
-            "[package]\nname = 'sandbox-fixture'\nversion = '0.1.0'\nedition = '2021'\n",
+            "[package]\nname = 'sandbox-fixture'\nversion = '0.1.0'\nedition = '2021'\n\
+             [dependencies]\nsandbox-dependency = '=0.1.0'\n",
         ),
-        ("src/main.rs", "fn main() {}\n"),
+        (
+            "src/main.rs",
+            "fn main() { println!(\"{}\", sandbox_dependency::message()); }\n",
+        ),
+        (
+            ".cargo/config.toml",
+            "[source.crates-io]\nreplace-with = 'vendored'\n[source.vendored]\ndirectory = 'vendor'\n",
+        ),
+        (
+            "vendor/sandbox-dependency/Cargo.toml",
+            "[package]\nname = 'sandbox-dependency'\nversion = '0.1.0'\nedition = '2021'\n",
+        ),
+        (
+            "vendor/sandbox-dependency/src/lib.rs",
+            "pub fn message() -> &'static str { \"built with a vendored dependency\" }\n",
+        ),
+        (
+            "vendor/sandbox-dependency/.cargo-checksum.json",
+            r#"{"package":null,"files":{}}"#,
+        ),
     ] {
         fs::write(project.path().join(path), content).unwrap();
     }
@@ -155,7 +180,9 @@ fn default_workspace_profile_builds_with_make_and_cargo() {
     ] {
         let server = command_task_server(argv, false);
         let out = run(
-            command(project.path(), &server.url).args(["--task", "Build the fixture"]),
+            command(project.path(), &server.url)
+                .env("CARGO_HOME", outside.path())
+                .args(["--task", "Build the fixture"]),
             "y\n",
         );
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -166,6 +193,11 @@ fn default_workspace_profile_builds_with_make_and_cargo() {
         );
         assert!(project.path().join(artifact).is_file(), "{stdout}");
     }
+    let artifact = Command::new(project.path().join("target/debug/sandbox-fixture"))
+        .output()
+        .unwrap();
+    assert!(artifact.status.success());
+    assert_eq!(artifact.stdout, b"built with a vendored dependency\n");
 }
 
 #[cfg(target_os = "macos")]

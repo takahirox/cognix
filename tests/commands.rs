@@ -320,19 +320,17 @@ writer = '''
 import os, sys, time
 from pathlib import Path
 
-# Reparent before signaling readiness, and leave no inherited output pipe.
+# Reparent before signaling readiness, keeping stdout and stderr open.
 if os.fork() != 0:
     os._exit(0)
 name = sys.argv[1]
 while os.getppid() != 1:
     time.sleep(0.005)
 assert os.getpgrp() != int(sys.argv[2])
-os.close(1)
-os.close(2)
 with open(name + '.writes', 'wb', buffering=0) as output:
     output.write(b'x')
     Path(name).touch()
-    for _ in range(150):
+    for _ in range(300):
         time.sleep(0.01)
         output.write(b'x')
 '''
@@ -345,17 +343,22 @@ while not all(Path(name).is_file() for name in ('session', 'group')):
     time.sleep(0.005)
 if sys.argv[1] == 'wait':
     time.sleep(5)
+print('parent stdout', flush=True)
+print('x' * 8192, file=sys.stderr, flush=True)
+sys.exit(23)
 "#;
-    for (action, status, exit_code) in [("exit", "passed", 0), ("wait", "canceled", -libc::SIGKILL)]
+    for (action, status, exit_code) in
+        [("exit", "failed", 23), ("wait", "canceled", -libc::SIGKILL)]
     {
         let project = tempfile::tempdir().unwrap();
         let cancel = Cancellation::default();
         let mut runtime =
             Runtime::new(project.path(), Box::new(|_, _| true), cancel.clone()).unwrap();
+        runtime.timeout = Duration::from_secs(2);
         let root = project.path().to_owned();
         let timer = (action == "wait").then(|| {
             std::thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(3);
+                let deadline = Instant::now() + Duration::from_secs(2);
                 let started = || {
                     ["session", "group"]
                         .iter()
@@ -381,11 +384,18 @@ if sys.argv[1] == 'wait':
         assert_eq!(result["status"], status, "{result}");
         assert_eq!(result["executed"], true);
         assert_eq!(result["exit_code"], exit_code);
+        if action == "exit" {
+            assert_eq!(
+                result["output"],
+                format!("parent stdout\n{}\n", "x".repeat(8192))
+            );
+        }
         let lengths = || {
             ["session.writes", "group.writes"]
                 .map(|name| fs::metadata(project.path().join(name)).unwrap().len())
         };
         let at_return = lengths();
+        assert!(at_return.iter().all(|&len| len < 301));
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(lengths(), at_return);
     }

@@ -231,6 +231,10 @@ in either profile. Check
 [the sandbox details](docs/implementation.md#verification-policy-and-isolation)
 for the readable runtime paths and process limits.
 
+For dependency-backed offline Cargo builds, declare a project-local source
+such as a vendored directory in `.cargo/config.toml` and run
+`cargo build --offline`. The command uses a private home directory.
+
 In either profile, exactly `["curl","https://host/path"]` (or the equivalent
 `/usr/bin/curl` invocation) requests one brokered HTTP(S) GET. Cognix shows or
 reviews the URL, host, port and protocol, including any query data sent by the
@@ -252,8 +256,10 @@ an exact URL through the Unix socket identified by `COGNIX_HTTP_SOCKET`.
 Each GET has its own confirmation in manual mode or review in auto mode.
 Pending confirmation ends when the parent command exits or times out.
 The configured origin denials apply in both modes. The private connection
-returns the upstream status and body (up to 4 MiB per request). Outbound
-headers, uploads, tunnels, redirects and direct network access remain blocked.
+returns the upstream status, body (up to 4 MiB per request) and a validated
+`Location` header when present on a redirect. A subsequent GET to that URL
+requires its own policy and approval check. Project-supplied headers, uploads,
+tunnels and direct network access remain blocked.
 
 Ctrl-C cancels work and exits with code 130. Use `/exit` or EOF at the task prompt
 to end the session, or `--task 'request'` for one task. Reports record patch paths

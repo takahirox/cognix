@@ -146,12 +146,15 @@ by scheme, host and port. DNS resolution and TLS use the system transport.
 Origin denials apply before any approval. A command proposed with `http_get:
 true` receives a single private Unix socket path. Its direct network access
 remains blocked. The broker accepts absolute HTTP(S) URLs in GET requests and
-returns the HTTP status and bounded body. Each GET needs its own approval and
+returns the HTTP status, bounded body and any single valid redirect `Location`,
+resolved against the approved request URL. Each GET needs its own approval and
 must complete while the parent command is active. Cognix releases any pending
 confirmation when that command exits or times out. A denied GET makes `--task`
 exit 1 while the report preserves the parent command's exit code. Cognix drops
-client headers and returns no redirect location. Each command can submit up to 16
-requests and receive up to 4 MiB per response.
+client headers and leaves the redirect target unrequested until a separate GET
+passes the normal policy and approval checks. Each command can submit up to 16
+requests and receive up to 4 MiB of body data per response. The broker caps
+upstream headers and trailers at 64 KiB combined.
 
 When approval mode is `auto`, the approval boundary prepares an independent
 local Ollama request with a security instruction and bounded structured
@@ -169,7 +172,9 @@ never triggers an unsandboxed retry. Explicit full access disables command
 isolation and ordinary approval and retains usual OS restrictions. Workspace-write
 uses a temporary launchd job with a dedicated resource coalition. Cognix verifies
 the coalition before launch and checks that its kernel task count reaches zero
-during cleanup. Children created by `posix_spawn` inherit the coalition, even
+during cleanup. Cleanup starts when the command exits, including when children
+still hold the output pipe open. Cognix then drains the buffered output.
+Children created by `posix_spawn` inherit the coalition, even
 if they change groups or sessions. A containment setup failure stops the command
 before execution. Full-access commands use process-group cleanup and can detach.
 Seatbelt provides no total CPU, memory, disk or process quota.

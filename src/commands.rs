@@ -2,7 +2,7 @@
 use crate::{
     Cancellation,
     action::{ActionPlan, SandboxMode, unexecuted},
-    network::{CURL, Fetch, MAX_BROKER_BODY},
+    network::{BrokerResponse, CURL, Fetch, MAX_BROKER_OUTPUT},
     schema,
 };
 use serde_json::{Value, json};
@@ -586,7 +586,7 @@ pub(crate) fn run_command(
     if prepared.broker != broker.is_some() {
         return Err("Command broker does not match the prepared permissions".into());
     }
-    let (mut result, output) = capture(prepared, cancel, timeout, limit, broker, false)?;
+    let (mut result, output) = capture(&prepared, cancel, timeout, limit, broker, false)?;
     if result["executed"] == true {
         // Lossy decoding can expand invalid bytes; keep even decoded text bounded.
         let mut decoded = String::from_utf8_lossy(&output).into_owned();
@@ -606,23 +606,17 @@ pub(crate) fn broker_get(
     prepared: PreparedCommand,
     cancel: &Cancellation,
     timeout: Duration,
-) -> Result<(u16, Vec<u8>), String> {
-    // Allow room for the four-byte status trailer from curl.
-    let (result, mut bytes) = capture(prepared, cancel, timeout, MAX_BROKER_BODY + 4, None, true)?;
-    if result["status"] != "passed" || bytes.len() < 4 {
+) -> Result<BrokerResponse, String> {
+    let fetch = prepared.fetch.as_ref().ok_or("Missing approved GET")?;
+    let (result, bytes) = capture(&prepared, cancel, timeout, MAX_BROKER_OUTPUT, None, true)?;
+    if result["status"] != "passed" {
         return Err("Upstream GET failed or exceeded its action limits".into());
     }
-    let footer = bytes.split_off(bytes.len() - 4);
-    let code = std::str::from_utf8(&footer)
-        .ok()
-        .and_then(|text| text.strip_prefix('\n')?.parse::<u16>().ok())
-        .filter(|code| (200..600).contains(code))
-        .ok_or("Invalid upstream status")?;
-    Ok((code, bytes))
+    fetch.broker_response(bytes)
 }
 
 fn capture(
-    prepared: PreparedCommand,
+    prepared: &PreparedCommand,
     cancel: &Cancellation,
     timeout: Duration,
     limit: usize,
@@ -769,6 +763,8 @@ fn capture(
     let mut state = None;
     let mut io_error = None;
     let mut eof = false;
+    #[cfg(target_os = "macos")]
+    let mut drain_after_cleanup = false;
     if nonblocking < 0 {
         io_error = Some(std::io::Error::last_os_error().to_string());
     }
@@ -807,6 +803,11 @@ fn capture(
                 // A descendant can hold the output pipe after the leader exits.
                 if let Some((_, network_lifetime)) = broker {
                     network_lifetime.cancel();
+                }
+                #[cfg(target_os = "macos")]
+                if matches!(child, RunningCommand::Workspace(_)) {
+                    drain_after_cleanup = !eof;
+                    break;
                 }
                 if eof {
                     break;
@@ -849,6 +850,25 @@ fn capture(
             (job.exit_status(), cleanup)
         }
     };
+    // With the workspace coalition stopped, only buffered bytes remain. Drain
+    // them without waiting for EOF, and still apply the combined output cap.
+    #[cfg(target_os = "macos")]
+    if drain_after_cleanup && cleanup_error.is_none() {
+        let remaining = limit - output.len();
+        match reader
+            .take(remaining.saturating_add(1) as u64)
+            .read_to_end(&mut output)
+        {
+            Err(error) if error.kind() != std::io::ErrorKind::WouldBlock => {
+                io_error = Some(error.to_string());
+            }
+            _ => {}
+        }
+        if output.len() > limit {
+            output.truncate(limit);
+            state = Some("limit_reached");
+        }
+    }
     let exit = match exit {
         Ok(exit) => exit,
         Err(e) => {

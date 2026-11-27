@@ -373,3 +373,28 @@ the release build passed on this revision.
 
 The `qwen3.8:27b` trial on Ollama 0.34.4 matched all seven expected decisions,
 with zero false approvals, zero false denials and 6.357–9.912 s review latency.
+
+### Descendant output, offline Cargo, and broker redirects
+
+The focused revision was verified on Apple Silicon macOS 27.2.1 (26B131)
+with Homebrew Cargo 1.94.0. The cleanup regression reproduced a timeout on
+the reviewed head even though the parent had exited with code 23. After the
+fix, Cognix preserved code 23 and both output streams while stopping detached
+descendants that still held the output pipe. The cancellation case also
+stopped the descendants before returning.
+
+The default workspace-write CLI built the synthetic Cargo fixture with
+`cargo build --offline`, resolving its dependency through the vendored source
+declared in `.cargo/config.toml`. The fixture's inherited `CARGO_HOME` pointed
+at an outside directory with invalid configuration. The built program printed
+the dependency's message, and the default sandbox denied direct network access.
+
+The native broker fixture returned a 302 with the validated `Location` and
+the chunked response body. The redirect target received exactly one request,
+after its separate approval. Informational and trailer locations and unrelated
+headers stayed out of the broker response. The parser tests also covered
+relative, unsupported, and ambiguous locations.
+
+`cargo test --locked --offline --all-targets` passed 127 tests. The separately
+invoked real Ollama trial was not rerun in this revision. Formatting, Clippy
+with warnings denied, the documentation checker, and `git diff --check` passed.
