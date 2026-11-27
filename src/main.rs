@@ -1,3 +1,6 @@
+mod dev_model;
+mod ollama_server;
+
 use cognix::cli::Args;
 use cognix::{
     Cancellation,
@@ -8,7 +11,14 @@ use cognix::{
     runtime::{ApprovalMode, Runtime},
     terminal::{input, render, show, submitted_input},
 };
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicI32, Ordering},
+    },
+    time::Duration,
+};
+use tokio::signal::unix::{SignalKind, signal};
 
 #[tokio::main]
 async fn main() {
@@ -17,19 +27,55 @@ async fn main() {
 }
 async fn run(args: Args) -> i32 {
     let cancel = Cancellation::default();
-    let signal = cancel.clone();
-    if let Err(e) = ctrlc::set_handler(move || signal.cancel()) {
-        show(&format!("Cannot install cancellation handler: {e}"));
+    let status = Arc::new(AtomicI32::new(0));
+    if let Err(e) = watch_signals(cancel.clone(), status.clone()) {
+        show(&format!("Cannot install cancellation handlers: {e}"));
         return 1;
     }
-    let result = session(args, &cancel).await;
-    match result {
+    let code = match session(args, &cancel).await {
         Ok(code) => code,
         Err(e) => {
             show(&format!("Error: {e}"));
-            if cancel.is_canceled() { 130 } else { 1 }
+            1
         }
+    };
+    match status.load(Ordering::SeqCst) {
+        0 => code,
+        signal_status => signal_status,
     }
+}
+
+fn watch_signals(cancel: Cancellation, status: Arc<AtomicI32>) -> std::io::Result<()> {
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        let received = tokio::select! {
+            _ = interrupt.recv() => libc::SIGINT,
+            _ = terminate.recv() => libc::SIGTERM,
+            _ = hangup.recv() => libc::SIGHUP,
+        };
+        status.store(128 + received, Ordering::SeqCst);
+        cancel.cancel();
+    });
+    Ok(())
+}
+
+fn startup_timeout(dev: bool) -> Result<Duration, String> {
+    let override_value = dev
+        .then(|| std::env::var_os("COGNIX_DEV_STARTUP_TIMEOUT"))
+        .flatten()
+        .filter(|value| !value.is_empty());
+    if let Some(value) = override_value {
+        return value
+            .to_str()
+            .filter(|value| !value.starts_with('0') && value.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| (1..=300).contains(seconds))
+            .map(Duration::from_secs)
+            .ok_or_else(|| "COGNIX_DEV_STARTUP_TIMEOUT must be 1–300 seconds".into());
+    }
+    Ok(Duration::from_secs(30))
 }
 
 async fn session(args: Args, cancel: &Cancellation) -> Result<i32, String> {
@@ -61,19 +107,45 @@ async fn session(args: Args, cancel: &Cancellation) -> Result<i32, String> {
     }
     runtime.timeout = Duration::from_secs(args.command_timeout as u64);
     runtime.output_limit = args.output_limit;
-    let mut provider = Ollama::new(
-        &args.model,
-        &args.ollama_url,
-        Duration::from_secs(args.model_timeout as u64),
-        args.num_ctx,
+    let model_timeout = Duration::from_secs(args.model_timeout as u64);
+    let initial_version_timeout = if args.dev_provision_model {
+        Duration::from_secs(1)
+    } else {
+        model_timeout
+    };
+    let mut provider = Ollama::new(&args.model, &args.ollama_url, model_timeout, args.num_ctx)
+        .map_err(|e| e.to_string())?;
+    let (version, owned_server) = ollama_server::ensure_ready(
+        provider.endpoint(),
+        initial_version_timeout,
+        startup_timeout(args.dev_provision_model)?,
+        cancel,
     )
+    .await
     .map_err(|e| e.to_string())?;
+    provider.version = version;
+    if args.dev_provision_model {
+        if owned_server.is_none() {
+            dev_model::report(&format!("Reusing Ollama at {}", provider.endpoint()));
+        }
+        let result = tokio::select! { biased;
+            _ = cancel.wait() => Err("Model provisioning canceled. Ollama-managed partial data was left intact".into()),
+            result = dev_model::provision(&args, provider.endpoint(), cancel) => result,
+        };
+        if let Err(error) = result {
+            dev_model::report(&error);
+            return Ok(1);
+        }
+    }
     show(&format!(
         "Project: {}\nChecking local model {} and tool calling...",
         runtime.root.display(),
         args.model
     ));
-    provider.validate(cancel).await.map_err(|e| e.to_string())?;
+    provider
+        .validate_model_and_tools(cancel)
+        .await
+        .map_err(|e| e.to_string())?;
     show(&format!(
         "Ollama {}; model {}. Ctrl-C cancels. /exit quits.",
         provider.version, args.model
@@ -83,7 +155,7 @@ async fn session(args: Args, cancel: &Cancellation) -> Result<i32, String> {
         let review_provider = Ollama::new(
             model,
             &args.ollama_url,
-            Duration::from_secs(args.model_timeout as u64),
+            model_timeout,
             args.num_ctx.min(32768),
         );
         let review_provider = match review_provider {

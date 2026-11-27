@@ -1,5 +1,24 @@
 # Development launcher validation
 
+## CLI-owned Ollama startup (Issue #32)
+
+On Apple Silicon macOS 27.2.1, a temporary release installation from
+`cargo install --locked --path . --bin cognix` started Ollama 0.34.4 on the
+default endpoint, passed the readiness and tool-call checks with the cached
+`qwen3-coder:30b` model, and shut down its server on `/exit`. The endpoint also
+returned to connection refused after a missing-model error and after SIGTERM,
+which exited with status 143. A separate `ollama serve` process remained running
+and responded to `/api/version` after a successful Cognix session. The smoke
+test used cached model files and performed no downloads.
+
+The CLI lifecycle tests exercise process-group ownership, readiness retries,
+startup timeout, early process exit, cancellation, missing Ollama, invalid or
+unresponsive listeners, and refused custom endpoints. They use ephemeral
+fixture ports. The launcher tests exercise build and argument forwarding,
+configuration and terminal consent through the native CLI, including
+cancellation during provisioning. The sections below record the earlier
+launcher implementation and its validation.
+
 ## Model provisioning (Issue #12)
 
 Validated on 2026-11-08 on Apple Silicon macOS 27.2, system Bash 3.2.57,

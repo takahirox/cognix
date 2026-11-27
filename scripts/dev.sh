@@ -3,177 +3,44 @@
 set -u
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P) || exit 1
-timeout=${COGNIX_DEV_STARTUP_TIMEOUT:-30}
-if [[ ! $timeout =~ ^[1-9][0-9]*$ ]] || ((${#timeout} > 3)) || ((timeout > 300)); then
-    echo 'dev.sh: COGNIX_DEV_STARTUP_TIMEOUT must be 1–300 seconds' >&2
+command -v cargo >/dev/null 2>&1 || {
+    echo 'dev.sh: required command not found: cargo' >&2
     exit 1
-fi
-for program in cargo curl /usr/bin/plutil; do
-    command -v "$program" >/dev/null 2>&1 || {
-        echo "dev.sh: required command not found: $program" >&2; exit 1;
-    }
-done
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/cognix-dev.XXXXXX") || exit 1
-ollama_pid=
-build_pid=
-cognix_pid=
-provision_pid=
-signal_status=0
-
-# Only build/Ollama jobs get their own process groups. Cognix stays in the
-# terminal's foreground group so its interactive input and approvals work.
-cancel() {
-    signal_status=$1
-    [[ -z $cognix_pid ]] || kill -INT "$cognix_pid" 2>/dev/null || :
-    [[ -z $provision_pid ]] || kill -INT "$provision_pid" 2>/dev/null || :
-    [[ -z $build_pid ]] || kill -TERM -- "-$build_pid" 2>/dev/null || :
-    [[ -z $ollama_pid ]] || kill -TERM -- "-$ollama_pid" 2>/dev/null || :
 }
+
+build_pid=
+signal_status=0
 cleanup() {
-    local status=$? i alive
+    local status=$? i
     trap '' INT TERM HUP
-    [[ -z $cognix_pid ]] || kill -INT "$cognix_pid" 2>/dev/null || :
-    [[ -z $provision_pid ]] || kill -INT "$provision_pid" 2>/dev/null || :
-    [[ -z $build_pid ]] || kill -TERM -- "-$build_pid" 2>/dev/null || :
-    [[ -z $ollama_pid ]] || kill -TERM -- "-$ollama_pid" 2>/dev/null || :
-    # Bound cleanup too: a stuck child cannot hold the launcher open forever.
-    for ((i=0; i<50; i++)); do
-        alive=0
-        [[ -z $cognix_pid ]] || { kill -0 "$cognix_pid" 2>/dev/null && alive=1; }
-        [[ -z $provision_pid ]] || { kill -0 "$provision_pid" 2>/dev/null && alive=1; }
-        [[ -z $build_pid ]] || { kill -0 -- "-$build_pid" 2>/dev/null && alive=1; }
-        [[ -z $ollama_pid ]] || { kill -0 -- "-$ollama_pid" 2>/dev/null && alive=1; }
-        ((alive)) || break
-        sleep 0.1
-    done
-    if [[ -n $cognix_pid ]]; then
-        kill -KILL "$cognix_pid" 2>/dev/null || :
-        wait "$cognix_pid" 2>/dev/null || :
+    if [[ -n $build_pid ]]; then
+        kill -TERM -- "-$build_pid" 2>/dev/null || :
+        for ((i=0; i<50; i++)); do
+            kill -0 -- "-$build_pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -KILL -- "-$build_pid" 2>/dev/null || :
+        wait "$build_pid" 2>/dev/null || :
     fi
-    for pid in "$build_pid" "$ollama_pid"; do
-        [[ -n $pid ]] || continue
-        kill -KILL -- "-$pid" 2>/dev/null || :
-        wait "$pid" 2>/dev/null || :
-    done
-    if [[ -n $provision_pid ]]; then
-        kill -KILL "$provision_pid" 2>/dev/null || :
-        wait "$provision_pid" 2>/dev/null || :
-    fi
-    rm -f "$scratch/version" "$scratch/curl-error" "$scratch/endpoint"
-    # Keep startup logs for inspection; remove the directory when none exists.
-    rmdir "$scratch" 2>/dev/null || :
     ((signal_status == 0)) || status=$signal_status
     exit "$status"
 }
 trap cleanup EXIT
-# Handlers record cancellation rather than exiting between spawn and $! capture.
-trap 'cancel 130' INT
-trap 'cancel 143' TERM
-trap 'cancel 129' HUP
-check_canceled() { ((signal_status == 0)) || exit "$signal_status"; }
-fail() {
-    echo "dev.sh: $*" >&2
-    [[ ! -f $scratch/ollama.log ]] || echo "dev.sh: Ollama startup log: $scratch/ollama.log" >&2
-    exit 1
-}
+# Record cancellation even if it arrives before the build PID is captured.
+trap 'signal_status=130' INT
+trap 'signal_status=143' TERM
+trap 'signal_status=129' HUP
 
-# Build from any working directory and keep the caller's project directory.
+# Keep the build in its own process group and retain the caller's directory.
 set -m
-(cd -- "$repo" && exec cargo build --locked --manifest-path "$repo/Cargo.toml" --target-dir "$repo/target" --bin cognix --bin cognix-dev-model) &
+(cd -- "$repo" && exec cargo build --locked --manifest-path "$repo/Cargo.toml" --target-dir "$repo/target" --bin cognix) &
 build_pid=$!
 set +m
-check_canceled
+((signal_status == 0)) || exit "$signal_status"
 wait "$build_pid"
 status=$?
-check_canceled
+((signal_status == 0)) || exit "$signal_status"
 ((status == 0)) || exit "$status"
 build_pid=
 
-# Resolve the loopback endpoint and capture a digest of the effective settings.
-unset COGNIX_DEV_SETTINGS_DIGEST
-"$repo/target/debug/cognix-dev-model" --launcher-endpoint "$@" >"$scratch/endpoint" &
-provision_pid=$!
-check_canceled
-wait "$provision_pid"
-status=$?
-check_canceled
-((status == 0)) || exit "$status"
-provision_pid=
-
-# 0 = compatible server, 2 = connection refused, 1 = incompatible/unresponsive.
-# Do not follow redirects or consult proxies. Only a refused connection permits
-# auto-start; an HTTP listener or ambiguous network failure is never assumed safe.
-probe() {
-    local code result version body
-    code=$(curl --silent --show-error --noproxy '*' --proto '=http' \
-        --connect-timeout 1 --max-time 1 --max-filesize 65536 \
-        --output "$scratch/version" --write-out '%{http_code}' \
-        "$endpoint/api/version" 2>"$scratch/curl-error")
-    result=$?
-    check_canceled
-    ((result != 7)) || return 2
-    ((result == 0)) && [[ $code == 200 ]] || return 1
-    # Require a JSON object opening with a quoted key and colon. plutil also
-    # accepts XML and OpenStep plists, which are not Ollama API responses.
-    body=$(LC_ALL=C tr -d '[:space:]' < "$scratch/version")
-    [[ $body =~ ^\{\"[^\"]*\": ]] || return 1
-    version=$(/usr/bin/plutil -extract version raw -expect string -o - "$scratch/version" 2>/dev/null) || return 1
-    [[ -n $version ]]
-}
-
-if [[ -s $scratch/endpoint ]]; then
-    {
-        IFS= read -r endpoint && IFS= read -r COGNIX_DEV_SETTINGS_DIGEST
-    } <"$scratch/endpoint" || fail 'Could not read Cognix startup settings.'
-    [[ -n $endpoint && $COGNIX_DEV_SETTINGS_DIGEST =~ ^[0-9a-f]{64}$ ]] || \
-        fail 'Invalid Cognix startup settings.'
-    export COGNIX_DEV_SETTINGS_DIGEST
-    probe
-    health=$?
-    check_canceled
-    case $health in
-    0) echo "dev.sh: Reusing Ollama at $endpoint" >&2 ;;
-    1) fail "No valid Ollama /api/version response at $endpoint; port may be occupied by another service or unresponsive. Start/check Ollama manually." ;;
-    2)
-        [[ $endpoint == http://127.0.0.1:11434 ]] || \
-            fail "Ollama unavailable at $endpoint; auto-start supports only http://127.0.0.1:11434. Start the custom server manually."
-        command -v ollama >/dev/null 2>&1 || fail "ollama command not found; install Ollama and put it on PATH."
-        echo "dev.sh: Starting Ollama; startup log: $scratch/ollama.log" >&2
-        set -m
-        OLLAMA_HOST=127.0.0.1:11434 ollama serve >"$scratch/ollama.log" 2>&1 < /dev/null &
-        ollama_pid=$!
-        set +m
-        check_canceled
-        deadline=$((SECONDS + timeout))
-        while ((SECONDS < deadline)); do
-            kill -0 "$ollama_pid" 2>/dev/null || fail 'ollama serve exited before becoming ready.'
-            probe
-            health=$?
-            check_canceled
-            # A concurrent app may win the bind race. Cleanup still targets only
-            # our process group, never the PID of the service on the port.
-            if ((health == 0)); then break; fi
-            ((health != 1)) || fail "No valid Ollama /api/version response at $endpoint during startup."
-            sleep 0.1
-        done
-        ((health == 0)) || fail "Ollama did not become ready within $timeout seconds."
-        ;;
-    esac
-    # Keep the helper in the foreground terminal group for interactive consent.
-    "$repo/target/debug/cognix-dev-model" "$@" <&0 &
-    provision_pid=$!
-    check_canceled
-    wait "$provision_pid"
-    status=$?
-    check_canceled
-    ((status == 0)) || exit "$status"
-    provision_pid=
-fi
-"$repo/target/debug/cognix" "$@" <&0 &
-cognix_pid=$!
-check_canceled
-wait "$cognix_pid"
-status=$?
-check_canceled
-cognix_pid=
-exit "$status"
+exec "$repo/target/debug/cognix" --dev-provision-model "$@"

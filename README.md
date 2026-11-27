@@ -22,8 +22,8 @@ Install Cognix from this checkout. Make sure Cargo's bin directory
 cargo install --locked --path . --bin cognix
 ```
 
-Open the Ollama app or run `ollama serve` in a separate terminal. Install the
-default model if you need it, then start Cognix from your project directory.
+Put `ollama` on your `PATH`. Open the Ollama app or run `ollama serve` in
+a separate terminal before installing the default model.
 
 ```sh
 ollama pull qwen3-coder:30b
@@ -31,8 +31,20 @@ cd /path/to/project
 cognix
 ```
 
-The [development launcher](#development-launcher) can start local Ollama and
-offers to download a missing model with explicit confirmation.
+After installing the model, you can run `cognix` with Ollama stopped. Cognix
+reuses a compatible running server. If the default endpoint
+(`http://127.0.0.1:11434`) refuses the connection, Cognix starts `ollama serve`
+on that address and waits up to 30 seconds for a valid version response.
+Cognix stops the server it started when it exits, including after cancellation
+or startup failure. It leaves an existing server running. A custom loopback
+endpoint must already be serving Ollama. An incompatible or unresponsive
+listener produces an error.
+
+When Cognix starts Ollama, it prints the path to a temporary `ollama.log`.
+Inspect that file if startup fails, then delete its temporary directory when
+you no longer need the log. Install missing models explicitly when running
+`cognix` directly. The [development launcher](#development-launcher) offers
+to download a missing model with explicit confirmation.
 
 Cargo downloads build dependencies on the first build; the committed lockfile
 pins their versions. The application needs no Python runtime. The repository's
@@ -95,9 +107,8 @@ limitations.
 
 ## Development launcher
 
-On Apple Silicon macOS, install Rust/Cargo 1.87+ and Ollama, with `cargo` and
-`ollama` on `PATH`. The launcher uses the macOS-provided Bash, curl and plutil;
-it needs no Python runtime. Run:
+On Apple Silicon macOS, install Rust/Cargo 1.87+ and Ollama. Put `cargo` and
+`ollama` on your `PATH`.
 
 ```sh
 ./scripts/dev.sh --model qwen3.8:27b
@@ -106,31 +117,20 @@ it needs no Python runtime. Run:
 /path/to/cognix/scripts/dev.sh --model qwen3-coder:30b
 ```
 
-The script is committed executable; if a copy lost that permission, run
-`chmod +x scripts/dev.sh`. It builds the native debug CLI and its internal model
-provisioning helper using the repository's Cargo manifest and `target` directory,
-forwarding all CLI arguments unchanged.
-It uses the same settings as the installed executable.
+The script is committed executable. If a copy lost that permission, run
+`chmod +x scripts/dev.sh`. It builds the native debug CLI using the
+repository's Cargo manifest and `target` directory, then forwards the CLI
+arguments unchanged.
 
-An existing server with a valid Ollama `/api/version` response is reused and
-left running. If the default `http://127.0.0.1:11434` endpoint refuses connections,
-the launcher starts `ollama serve` bound to that address, waits up to 30 seconds,
-and stops only its own server/process group on exit or interruption. Custom local
-HTTP endpoints must already be running; the launcher never starts a daemon for
-them. An incompatible or unresponsive listener produces an error. Override the
-readiness deadline with `COGNIX_DEV_STARTUP_TIMEOUT` (1–300 seconds) if necessary.
-Startup prints the path to a retained temporary `ollama.log`; inspect it with
-`cat /printed/path/ollama.log`, then delete that temporary directory when done.
-Normal Cognix exit codes pass through; Ctrl-C, termination and hangup exit with
-130, 143 and 129 respectively, with bounded cleanup of owned processes.
+The launcher uses Cognix's server startup and cleanup. Set
+`COGNIX_DEV_STARTUP_TIMEOUT` to adjust the default 30-second readiness deadline
+(1–300 seconds). Ctrl-C, termination and hangup exit with 130, 143 and 129
+respectively.
 
-After building, the helper resolves the endpoint and model with Cognix's CLI
-parser. It checks that exact model through `/api/show` on the configured
-endpoint. Installed models start without prompts, updates or downloads.
-If effective settings change between the endpoint probe, model provisioning
-and CLI startup, the launcher stops and asks you to run it again.
-Help/version and invalid CLI options are handled by the same parser without
-provisioning.
+Cognix resolves the settings once, then checks the selected model through
+`/api/show` on the configured endpoint. Installed models start without
+prompts, updates or downloads. Help, version and invalid CLI options do not
+contact Ollama.
 
 Only Ollama's explicit missing-model response offers a download. The launcher
 shows the tag, endpoint and warning about potentially many GB of network/disk
@@ -155,12 +155,8 @@ errors do not trigger downloads. No hosted inference fallback is selected.
 Network access to model registries is needed only for an approved download;
 normal local inference requires no hosted AI API.
 
-Cognix still checks local model readiness, capabilities and actual tool calling,
-and retains its approval, sandbox and command allowlist behavior. A downloaded
-model can fail these checks. The direct `cognix` binary does not provision models.
-To run manually, start `ollama serve` in one terminal (or use the Ollama app),
-install a suitable model, then launch the installed executable as described in
-[Setup](#setup). See the [launcher validation record](docs/dev-launcher-validation.md)
+Cognix still checks local model capabilities and runs a tool-call probe after
+provisioning. See the [launcher validation record](docs/dev-launcher-validation.md)
 for focused checks.
 
 ## Run

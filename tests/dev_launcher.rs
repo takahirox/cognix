@@ -6,37 +6,14 @@ use serde_json::json;
 use std::{
     fs,
     io::Write,
-    os::{fd::FromRawFd, unix::fs::PermissionsExt},
+    os::{
+        fd::FromRawFd,
+        unix::fs::{PermissionsExt, symlink},
+    },
     path::Path,
     process::{Child, Command, Output, Stdio},
     time::{Duration, Instant},
 };
-
-// Native disposable child: unlike background shell scripts, it can restore
-// SIGINT handling. It also gives the Ollama stub a real descendant to clean up.
-#[test]
-fn launcher_child() {
-    let Ok(mode) = std::env::var("LAUNCHER_CHILD") else {
-        return;
-    };
-    extern "C" fn interrupted(_: i32) {
-        unsafe { libc::_exit(130) }
-    }
-    unsafe { libc::signal(libc::SIGINT, interrupted as *const () as usize) };
-    let dir = std::env::var("FIXTURE").unwrap();
-    fs::write(format!("{dir}/{mode}.pid"), std::process::id().to_string()).unwrap();
-    if mode == "ollama" {
-        let mut worker = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "launcher_child", "--nocapture"])
-            .env("LAUNCHER_CHILD", "worker")
-            .spawn()
-            .unwrap();
-        let _ = worker.wait();
-    }
-    loop {
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -70,23 +47,14 @@ impl Fixture {
 printf '%s\0' "$@" > "$FIXTURE/cargo-argv"
 pwd > "$FIXTURE/cargo-cwd"
 if [[ ${BUILD_WAIT:-0} == 1 ]]; then
-    export LAUNCHER_CHILD=build
-    exec "$HELPER_EXE" --exact launcher_child --nocapture
+    printf '%s' "$$" > "$FIXTURE/build.pid"
+    exec /bin/sleep 30
+fi
+if [[ ${BUILD_EXIT:-0} != 0 ]]; then
+    /bin/sleep 10 </dev/null >/dev/null 2>&1 &
+    printf '%s' "$!" > "$FIXTURE/build-worker.pid"
 fi
 exit "${BUILD_EXIT:-0}"
-"#,
-        );
-        executable(
-            &root.join("repo with spaces/target/debug/cognix-dev-model"),
-            r#"#!/bin/bash
-if [[ ${1:-} == --launcher-endpoint ]]; then
-    exec "$NATIVE_MODEL_HELPER" "$@"
-fi
-if [[ ${PROVISION_WAIT:-0} == 1 ]]; then
-    export LAUNCHER_CHILD=provision
-    exec "$HELPER_EXE" --exact launcher_child --nocapture
-fi
-exit "${PROVISION_EXIT:-0}"
 "#,
         );
         executable(
@@ -95,43 +63,11 @@ exit "${PROVISION_EXIT:-0}"
 printf '%s\0' "$@" > "$FIXTURE/argv"
 pwd > "$FIXTURE/cwd-record"
 printf '%s' "${COGNIX_MODEL:-}" > "$FIXTURE/model"
-if [[ ${COGNIX_WAIT:-0} == 1 ]]; then
-    export LAUNCHER_CHILD=cognix
-    exec "$HELPER_EXE" --exact launcher_child --nocapture
-fi
 if [[ ${READ_STDIN:-0} == 1 ]]; then
     IFS= read -r line
     printf '%s' "$line" > "$FIXTURE/stdin-record"
 fi
 exit "${COGNIX_EXIT:-0}"
-"#,
-        );
-        executable(
-            &root.join("bin/curl"),
-            r#"#!/bin/bash
-printf '%s\0' "$@" >> "$FIXTURE/curl-argv"
-while (($#)); do
-    if [[ $1 == --output ]]; then output=$2; shift; fi
-    shift
-done
-case ${CURL_MODE:-managed} in
-    managed) [[ -f $FIXTURE/ollama.pid ]] || exit 7 ;;
-    absent) exit 7 ;;
-    invalid) printf '{"version":42}' > "$output"; printf 200; exit ;;
-    timeout) exit 28 ;;
-esac
-printf '{"version":"0.34.4"}' > "$output"
-printf 200
-"#,
-        );
-        executable(
-            &root.join("bin/ollama"),
-            r#"#!/bin/bash
-printf '%s\0' "$@" > "$FIXTURE/ollama-argv"
-printf '%s' "$OLLAMA_HOST" > "$FIXTURE/ollama-host"
-if [[ ${OLLAMA_FAIL:-0} == 1 ]]; then echo 'fixture bind failure'; exit 9; fi
-export LAUNCHER_CHILD=ollama
-exec "$HELPER_EXE" --exact launcher_child --nocapture
 "#,
         );
         Self { dir }
@@ -141,17 +77,21 @@ exec "$HELPER_EXE" --exact launcher_child --nocapture
     }
     fn command(&self) -> Command {
         let mut c = Command::new(self.path("repo with spaces/scripts/dev.sh"));
+        self.configure(&mut c);
+        c
+    }
+    fn direct(&self) -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_cognix"));
+        self.configure(&mut c);
+        c
+    }
+    fn configure(&self, c: &mut Command) {
         c.current_dir(self.path("cwd"))
             .env(
                 "PATH",
                 format!("{}:/usr/bin:/bin", self.path("bin").display()),
             )
             .env("FIXTURE", self.dir.path())
-            .env("HELPER_EXE", std::env::current_exe().unwrap())
-            .env(
-                "NATIVE_MODEL_HELPER",
-                env!("CARGO_BIN_EXE_cognix-dev-model"),
-            )
             .env("HOME", self.path("home"))
             .env("TMPDIR", self.path("logs"))
             .env("COGNIX_DEV_STARTUP_TIMEOUT", "2")
@@ -160,7 +100,6 @@ exec "$HELPER_EXE" --exact launcher_child --nocapture
             .env_remove("BASH_ENV")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        c
     }
     fn argv(&self, file: &str) -> Vec<String> {
         fs::read(self.path(file))
@@ -188,39 +127,10 @@ exec "$HELPER_EXE" --exact launcher_child --nocapture
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    fn native_model_helper(&self) {
-        fs::copy(
-            env!("CARGO_BIN_EXE_cognix-dev-model"),
-            self.path("repo with spaces/target/debug/cognix-dev-model"),
-        )
-        .unwrap();
-    }
     fn native_cognix(&self) {
-        self.native_model_helper();
-        fs::copy(
-            env!("CARGO_BIN_EXE_cognix"),
-            self.path("repo with spaces/target/debug/cognix"),
-        )
-        .unwrap();
-    }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        // Test failures must not leave disposable children behind either.
-        for file in [
-            "ollama.pid",
-            "worker.pid",
-            "cognix.pid",
-            "build.pid",
-            "provision.pid",
-        ] {
-            if let Some(pid) = fs::read_to_string(self.path(file))
-                .ok()
-                .and_then(|pid| pid.parse::<i32>().ok())
-            {
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
-        }
+        let target = self.path("repo with spaces/target/debug/cognix");
+        fs::remove_file(&target).unwrap();
+        symlink(env!("CARGO_BIN_EXE_cognix"), target).unwrap();
     }
 }
 fn finished(mut child: Child) -> Output {
@@ -231,6 +141,7 @@ fn finished(mut child: Child) -> Output {
         }
         if Instant::now() >= deadline {
             child.kill().unwrap();
+            child.wait().unwrap();
             panic!("launcher did not finish");
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -240,13 +151,14 @@ fn status(out: &Output, expected: i32) {
     assert_eq!(
         out.status.code(),
         Some(expected),
-        "{}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn managed_startup_forwards_arguments_stdin_environment_and_exit_status() {
+fn build_preserves_arguments_stdin_working_directory_and_exit_status() {
     let f = Fixture::new();
     let args = [
         "--root",
@@ -264,7 +176,6 @@ fn managed_startup_forwards_arguments_stdin_environment_and_exit_status() {
         .env("COGNIX_EXIT", "23")
         .env("READ_STDIN", "1")
         .env("COGNIX_MODEL", "env:local")
-        .env("OLLAMA_HOST", "wrong-address:9999")
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
@@ -276,11 +187,9 @@ fn managed_startup_forwards_arguments_stdin_environment_and_exit_status() {
         .unwrap();
     let out = finished(child);
     status(&out, 23);
-    assert_eq!(f.argv("argv"), args);
-    assert_eq!(f.argv("ollama-argv"), ["serve"]);
     assert_eq!(
-        fs::read_to_string(f.path("ollama-host")).unwrap(),
-        "127.0.0.1:11434"
+        f.argv("argv"),
+        [vec!["--dev-provision-model"], args.to_vec()].concat()
     );
     assert_eq!(fs::read_to_string(f.path("model")).unwrap(), "env:local");
     assert_eq!(
@@ -304,16 +213,32 @@ fn managed_startup_forwards_arguments_stdin_environment_and_exit_status() {
             .to_str()
             .unwrap()
     );
-    f.assert_stopped("ollama.pid");
-    // Wait until spawned during readiness/build, then verify group cleanup.
-    f.assert_stopped("worker.pid");
+    assert_eq!(cargo[6..], ["--bin", "cognix"]);
+}
+
+#[test]
+fn build_failure_and_hangup_never_start_cognix() {
+    let failed = Fixture::new();
+    status(
+        &finished(failed.command().env("BUILD_EXIT", "17").spawn().unwrap()),
+        17,
+    );
+    failed.assert_stopped("build-worker.pid");
+    assert!(!failed.path("argv").exists());
+
+    let canceled = Fixture::new();
+    let child = canceled.command().env("BUILD_WAIT", "1").spawn().unwrap();
+    canceled.wait_for("build.pid");
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGHUP) }, 0);
+    status(&finished(child), 129);
+    canceled.assert_stopped("build.pid");
+    assert!(!canceled.path("argv").exists());
 }
 
 #[test]
 fn existing_real_http_server_and_native_cli_work_from_both_directories() {
     let server = Server::new(ready);
     let f = Fixture::new();
-    fs::remove_file(f.path("bin/curl")).unwrap();
     f.native_cognix();
     for cwd in ["cwd", "repo with spaces"] {
         let out = finished(
@@ -333,185 +258,27 @@ fn existing_real_http_server_and_native_cli_work_from_both_directories() {
         status(&out, 0);
         assert!(String::from_utf8_lossy(&out.stdout).contains("Ollama fixture-1"));
     }
-    assert!(!f.path("ollama-argv").exists());
-    // The existing server still serves a third launch after both sessions exit.
+    // Help works even when the effective endpoint is unavailable.
     status(
         &finished(
             f.command()
                 .env("COGNIX_OLLAMA_URL", "http://127.0.0.1:1")
-                .arg(format!("--ollama-url={}", server.url))
                 .arg("--help")
                 .spawn()
                 .unwrap(),
         ),
         0,
     );
-}
-
-#[test]
-fn refused_custom_endpoint_missing_ollama_and_invalid_listeners_fail_before_launch() {
-    for (mode, endpoint, missing, message) in [
-        (
-            "absent",
-            "http://localhost:11434",
-            false,
-            "auto-start supports only",
-        ),
-        (
-            "absent",
-            "http://127.0.0.1:11434",
-            true,
-            "ollama command not found",
-        ),
-        (
-            "invalid",
-            "http://127.0.0.1:11434",
-            false,
-            "No valid Ollama",
-        ),
-        (
-            "timeout",
-            "http://127.0.0.1:11434",
-            false,
-            "No valid Ollama",
-        ),
-        (
-            "existing",
-            "https://example.com",
-            false,
-            "local HTTP origin",
-        ),
-    ] {
-        let f = Fixture::new();
-        if missing {
-            fs::remove_file(f.path("bin/ollama")).unwrap();
-        }
-        let out = finished(
-            f.command()
-                .env("CURL_MODE", mode)
-                .env("COGNIX_OLLAMA_URL", endpoint)
-                .spawn()
-                .unwrap(),
-        );
-        status(&out, 1);
-        assert!(String::from_utf8_lossy(&out.stderr).contains(message));
-        assert!(!f.path("argv").exists());
-        assert!(!f.path("ollama-argv").exists());
-    }
-}
-
-#[test]
-fn real_http_wrong_service_and_redirect_are_not_reused() {
-    for (code, body) in [
-        (200, "welcome"),
-        (200, r#"{"version"="fake";}"#),
-        (200, r#"{"version":1}"#),
-        (200, r#"{"version":""}"#),
-        (302, r#"{"version":"1"}"#),
-    ] {
-        let server = Server::new(move |_, _| Reply {
-            status: code,
-            body: body.into(),
-            delay: Duration::ZERO,
-        });
-        let f = Fixture::new();
-        fs::remove_file(f.path("bin/curl")).unwrap();
-        let out = finished(
-            f.command()
-                .args(["--ollama-url", &server.url])
-                .spawn()
-                .unwrap(),
-        );
-        status(&out, 1);
-        assert!(String::from_utf8_lossy(&out.stderr).contains("No valid Ollama"));
-        assert!(!f.path("ollama-argv").exists());
-        assert!(!f.path("argv").exists());
-    }
-}
-
-#[test]
-fn startup_failure_timeout_and_build_failure_report_and_clean_up() {
-    for (mode, fail, build_exit, provision_exit, message) in [
-        ("managed", "1", "0", "0", "exited before becoming ready"),
-        ("absent", "0", "0", "0", "did not become ready within"),
-        ("managed", "0", "17", "0", ""),
-        ("managed", "0", "0", "19", "startup log:"),
-    ] {
-        let f = Fixture::new();
-        let out = finished(
-            f.command()
-                .env("CURL_MODE", mode)
-                .env("OLLAMA_FAIL", fail)
-                .env("BUILD_EXIT", build_exit)
-                .env("PROVISION_EXIT", provision_exit)
-                .spawn()
-                .unwrap(),
-        );
-        status(
-            &out,
-            match (build_exit, provision_exit) {
-                ("17", _) => 17,
-                (_, "19") => 19,
-                _ => 1,
-            },
-        );
-        assert!(!f.path("argv").exists());
-        if build_exit != "0" {
-            assert!(!f.path("ollama-argv").exists());
-            continue;
-        }
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains(message), "{err}");
-        let log = err
-            .lines()
-            .find_map(|line| line.split_once("startup log: ").map(|(_, path)| path))
-            .unwrap();
-        assert!(Path::new(log).is_file());
-        if fail == "0" {
-            f.assert_stopped("ollama.pid");
-            f.assert_stopped("worker.pid");
-        }
-    }
-}
-
-#[test]
-fn signals_cancel_cognix_build_and_startup_without_leaking_owned_processes() {
-    for (signal, stage, mode) in [
-        (libc::SIGINT, "cognix.pid", "managed"),
-        (libc::SIGTERM, "cognix.pid", "managed"),
-        (libc::SIGHUP, "build.pid", "managed"),
-        (libc::SIGTERM, "ollama.pid", "absent"),
-        (libc::SIGTERM, "cognix.pid", "existing"),
-        (libc::SIGINT, "provision.pid", "managed"),
-        (libc::SIGTERM, "provision.pid", "managed"),
-    ] {
-        let f = Fixture::new();
-        let child = f
-            .command()
-            .env("CURL_MODE", mode)
-            .env("COGNIX_WAIT", "1")
-            .env(
-                "PROVISION_WAIT",
-                if stage == "provision.pid" { "1" } else { "0" },
-            )
-            .env("BUILD_WAIT", if stage == "build.pid" { "1" } else { "0" })
-            .spawn()
-            .unwrap();
-        f.wait_for(stage);
-        if mode == "managed" && stage != "build.pid" {
-            f.wait_for("worker.pid");
-        }
-        unsafe { libc::kill(child.id() as i32, signal) };
-        status(&finished(child), 128 + signal);
-        f.assert_stopped(stage);
-        if mode == "managed" && stage != "build.pid" {
-            f.assert_stopped("ollama.pid");
-            f.assert_stopped("worker.pid");
-        }
-        if mode == "existing" || stage == "build.pid" {
-            assert!(!f.path("ollama-argv").exists());
-        }
-    }
+    assert_eq!(
+        server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["path"] == "/api/version")
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -532,10 +299,8 @@ fn native_model_errors_pass_through_without_pulls_or_fallbacks() {
             }
         });
         let f = Fixture::new();
-        fs::remove_file(f.path("bin/curl")).unwrap();
-        f.native_cognix();
         let out = finished(
-            f.command()
+            f.direct()
                 .args(["--ollama-url", &server.url, "--model", "fixture:local"])
                 .stdin(Stdio::null())
                 .spawn()
@@ -549,13 +314,12 @@ fn native_model_errors_pass_through_without_pulls_or_fallbacks() {
         );
         assert!(
             text.contains(if missing {
-                "Non-interactive input; no download"
+                "Install a suitable local tag explicitly"
             } else {
                 "completion and tools"
             }),
             "{text}"
         );
-        assert!(!f.path("ollama-argv").exists());
         assert!(
             server
                 .requests
@@ -591,8 +355,7 @@ fn terminal_input(command: &mut Command) -> fs::File {
 
 fn provisioning_fixture() -> Fixture {
     let f = Fixture::new();
-    f.native_model_helper();
-    fs::remove_file(f.path("bin/curl")).unwrap();
+    f.native_cognix();
     f
 }
 
@@ -605,13 +368,12 @@ fn missing(model: &str) -> Reply {
 }
 
 #[test]
-fn effective_models_are_checked_exactly_without_prompt_or_changed_arguments() {
+fn effective_models_are_checked_exactly_without_prompt() {
     for (args, environment, expected) in [
         (
             vec![
                 "--model",
                 "namespace/fixture:tag",
-                "--task=--model=decoy",
                 "--allow-command",
                 r#"["/bin/echo","two words"]"#,
             ],
@@ -619,7 +381,7 @@ fn effective_models_are_checked_exactly_without_prompt_or_changed_arguments() {
             "namespace/fixture:tag",
         ),
         (
-            vec!["--model=fixture:equal", "--task", "quoted ' \" words\nnext"],
+            vec!["--model=fixture:equal"],
             "env:ignored",
             "fixture:equal",
         ),
@@ -639,10 +401,12 @@ fn effective_models_are_checked_exactly_without_prompt_or_changed_arguments() {
         let out = finished(command.spawn().unwrap());
         status(&out, 0);
         assert!(!String::from_utf8_lossy(&out.stdout).contains("Download"));
-        assert_eq!(f.argv("argv"), args);
         let requests = server.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2); // version and exact show; never pull
-        assert_eq!(requests[1]["body"]["model"], expected);
+        assert_eq!(requests.len(), 4); // version, provisioning, capabilities, tool probe
+        for show in &requests[1..3] {
+            assert_eq!(show["path"], "/api/show");
+            assert_eq!(show["body"]["model"], expected);
+        }
     }
 }
 
@@ -661,26 +425,19 @@ fn launcher_reuses_the_normalized_endpoint_and_model_from_user_configuration() {
     .unwrap();
     let out = finished(f.command().stdin(Stdio::null()).spawn().unwrap());
     status(&out, 0);
-    let endpoint = server.url.replace("127.0.0.1", "localhost");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains(&format!("Reusing Ollama at {endpoint}"))
-    );
-    assert!(!f.path("ollama-argv").exists());
-    assert!(f.argv("argv").is_empty());
     let requests = server.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 4);
     assert_eq!(requests[0]["path"], "/api/version");
     assert_eq!(requests[1]["body"]["model"], "saved:local");
 }
 
 #[test]
-fn launcher_rejects_settings_changes_during_probe_or_download() {
+fn launcher_applies_one_settings_snapshot_through_probe_and_provisioning() {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
     let other_server = Server::new(ready);
     for edit_at in ["/api/version", "/api/pull"] {
         let f = provisioning_fixture();
-        f.native_cognix();
         fs::create_dir(f.path("home/.cognix")).unwrap();
         let config = f.path("home/.cognix/config.toml");
         let edited_config = config.clone();
@@ -720,37 +477,34 @@ fn launcher_rejects_settings_changes_during_probe_or_download() {
         let child = command.spawn().unwrap();
         terminal.write_all(b"y\n\x04").unwrap();
         let out = finished(child);
-        status(&out, 2);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("settings changed during development launcher startup"),
-            "{stderr}"
-        );
-
+        status(&out, 0);
         let requests = server.requests.lock().unwrap();
         let paths: Vec<_> = requests
             .iter()
             .map(|r| r["path"].as_str().unwrap())
             .collect();
-        if edit_at == "/api/version" {
-            assert_eq!(paths, ["/api/version"]);
-        } else {
-            assert_eq!(
-                paths,
-                ["/api/version", "/api/show", "/api/pull", "/api/show"]
-            );
-            assert!(
-                requests[1..]
-                    .iter()
-                    .all(|r| r["body"]["model"] == "original:local")
-            );
-        }
+        assert_eq!(
+            paths,
+            [
+                "/api/version",
+                "/api/show",
+                "/api/pull",
+                "/api/show",
+                "/api/show",
+                "/api/chat"
+            ]
+        );
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|r| r["body"]["model"] == "original:local")
+        );
     }
     assert!(other_server.requests.lock().unwrap().is_empty());
 }
 
 #[test]
-fn decline_default_eof_and_noninteractive_never_download_or_start_cognix() {
+fn decline_default_eof_and_noninteractive_never_download() {
     for answer in [
         Some("n\n"),
         Some("\n"),
@@ -796,14 +550,13 @@ fn decline_default_eof_and_noninteractive_never_download_or_start_cognix() {
             )),
             "{err}"
         );
-        assert!(!f.path("argv").exists());
         assert!(
             server
                 .requests
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|r| r["path"] != "/api/pull")
+                .all(|r| matches!(r["path"].as_str(), Some("/api/version" | "/api/show")))
         );
     }
 }
@@ -831,29 +584,19 @@ fn approved_download_targets_selected_server_verifies_and_reuses_model() {
         _ => ready(path, body),
     });
     let f = provisioning_fixture();
-    let args = [
-        "--ollama-url",
-        &server.url,
-        "--model",
-        "fixture:chosen",
-        "--task",
-        "keep ' quotes\nand spaces",
-    ];
+    let args = ["--ollama-url", &server.url, "--model", "fixture:chosen"];
     let mut command = f.command();
     command
         .args(args)
-        .env("COGNIX_OLLAMA_URL", "http://127.0.0.1:1")
-        .env("READ_STDIN", "1");
+        .env("COGNIX_OLLAMA_URL", "http://127.0.0.1:1");
     let mut terminal = terminal_input(&mut command);
     let child = command.spawn().unwrap();
-    terminal.write_all(b"YES\nnext approval\n").unwrap();
+    // Both lines remain available to their respective prompts. With the PTY
+    // held open, consuming /exit at the consent prompt would hang the session.
+    terminal.write_all(b"YES\n/exit\n").unwrap();
     let out = finished(child);
     status(&out, 0);
-    assert_eq!(f.argv("argv"), args);
-    assert_eq!(
-        fs::read_to_string(f.path("stdin-record")).unwrap(),
-        "next approval"
-    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\n> "));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains("5/10 bytes") && err.contains("success"),
@@ -881,7 +624,6 @@ fn approved_download_targets_selected_server_verifies_and_reuses_model() {
             .filter(|r| r["path"] == "/api/show")
             .all(|r| r["body"]["model"] == "fixture:chosen")
     );
-    assert!(!f.path("ollama-argv").exists());
 }
 
 #[test]
@@ -908,7 +650,6 @@ fn invalid_models_and_cli_are_rejected_before_model_requests() {
                 .unwrap(),
         );
         assert!(!out.status.success(), "{model}");
-        assert!(!f.path("argv").exists());
     }
     let f = provisioning_fixture();
     status(
@@ -969,20 +710,19 @@ fn lookup_errors_and_cloud_metadata_are_never_treated_as_missing() {
         let child = command.spawn().unwrap();
         terminal.write_all(b"y\n").unwrap();
         status(&finished(child), 1);
-        assert!(!f.path("argv").exists());
         assert!(
             server
                 .requests
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|r| r["path"] != "/api/pull")
+                .all(|r| matches!(r["path"].as_str(), Some("/api/version" | "/api/show")))
         );
     }
 }
 
 #[test]
-fn failed_incomplete_and_unverified_downloads_never_start_cognix() {
+fn failed_incomplete_and_unverified_downloads_stop_startup() {
     for (code, body, delay, message) in [
         (
             200,
@@ -1037,7 +777,14 @@ fn failed_incomplete_and_unverified_downloads_never_start_cognix() {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(!f.path("argv").exists());
+        assert!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request["path"] != "/api/chat")
+        );
     }
 }
 
@@ -1072,8 +819,6 @@ fn real_pull_cancellation_preserves_status_and_reused_server() {
         }
         unsafe { libc::kill(child.id() as i32, signal) };
         status(&finished(child), 128 + signal);
-        assert!(!f.path("argv").exists());
-        assert!(!f.path("ollama-argv").exists());
     }
 }
 
@@ -1103,7 +848,6 @@ fn downloaded_models_still_undergo_native_capability_and_tool_call_checks() {
             _ => ready(path, body),
         });
         let f = provisioning_fixture();
-        f.native_cognix();
         let mut command = f.command();
         command.args(["--ollama-url", &server.url, "--model=fixture:local"]);
         let mut terminal = terminal_input(&mut command);
@@ -1130,28 +874,6 @@ fn downloaded_models_still_undergo_native_capability_and_tool_call_checks() {
             mode != "no-tools"
         );
     }
-}
-
-#[test]
-fn failed_model_connection_does_not_trigger_provisioning() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
-    let f = Fixture::new();
-    f.native_model_helper();
-    // The curl stub reports a ready version; the native model request encounters
-    // a real refused connection. It must fail rather than assume a missing tag.
-    let out = finished(
-        f.command()
-            .env("CURL_MODE", "existing")
-            .args(["--ollama-url", &endpoint])
-            .spawn()
-            .unwrap(),
-    );
-    status(&out, 1);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("Model lookup failed"));
-    assert!(!f.path("argv").exists());
-    assert!(!f.path("ollama-argv").exists());
 }
 
 #[test]
@@ -1186,7 +908,7 @@ fn canonical_missing_model_responses_support_implicit_tags_and_registry_names() 
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|r| r["path"] != "/api/pull")
+                .all(|r| matches!(r["path"].as_str(), Some("/api/version" | "/api/show")))
         );
     }
 }
