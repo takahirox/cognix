@@ -1,11 +1,5 @@
-//! Internal development-launcher helper; the core agent never provisions models.
-use clap::error::ErrorKind;
-use cognix::{
-    Cancellation,
-    cli::Args,
-    provider::{normalize_ollama_url, validate_model},
-    terminal,
-};
+//! Optional model provisioning for the development launcher.
+use cognix::{Cancellation, cli::Args, terminal};
 use reqwest::{Client, Response, StatusCode};
 use serde_json::{Value, json};
 use std::{
@@ -16,7 +10,7 @@ use std::{
 const RESPONSE_LIMIT: usize = 1024 * 1024;
 const LINE_LIMIT: usize = 16 * 1024;
 
-fn report(message: &str) {
+pub(super) fn report(message: &str) {
     eprintln!("dev.sh: {}", terminal::text(message));
 }
 
@@ -169,8 +163,11 @@ async fn pull(client: &Client, endpoint: &str, model: &str) -> Result<(), String
     Ok(())
 }
 
-async fn provision(args: &Args, endpoint: &str, cancel: &Cancellation) -> Result<(), String> {
-    validate_model(&args.model)?;
+pub(super) async fn provision(
+    args: &Args,
+    endpoint: &str,
+    cancel: &Cancellation,
+) -> Result<(), String> {
     if model_key(&args.model).is_none() {
         return Err("Select a valid local Ollama model name (optional namespace and :tag); cloud-backed tags are unsupported".into());
     }
@@ -194,7 +191,7 @@ async fn provision(args: &Args, endpoint: &str, cancel: &Cancellation) -> Result
         args.model
     ));
     let manual = format!(
-        "No ready model; Cognix was not started. Install manually with: OLLAMA_HOST='{endpoint}' ollama pull '{}'",
+        "No ready model; The session did not start. Install manually with: OLLAMA_HOST='{endpoint}' ollama pull '{}'",
         args.model
     );
     if !std::io::stdin().is_terminal() {
@@ -212,45 +209,7 @@ async fn provision(args: &Args, endpoint: &str, cancel: &Cancellation) -> Result
         .await.map_err(|_| format!("Download timed out after {seconds}s; increase COGNIX_DEV_PULL_TIMEOUT if needed"))?
         .map_err(|e| format!("Download failed: {e}. Check network access and free disk space, then retry. Ollama-managed partial data was left intact."))?;
     if !installed(&client, endpoint, &args.model).await? {
-        return Err("Download reported success but the selected model is still missing; Cognix was not started".into());
+        return Err("Download reported success but the selected model is still missing; The session did not start".into());
     }
     Ok(())
-}
-
-#[tokio::main]
-async fn main() {
-    let mut argv: Vec<_> = std::env::args_os().collect();
-    let print_endpoint = argv.get(1).is_some_and(|arg| arg == "--launcher-endpoint");
-    if print_endpoint {
-        argv.remove(1);
-    }
-    let args = match Args::try_parse_configured(argv) {
-        Ok(args) => args,
-        // Let the actual Cognix invocation print help/version exactly once.
-        Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => return,
-        Err(e) => e.exit(),
-    };
-    let endpoint = normalize_ollama_url(&args.ollama_url).unwrap_or_else(|e| {
-        report(e);
-        std::process::exit(1);
-    });
-    if print_endpoint {
-        println!("{endpoint}");
-        println!("{}", args.launcher_settings_digest());
-        return;
-    }
-    let cancel = Cancellation::default();
-    let signal = cancel.clone();
-    if let Err(e) = ctrlc::set_handler(move || signal.cancel()) {
-        report(&format!("Cannot install cancellation handler: {e}"));
-        std::process::exit(1);
-    }
-    let result = tokio::select! { biased;
-        _ = cancel.wait() => Err("Model provisioning canceled; Cognix was not started. Ollama-managed partial data was left intact".into()),
-        result = provision(&args, &endpoint, &cancel) => result,
-    };
-    if let Err(e) = result {
-        report(&e);
-        std::process::exit(if cancel.is_canceled() { 130 } else { 1 });
-    }
 }

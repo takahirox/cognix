@@ -31,7 +31,13 @@ pub struct Server {
 }
 impl Server {
     pub fn new(handler: impl Fn(&str, &Value) -> Reply + Send + 'static) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        Self::listen(TcpListener::bind("127.0.0.1:0").unwrap(), handler)
+    }
+
+    pub fn listen(
+        listener: TcpListener,
+        handler: impl Fn(&str, &Value) -> Reply + Send + 'static,
+    ) -> Self {
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let stop = Arc::new(AtomicBool::new(false));

@@ -40,6 +40,8 @@ pub fn normalize(mut message: Value) -> Result<Value, Error> {
     Ok(message)
 }
 
+pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
+
 pub struct Ollama {
     pub model: String,
     pub version: String,
@@ -93,6 +95,10 @@ impl Ollama {
             timeout,
         })
     }
+    pub fn endpoint(&self) -> &str {
+        &self.url
+    }
+
     pub async fn request(
         &self,
         path: &str,
@@ -155,6 +161,10 @@ impl Ollama {
             .as_str()
             .unwrap_or("unknown")
             .into();
+        self.validate_model_and_tools(cancel).await
+    }
+
+    pub async fn validate_model_and_tools(&mut self, cancel: &Cancellation) -> Result<(), Error> {
         self.validate_local_model(true, cancel).await?;
         let tools = json!([{"type":"function","function":{"name":"cognix_probe","description":"Compatibility probe; call with value='ok'.","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}}]);
         let message=self.chat(&[json!({"role":"user","content":"Call cognix_probe with value ok now. Do not answer with prose."})],&tools,cancel).await?;
