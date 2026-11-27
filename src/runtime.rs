@@ -1,7 +1,9 @@
 use crate::{
     Cancellation,
     action::{ActionPlan, finish_result, unexecuted},
-    commands, schema,
+    commands::{self, ExecutionPolicy, PreparedCommand},
+    review::{Decision, Reviewer},
+    schema,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -26,13 +28,20 @@ mod tests;
 #[path = "patch.rs"]
 pub(crate) mod patch;
 
-pub use crate::action::Approval;
+pub use crate::action::{Approval, ApprovalMode, SandboxMode};
 #[cfg(test)]
 type CommitHook = Box<dyn FnMut(&str)>;
 pub struct Runtime {
     pub root: PathBuf,
     root_fd: File,
     pub approve: Approval,
+    pub approval_mode: ApprovalMode,
+    pub sandbox_mode: SandboxMode,
+    pub reviewer: Option<Reviewer>,
+    pub denied_network_origins: Vec<String>,
+    human_decisions: Vec<Value>,
+    denied_network_in_session: BTreeSet<String>,
+    auto_denied: bool,
     pub cancel: Cancellation,
     /// Nonempty lists restrict proposals to exact argv matches.
     pub allowed_commands: Vec<Vec<String>>,
@@ -81,6 +90,19 @@ struct PatchSource {
     file: File,
     bytes: Vec<u8>,
     info: Metadata,
+}
+
+struct PreparedPatch {
+    path: String,
+    parent: File,
+    target: CString,
+    before: Option<PatchSource>,
+    after: String,
+}
+
+enum PreparedAction {
+    Patch(PreparedPatch),
+    Command(PreparedCommand),
 }
 
 enum PatchPublication {
@@ -160,6 +182,7 @@ impl Drop for PatchTemporary<'_> {
 impl Runtime {
     pub fn new(root: &Path, approve: Approval, cancel: Cancellation) -> Result<Self, String> {
         let root = root.canonicalize().map_err(err)?;
+        root.to_str().ok_or("Project root must have a UTF-8 path")?;
         use std::os::unix::fs::OpenOptionsExt;
         let root_fd = std::fs::OpenOptions::new()
             .read(true)
@@ -170,6 +193,13 @@ impl Runtime {
             root,
             root_fd,
             approve,
+            approval_mode: ApprovalMode::default(),
+            sandbox_mode: SandboxMode::default(),
+            reviewer: None,
+            denied_network_origins: vec![],
+            human_decisions: vec![],
+            denied_network_in_session: BTreeSet::new(),
+            auto_denied: false,
             cancel,
             allowed_commands: vec![],
             timeout: Duration::from_secs(30),
@@ -361,7 +391,7 @@ impl Runtime {
         self.seen.remove(path);
         self.patch_reads.remove(path);
     }
-    fn patch(&mut self, args: &Value) -> Result<Value, String> {
+    fn prepare_patch(&self, args: &Value) -> Result<(PreparedAction, ActionPlan), String> {
         let parts = Self::parts(args["path"].as_str().unwrap())?;
         let normalized = parts.join("/");
         let (name, parent_parts) = parts.split_last().unwrap();
@@ -395,15 +425,36 @@ impl Runtime {
             if after.len() > schema::PATCH_FILE_BYTES {
                 return Err("Patched file exceeds 64 KiB".into());
             }
-            let plan = ActionPlan::patch(&normalized, text, &after, old, new);
+            let mut plan = ActionPlan::patch(&normalized, text, &after, old, new);
+            plan.evidence["mode"] = json!(snapshot.info.mode() & 0o777);
+            plan.evidence["after_sha256"] = json!(hash(after.as_bytes()));
             (Some(snapshot), after, plan)
         } else {
             Self::destination_absent(&parent, &target)?;
             (None, new.to_owned(), ActionPlan::creation(&normalized, new))
         };
-        if let Err(result) = plan.approve(&mut self.approve, &self.cancel) {
-            return Ok(result);
-        }
+        Ok((
+            PreparedAction::Patch(PreparedPatch {
+                path: normalized,
+                parent,
+                target,
+                before,
+                after,
+            }),
+            plan,
+        ))
+    }
+
+    fn commit_patch(&mut self, patch: PreparedPatch) -> Result<Value, String> {
+        let PreparedPatch {
+            path: normalized,
+            parent,
+            target,
+            before,
+            after,
+        } = patch;
+        let parts = Self::parts(&normalized)?;
+        let (name, parent_parts) = parts.split_last().unwrap();
         self.patch_parent_unchanged(parent_parts, &parent)?;
         Self::check_patch_target(&parent, name, &target, before.as_ref())?;
 
@@ -486,33 +537,224 @@ impl Runtime {
         }
         Ok(json!({"path":normalized,"sha256":digest,"bytes":after.len(),"executed":true}))
     }
-    fn run_command(&mut self, args: &Value) -> Result<Value, String> {
+    fn prepare(&self, name: &str, args: &Value) -> Result<(PreparedAction, ActionPlan), String> {
+        schema::validate(name, args)?;
+        if self.auto_denied {
+            return Err("An action was denied. A new user request is required before proposing more actions".into());
+        }
+        if name == "apply_patch" {
+            return self.prepare_patch(args);
+        }
         let argv = schema::argv(&args["argv"])?;
-        if !self.allowed_commands.is_empty() && !self.allowed_commands.contains(&argv) {
-            return Ok(
-                json!({"status":"not_run","executed":false,"error":"Command is outside the exact --allow-command policy"}),
-            );
+        let policy = if self.approval_mode == ApprovalMode::FullAccess {
+            ExecutionPolicy::FullAccess
+        } else {
+            if !self.allowed_commands.is_empty() && !self.allowed_commands.contains(&argv) {
+                return Err("Command is outside the exact --allow-command policy".into());
+            }
+            ExecutionPolicy::Sandbox(self.sandbox_mode)
+        };
+        let prepared = PreparedCommand::new(&self.root, argv, policy)?;
+        if let Some(fetch) = &prepared.fetch {
+            let origin = fetch.origin();
+            if self.denied_network_origins.contains(&origin)
+                || self.denied_network_in_session.contains(&origin)
+            {
+                return Err(format!("Network destination {origin} is explicitly denied"));
+            }
         }
-        let prepared = commands::PreparedCommand::new(&argv)?;
-        if let Err(result) =
-            ActionPlan::command(&argv, prepared.invocation(), prepared.executable())
-                .approve(&mut self.approve, &self.cancel)
+        let plan = prepared.plan();
+        Ok((PreparedAction::Command(prepared), plan))
+    }
+
+    fn commit(&mut self, action: PreparedAction) -> Result<Value, String> {
+        if self.cancel.is_canceled() {
+            return Ok(unexecuted("canceled"));
+        }
+        match action {
+            PreparedAction::Patch(patch) => self.commit_patch(patch),
+            PreparedAction::Command(command) => {
+                if !identity(
+                    &self.root.symlink_metadata().map_err(err)?,
+                    &self.root_fd.metadata().map_err(err)?,
+                ) {
+                    return Err("Project root changed during session".into());
+                }
+                commands::run_prepared(command, &self.cancel, self.timeout, self.output_limit)
+            }
+        }
+    }
+
+    fn needs_approval(&self, action: &PreparedAction) -> bool {
+        self.approval_mode != ApprovalMode::FullAccess
+            && !matches!(action, PreparedAction::Command(command) if command.low_risk())
+    }
+
+    fn action_evidence(&self, name: &str, args: &Value, plan: &ActionPlan) -> Value {
+        let definition = schema::tools()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|def| def["function"]["name"] == name)
+            .unwrap()["function"]["description"]
+            .clone();
+        json!({"tool":name,"description":definition,"validated_arguments":args,
+            "project_root":self.root,"prepared":plan.evidence,
+            "effective_policy":{"approval_mode":self.approval_mode,"command_sandbox":self.sandbox_mode,
+                "exact_argv_restricted":!self.allowed_commands.is_empty(),"command_timeout_ms":self.timeout.as_millis(),
+                "output_limit_bytes":self.output_limit,
+                "additional_network_permission":plan.evidence["requested_network"]},
+            "approval_required_because": if plan.path.is_some() { "This action changes a project file through the bounded patch executor" }
+                else if !plan.evidence["requested_network"].is_null() { "This HTTP(S) GET transmits request data to a new destination for this action" }
+                else { "This command is outside the fixed inspection exemption and can execute project code" }})
+    }
+
+    fn review_context(&self, reviewer: &Reviewer, action: Value, history: &[Value]) -> Value {
+        let user: Vec<_> = history
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .map(|message| &message["content"])
+            .collect();
+        let mut evidence = json!({"prepared_action":action,"trusted_user_instructions":user,
+            "recorded_human_decisions":self.human_decisions,
+            "untrusted_recent_conversation":[]});
+        let mut remaining = reviewer
+            .evidence_budget()
+            .saturating_sub(evidence.to_string().len());
+        let mut recent = Vec::new();
+        for message in history
+            .iter()
+            .rev()
+            .filter(|m| matches!(m["role"].as_str(), Some("assistant" | "tool")))
+            .take(8)
         {
-            return Ok(result);
+            if remaining < 512 {
+                break;
+            }
+            let content = message["content"].as_str().unwrap_or_default();
+            let call_summary;
+            let content = if content.is_empty() && message["tool_calls"].is_array() {
+                call_summary = message["tool_calls"].to_string();
+                &call_summary
+            } else {
+                content
+            };
+            let excerpt: String = content.chars().take(1200).collect();
+            let entry = json!({"source":message["role"],"tool_name":message["tool_name"],
+                "content_excerpt":excerpt,"truncated":excerpt.len() < content.len()});
+            let size = entry.to_string().len() + 1;
+            if size <= remaining {
+                remaining -= size;
+                recent.push(entry);
+            }
         }
-        if !identity(
-            &self.root.symlink_metadata().map_err(err)?,
-            &self.root_fd.metadata().map_err(err)?,
-        ) {
-            return Err("Project root changed during session".into());
+        recent.reverse();
+        evidence["untrusted_recent_conversation"] = json!(recent);
+        evidence
+    }
+
+    fn manual(
+        &mut self,
+        action: PreparedAction,
+        plan: &ActionPlan,
+        digest: &str,
+        fallback: Option<&str>,
+    ) -> Result<Value, String> {
+        if self.cancel.is_canceled() {
+            return Ok(plan.stopped("canceled"));
         }
-        commands::run_prepared(
-            &self.root,
-            prepared,
-            &self.cancel,
-            self.timeout,
-            self.output_limit,
-        )
+        let preview = match fallback {
+            Some(reason) => format!(
+                "{plan_preview}\nAutomatic review needs confirmation: {reason}",
+                plan_preview = plan.preview
+            ),
+            None => plan.preview.clone(),
+        };
+        let allowed = (self.approve)(plan.kind, &preview);
+        if self.cancel.is_canceled() {
+            return Ok(plan.stopped("canceled"));
+        }
+        let origin = match &action {
+            PreparedAction::Command(command) => command.fetch.as_ref().map(|fetch| fetch.origin()),
+            _ => None,
+        };
+        self.human_decisions.push(json!({"decision":if allowed { "allow" } else { "not_approved" },
+            "action_sha256":digest,"scope_excerpt":plan.preview.chars().take(512).collect::<String>(),
+            "network_origin":origin}));
+        if allowed {
+            self.commit(action)
+        } else {
+            if let Some(origin) = origin {
+                self.denied_network_in_session.insert(origin);
+            }
+            self.auto_denied = self.approval_mode == ApprovalMode::Auto;
+            Ok(plan.stopped("denied"))
+        }
+    }
+
+    pub(crate) fn begin_task(&mut self) {
+        self.auto_denied = false;
+    }
+
+    pub(crate) async fn execute_with_history(
+        &mut self,
+        name: &str,
+        args: Value,
+        history: &[Value],
+    ) -> Value {
+        if self.approval_mode != ApprovalMode::Auto
+            || self.reviewer.is_none()
+            || self.cancel.is_canceled()
+        {
+            return self.execute(name, args);
+        }
+        let (action, plan) = match self.prepare(name, &args) {
+            Ok(prepared) => prepared,
+            Err(error) => return self.record_result(name, args, Err(error)),
+        };
+        if !self.needs_approval(&action) {
+            let result = self.commit(action);
+            return self.record_result(name, args, result);
+        }
+        let reviewer = self.reviewer.as_ref().unwrap();
+        let evidence = self.action_evidence(name, &args, &plan);
+        let digest = hash(evidence.to_string().as_bytes());
+        let review = reviewer
+            .review(
+                &self.review_context(reviewer, evidence, history),
+                &self.cancel,
+            )
+            .await;
+        let (result, audit) = if self.cancel.is_canceled() {
+            (Ok(plan.stopped("canceled")), json!({"decision":"canceled"}))
+        } else {
+            match review {
+                Ok(verdict) => {
+                    let result = match verdict.decision {
+                        Decision::Allow => self.commit(action),
+                        Decision::Deny => {
+                            self.auto_denied = true;
+                            Ok(plan.stopped("denied"))
+                        }
+                        Decision::AskUser => {
+                            self.manual(action, &plan, &digest, Some(&verdict.reason))
+                        }
+                    };
+                    (result, json!(verdict))
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    (
+                        self.manual(action, &plan, &digest, Some(&reason)),
+                        json!({"decision":"ask_user","reason":reason}),
+                    )
+                }
+            }
+        };
+        let mut result = finish_result(name, result, &self.cancel);
+        result["automatic_review"] = audit;
+        result["automatic_review"]["action_sha256"] = json!(digest);
+        self.record_result(name, args, Ok(result))
     }
     pub(crate) fn record_result(
         &mut self,
@@ -525,14 +767,23 @@ impl Runtime {
             .push(json!({"tool":name,"arguments":args,"result":result}));
         result
     }
+    /// Synchronous entry point for manual callers. Automatic inference runs through Agent.
     pub fn execute(&mut self, name: &str, args: Value) -> Value {
         let result = if self.cancel.is_canceled() {
             Ok(unexecuted("canceled"))
         } else {
-            schema::validate(name, &args).and_then(|()| match name {
-                "apply_patch" => self.patch(&args),
-                "run_command" => self.run_command(&args),
-                _ => Err("Unknown tool".into()),
+            self.prepare(name, &args).and_then(|(action, plan)| {
+                if !self.needs_approval(&action) {
+                    return self.commit(action);
+                }
+                let digest = hash(
+                    self.action_evidence(name, &args, &plan)
+                        .to_string()
+                        .as_bytes(),
+                );
+                let fallback =
+                    (self.approval_mode == ApprovalMode::Auto).then_some("Reviewer unavailable");
+                self.manual(action, &plan, &digest, fallback)
             })
         };
         self.record_result(name, args, result)

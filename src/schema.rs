@@ -12,7 +12,7 @@ pub fn tools() -> Value {
         ),
         (
             "run_command",
-            "Inspect, search, or verify the project with an approved read-only sandboxed command. Use a bare installed command name (e.g. ls, cat, rg, or grep) or an absolute executable path, plus literal arguments. Runs from the project root with no shell expansion, network, or project writes.",
+            "Inspect, search, build, or verify the project with literal argv under the session policy. Use a bare installed command name (e.g. ls, cat, rg, or grep) or an eligible absolute executable path. Runs from the project root with no shell expansion. In sandboxed sessions exactly [\"curl\",\"https://host/path\"] requests a separately reviewed HTTP(S) GET with redirects disabled.",
             json!({"argv":{"type":"array","items":string,"minItems":1,"maxItems":64}}),
         ),
     ];

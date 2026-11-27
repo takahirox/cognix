@@ -608,6 +608,13 @@ fn invalid_user_configuration_names_the_file_and_setting() {
         ("modle = 'typo'", "unknown field"),
         ("model = ''", "nonempty local model tag"),
         ("ollama_url = 'https://example.com'", "local HTTP origin"),
+        ("approval_mode = 'unsafe'", "approval_mode"),
+        ("sandbox_mode = 'arbitrary'", "sandbox_mode"),
+        ("review_model = 'remote-cloud'", "review_model"),
+        (
+            "deny_network = ['https://example.com/path']",
+            "deny_network",
+        ),
         ("max_steps = 0", "max_steps must be greater than zero"),
         ("num_ctx = 8191", "num_ctx must be at least 8192"),
         (

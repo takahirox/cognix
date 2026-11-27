@@ -155,6 +155,27 @@ impl Ollama {
             .as_str()
             .unwrap_or("unknown")
             .into();
+        self.validate_local_model(true, cancel).await?;
+        let tools = json!([{"type":"function","function":{"name":"cognix_probe","description":"Compatibility probe; call with value='ok'.","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}}]);
+        let message=self.chat(&[json!({"role":"user","content":"Call cognix_probe with value ok now. Do not answer with prose."})],&tools,cancel).await?;
+        if message["tool_calls"]
+            .as_array()
+            .is_none_or(|v| v.len() != 1)
+            || message["tool_calls"][0]["function"]["name"] != "cognix_probe"
+            || message["tool_calls"][0]["function"]["arguments"] != json!({"value":"ok"})
+        {
+            return Err(Error::Provider(
+                "Tool-calling compatibility probe failed; select another local model/template"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+    pub async fn validate_local_model(
+        &mut self,
+        tools: bool,
+        cancel: &Cancellation,
+    ) -> Result<(), Error> {
         let info = self
             .request("/api/show", Some(json!({"model":self.model})), cancel)
             .await.map_err(|e| match e { Error::Provider(detail)=>Error::Provider(format!("Cannot load local model {:?}. Install a suitable local tag explicitly with 'ollama pull'. {detail}",self.model)),other=>other })?;
@@ -171,34 +192,35 @@ impl Ollama {
         }
         let caps = info["capabilities"]
             .as_array()
-            .ok_or_else(|| Error::Provider("Model does not advertise tools/completion".into()))?;
-        if !caps.contains(&json!("tools")) || !caps.contains(&json!("completion")) {
+            .ok_or_else(|| Error::Provider("Model does not advertise capabilities".into()))?;
+        if !caps.contains(&json!("completion")) || (tools && !caps.contains(&json!("tools"))) {
             return Err(Error::Provider(
-                "Select a local model advertising completion and tools".into(),
+                if tools {
+                    "Select a local model advertising completion and tools"
+                } else {
+                    "Select a local reviewer model advertising completion"
+                }
+                .into(),
             ));
         }
         let mi = info["model_info"]
             .as_object()
             .ok_or_else(|| Error::Provider("Malformed model_info".into()))?;
-        for (key, v) in mi {
-            if key.ends_with(".context_length")
-                && v.as_u64().is_some_and(|n| (self.num_ctx as u64) > n)
-            {
+        let capacity = mi
+            .iter()
+            .filter(|(key, _)| key.ends_with(".context_length"))
+            .filter_map(|(_, value)| value.as_u64())
+            .min();
+        if let Some(capacity) = capacity.filter(|n| *n < self.num_ctx as u64) {
+            if tools {
                 return Err(Error::Context("--num-ctx exceeds model context".into()));
             }
-        }
-        let tools = json!([{"type":"function","function":{"name":"cognix_probe","description":"Compatibility probe; call with value='ok'.","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}}]);
-        let message=self.chat(&[json!({"role":"user","content":"Call cognix_probe with value ok now. Do not answer with prose."})],&tools,cancel).await?;
-        if message["tool_calls"]
-            .as_array()
-            .is_none_or(|v| v.len() != 1)
-            || message["tool_calls"][0]["function"]["name"] != "cognix_probe"
-            || message["tool_calls"][0]["function"]["arguments"] != json!({"value":"ok"})
-        {
-            return Err(Error::Provider(
-                "Tool-calling compatibility probe failed; select another local model/template"
-                    .into(),
-            ));
+            if capacity < 4096 {
+                return Err(Error::Context(
+                    "Reviewer model context must support at least 4096 tokens".into(),
+                ));
+            }
+            self.num_ctx = capacity as usize;
         }
         Ok(())
     }
