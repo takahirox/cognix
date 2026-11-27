@@ -139,6 +139,11 @@ impl BrokerJob {
             .unwrap()
             .join()
             .map_err(|_| "Command worker failed")??;
+        // Summarize all over-budget requests in one entry to bound the report.
+        if let Some((status, error)) = self.broker.request_limit_rejection() {
+            self.requests
+                .push(json!({"status":"failed","http_status":status,"error":error}));
+        }
         result["network_requests"] = json!(std::mem::take(&mut self.requests));
         Ok(result)
     }
